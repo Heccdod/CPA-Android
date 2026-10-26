@@ -109,6 +109,10 @@ jobs:
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
           cd go-bridge
+          # gomobile bind refuses to run unless golang.org/x/mobile is in the module graph, and
+          # the earlier `go mod tidy` drops it precisely because nothing imports it. Add the
+          # bind package back right before binding.
+          go get golang.org/x/mobile/bind@latest
           # -checklinkname=0: pion/stdnet pulls github.com/wlynxg/anet, whose //go:linkname
           # hooks into net.zoneCache and x/net/internal/socket.zoneCache are rejected by the
           # Go 1.23+ linkname checker when they are linked into a c-shared library.
