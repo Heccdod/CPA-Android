@@ -3,6 +3,16 @@
 个人自用 Android 反向代理：把 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Go 内核
 经 `gomobile` 打进前台服务，在本机 `127.0.0.1:8317` 暴露 OpenAI / Anthropic / Gemini 兼容的流式 API。
 
+## 安装
+
+完整步骤见 [INSTALL.md](INSTALL.md)。最快一条命令（Windows PowerShell）：
+
+```powershell
+C:\Users\28381\Documents\ds_home\tools\platform-tools\adb.exe install -r C:\Users\28381\Desktop\CPA-Android-2.1.0.apk
+```
+
+装完打开 App，状态卡显示「运行中 + 127.0.0.1:8317」即可用；点「快捷添加」走一遍 Google 授权就有账号了。
+
 ## 终态交付契约与验证方式
 
 | 契约 | 物证 | 验证命令 |
