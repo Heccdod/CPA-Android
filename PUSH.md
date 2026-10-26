@@ -1,7 +1,8 @@
 # 推送到 GitHub
 
-本机没有 GitHub 凭据（`gh` 未安装、无 token、无 SSH key），所以这两条 commit 与 v2.1.0 tag
-还没有推出去。仓库已经就绪：remote 指向 `Heccdod/CPA-Android`，历史干净地接在 `Initial commit` 之上。
+本机没有 GitHub 凭据（`gh` 未安装、无 token、无 SSH key），所以这四条 commit 与 v2.1.0 tag
+还没有推出去。仓库已经就绪：remote 指向 `Heccdod/CPA-Android`，历史干净地接在 `Initial commit` 之上，
+`.git` 只有 2.9 MB（构建产物全部 gitignore，由 Release 承载）。
 
 ## 1. 推送代码与 tag
 
@@ -43,7 +44,8 @@ gh release create v2.1.0 \
 ## 3. tag 名要对上
 
 App 里的更新检查认 `releases/latest` 的 `tag_name`，并且已经忽略 `v` 前缀，所以 `v2.1.0`
-和 `2.1.0` 都行。资产名必须含 `libgojni.so` 才能被热更新识别，含 `debug` 的 APK 会被跳过。
+和 `2.1.0` 都行。内核资产名只要含 `libgojni` 且以 `.so` 结尾就能被热更新识别，
+含 `debug` 的 APK 会被跳过（避免用调试包覆盖已签名的正式包）。
 
 ## 4. 之后自动化
 
