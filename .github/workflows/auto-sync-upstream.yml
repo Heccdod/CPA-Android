@@ -1,16 +1,15 @@
 name: auto-sync-upstream
 
+# This workflow exists for ONE purpose: notice that router-for-me/CLIProxyAPI moved, rebuild the
+# kernel and republish. It deliberately has no push trigger - a push-triggered run would either
+# rebuild against an upstream tree that is gitignored (and therefore absent), or, with the
+# changed-check bypassed, mint a fresh release on every commit. Local builds run ./gradlew
+# locally; CI only chases upstream.
 on:
   schedule:
     # every 6 hours
     - cron: "0 */6 * * *"
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - "go-bridge/**"
-      - "app/**"
-      - ".github/workflows/auto-sync-upstream.yml"
 
 permissions:
   contents: write
@@ -46,7 +45,9 @@ jobs:
           echo "Upstream head: $SHA"
           CURRENT=$(cat .upstream-sha 2>/dev/null || echo "")
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          if [ "$SHA" = "$CURRENT" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "${{ github.event_name }}" != "push" ]; then
+          # A manual run always rebuilds (that is what the button is for); a scheduled run only
+          # acts when the pointer actually moved.
+          if [ "$SHA" = "$CURRENT" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -75,16 +76,21 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
+      # android-actions/setup-android runs `sdkmanager --install tools` internally, and that
+      # package no longer exists in the repository index — the action dies with exit code 1
+      # before any of our steps run. The GitHub-hosted runner image already ships the SDK, so
+      # the SDK is accepted and extended with plain sdkmanager calls instead.
       - name: Set up Android SDK and NDK
-        if: steps.upstream.outputs.changed == 'true'
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK and platform
         if: steps.upstream.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          sdkmanager --install "ndk;${ANDROID_NDK}" "platforms;android-${ANDROID_API}" "build-tools;${ANDROID_BUILD_TOOLS}"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK}" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}" >> "$GITHUB_ENV"
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;${ANDROID_NDK}" "platforms;android-${ANDROID_API}" "build-tools;${ANDROID_BUILD_TOOLS}"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/${ANDROID_NDK}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
 
       - name: Run Go bridge tests
         if: steps.upstream.outputs.changed == 'true'
@@ -154,9 +160,15 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release delete "$TAG" --yes
           fi
+          # --prerelease matters: the app reads releases/latest, and a plain upstream-sync
+          # release would become "latest" the moment it is created, so every check would
+          # report a version newer than the installed one and never settle. Marking these as
+          # prereleases keeps releases/latest pinned to the hand-cut versioned release while
+          # still publishing the kernel for hot update.
           gh release create "$TAG" \
             --title "Upstream sync $TAG" \
             --notes "Auto-built from ${UPSTREAM_REPO}@${{ steps.upstream.outputs.sha }}." \
+            --prerelease \
             "$RELEASE_APK" "$DEBUG_APK" "./libgojni-${TAG}.so" SHA256SUMS.txt
 
       - name: Commit the upstream pointer
