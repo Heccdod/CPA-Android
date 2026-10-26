@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Tinted at runtime from Palette.colors.ok; the solid here is only a placeholder. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="@color/day_ok" />
+    <size android:width="9dp" android:height="9dp" />
+</shape>

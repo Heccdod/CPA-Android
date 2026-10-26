@@ -1,0 +1,23 @@
+*.iml
+.gradle/
+local.properties
+.idea/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+app/build/
+upstream-cliproxy/
+*.hprof
+
+# The gomobile output is 60 MB of compiled kernel. It is rebuilt by CI on every upstream
+# sync and attached to the release, so it does not belong in git history.
+app/libs/cliproxy.aar
+
+# Signing material never enters the repository.
+keystore.properties
+*.jks
+*.keystore
+
+# Local agent/skill scratch directories are not part of the app.
+.dsh/

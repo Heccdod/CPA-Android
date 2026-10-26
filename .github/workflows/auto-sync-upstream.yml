@@ -1,0 +1,170 @@
+name: auto-sync-upstream
+
+on:
+  schedule:
+    # every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "go-bridge/**"
+      - "app/**"
+      - ".github/workflows/auto-sync-upstream.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-sync-upstream
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.27.3"
+  JAVA_VERSION: "17"
+  ANDROID_API: "28"
+  ANDROID_BUILD_TOOLS: "34.0.0"
+  ANDROID_NDK: "26.1.10909125"
+  UPSTREAM_REPO: "router-for-me/CLIProxyAPI"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect upstream head
+        id: upstream
+        run: |
+          set -euo pipefail
+          SHA=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" HEAD | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream head: $SHA"
+          CURRENT=$(cat .upstream-sha 2>/dev/null || echo "")
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          if [ "$SHA" = "$CURRENT" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ "${{ github.event_name }}" != "push" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync upstream source
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf upstream-cliproxy
+          git clone --depth 1 "https://github.com/${UPSTREAM_REPO}.git" upstream-cliproxy
+          head -5 upstream-cliproxy/go.mod
+          echo "${{ steps.upstream.outputs.sha }}" > .upstream-sha
+
+      - name: Set up Go
+        if: steps.upstream.outputs.changed == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go-bridge/go.sum
+
+      - name: Set up JDK
+        if: steps.upstream.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK and NDK
+        if: steps.upstream.outputs.changed == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and platform
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          sdkmanager --install "ndk;${ANDROID_NDK}" "platforms;android-${ANDROID_API}" "build-tools;${ANDROID_BUILD_TOOLS}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ANDROID_NDK}" >> "$GITHUB_ENV"
+
+      - name: Run Go bridge tests
+        if: steps.upstream.outputs.changed == 'true'
+        working-directory: go-bridge
+        run: |
+          set -euo pipefail
+          go mod tidy
+          go test -count=1 -timeout 300s ./cliproxymobile
+
+      - name: Build the Go kernel AAR
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+          cd go-bridge
+          # -checklinkname=0: pion/stdnet pulls github.com/wlynxg/anet, whose //go:linkname
+          # hooks into net.zoneCache and x/net/internal/socket.zoneCache are rejected by the
+          # Go 1.23+ linkname checker when they are linked into a c-shared library.
+          # max-page-size=16384: Android 17 refuses to load a .so whose PT_LOAD segments are
+          # only 4 KB aligned; the default arm64 link emits 4 KB.
+          gomobile bind -target=android/arm64 -androidapi 28 \
+            -javapkg=me.routerfor.cliproxy \
+            -ldflags="-checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+            -o ../app/libs/cliproxy.aar ./cliproxymobile
+          ls -l ../app/libs/cliproxy.aar
+
+      - name: Verify the AAR symbols
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          unzip -l app/libs/cliproxy.aar | tee /tmp/aar.txt
+          grep -q "jni/arm64-v8a/libgojni.so" /tmp/aar.txt
+          grep -q "me/routerfor/cliproxy/cliproxymobile/Cliproxymobile.class" <(unzip -p app/libs/cliproxy.aar classes.jar | unzip -l /dev/stdin 2>/dev/null || true) || true
+          grep -q "classes.jar" /tmp/aar.txt
+          test "$(stat -c%s app/libs/cliproxy.aar)" -gt 8000000
+          # Android 17 on a 16 KB page device refuses a 4 KB-aligned kernel.
+          python3 scripts/check16k.py app/libs/cliproxy.aar
+
+      - name: Assemble release APK
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleRelease assembleDebug
+          ls -l app/build/outputs/apk/release app/build/outputs/apk/debug
+          python3 scripts/check16k.py app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk
+
+      - name: Publish the kernel and APK
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="upstream-$(date -u +%Y%m%d-%H%M%S)"
+          RELEASE_APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          DEBUG_APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+          SO_FILE=$(mktemp -d)/libgojni.so
+          unzip -o -j app/libs/cliproxy.aar jni/arm64-v8a/libgojni.so -d "$(dirname "$SO_FILE")" >/dev/null
+          sha256sum "$SO_FILE" "$RELEASE_APK" "$DEBUG_APK" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          # Publish the bare kernel too: the app hot-loads it via SHA256SUMS to skip a reinstall.
+          cp "$SO_FILE" ./libgojni-${TAG}.so
+          echo "sha256:$(sha256sum ./libgojni-${TAG}.so | cut -d' ' -f1)" > so-digest.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes
+          fi
+          gh release create "$TAG" \
+            --title "Upstream sync $TAG" \
+            --notes "Auto-built from ${UPSTREAM_REPO}@${{ steps.upstream.outputs.sha }}." \
+            "$RELEASE_APK" "$DEBUG_APK" "./libgojni-${TAG}.so" SHA256SUMS.txt
+
+      - name: Commit the upstream pointer
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "cpa-bot"
+          git config user.email "cpa-bot@users.noreply.github.com"
+          git add .upstream-sha
+          git commit -m "chore: track upstream ${{ steps.upstream.outputs.sha }}" || echo "nothing to commit"
+          git push

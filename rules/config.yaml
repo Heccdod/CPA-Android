@@ -1,0 +1,52 @@
+# CPA-Android remote rule file (L2 hot-reload channel).
+# UpdateManager.syncRules() downloads this file, atomically replaces filesDir/config.yaml and
+# lets the CLIProxyAPI file watcher hot-reload it in milliseconds - no rebuild, no reinstall.
+config-version: 8
+
+server:
+  host: "127.0.0.1"
+  port: 8317
+
+requests:
+  proxy-url: ""
+  streaming:
+    keepalive-seconds: 15
+    bootstrap-retries: 2
+    send-keepalive-before-ft: true
+
+access:
+  api-keys:
+    - "cpa-android-local"
+
+management:
+  allow-remote: false
+  secret-key: "cpa-android-local"
+  disable-control-panel: false
+  disable-auto-update-panel: true
+
+oauth:
+  auth-dir: "auths"
+  providers:
+    antigravity:
+      signature-cache-enabled: true
+      antigravity-credits: true
+      sensitive-words:
+        - "Claude Agent SDK"
+        - "RFC 2119"
+        - "system-conventions"
+        - "system_conventions"
+        - "system-directive"
+        - "system_directive"
+        - "Hermes Agent"
+        - "Codex"
+
+routing:
+  retry:
+    request-retry: 3
+    max-retry-credentials: 2
+    max-retry-interval: 30
+
+observability:
+  logs:
+    debug: false
+    logging-to-file: false

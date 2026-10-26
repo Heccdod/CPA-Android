@@ -1,0 +1,4 @@
+-keep class me.routerfor.cliproxy.** { *; }
+-keep class go.** { *; }
+-dontwarn me.routerfor.cliproxy.**
+-dontwarn go.**

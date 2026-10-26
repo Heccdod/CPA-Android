@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Three palettes side by side. There is no "paper" resource qualifier in Android, and
+         "follow system" must resolve day/night at runtime anyway, so Palette picks the set. -->
+
+    /* day */
+    <color name="day_brand">#FF3D5AFE</color>
+    <color name="day_brand_dark">#FF2A3EB1</color>
+    <color name="day_surface">#FFF7F8FC</color>
+    <color name="day_surface_card">#FFFFFFFF</color>
+    <color name="day_text_primary">#FF11131A</color>
+    <color name="day_text_secondary">#FF6B7280</color>
+    <color name="day_text_tertiary">#FF9AA1AE</color>
+    <color name="day_stroke">#14000000</color>
+    <color name="day_divider">#0D000000</color>
+    <color name="day_ok">#FF12B76A</color>
+    <color name="day_warn">#FFF79009</color>
+    <color name="day_err">#FFF04438</color>
+    <color name="day_switch_off">#FFD5D9E2</color>
+    <color name="day_on_brand">#FFFFFFFF</color>
+    <color name="day_primary_container">#FFE3E8FF</color>
+    <color name="day_on_primary_container">#FF0B1B57</color>
+
+    /* night */
+    <color name="night_brand">#FF8FA2FF</color>
+    <color name="night_brand_dark">#FF5E76E8</color>
+    <color name="night_surface">#FF0F1116</color>
+    <color name="night_surface_card">#FF191C23</color>
+    <color name="night_text_primary">#FFF2F4F8</color>
+    <color name="night_text_secondary">#FF9BA3B4</color>
+    <color name="night_text_tertiary">#FF6C7488</color>
+    <color name="night_stroke">#26FFFFFF</color>
+    <color name="night_divider">#1AFFFFFF</color>
+    <color name="night_ok">#FF34D399</color>
+    <color name="night_warn">#FFFBBF24</color>
+    <color name="night_err">#FFF87171</color>
+    <color name="night_switch_off">#FF3A4050</color>
+    <color name="night_on_brand">#FF0B0D12</color>
+    <color name="night_primary_container">#FF23304F</color>
+    <color name="night_on_primary_container">#FFDCE3FF</color>
+
+    /* paper */
+    <color name="paper_brand">#FF8B5E34</color>
+    <color name="paper_brand_dark">#FF6E4623</color>
+    <color name="paper_surface">#FFF3E9D2</color>
+    <color name="paper_surface_card">#FFFAF3E0</color>
+    <color name="paper_text_primary">#FF3A2E1F</color>
+    <color name="paper_text_secondary">#FF7A6748</color>
+    <color name="paper_text_tertiary">#FF9C8A6B</color>
+    <color name="paper_stroke">#33A98A5E</color>
+    <color name="paper_divider">#1FA98A5E</color>
+    <color name="paper_ok">#FF3F8F5B</color>
+    <color name="paper_warn">#FFB4761B</color>
+    <color name="paper_err">#FFB4453A</color>
+    <color name="paper_switch_off">#FFD8C7A4</color>
+    <color name="paper_on_brand">#FFFFF9EC</color>
+    <color name="paper_primary_container">#FFEADFC5</color>
+    <color name="paper_on_primary_container">#FF3A2E1F</color>
+</resources>

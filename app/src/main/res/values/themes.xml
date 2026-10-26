@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Palette selection happens in Palette.apply(activity) before setContentView: there is no
+         "paper" resource qualifier, so all three share one style name and the colours are applied
+         programmatically. These values are only the fallback for the very first frame. -->
+    <style name="Theme.Cpa" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/day_brand</item>
+        <item name="colorOnPrimary">@color/day_on_brand</item>
+        <item name="colorPrimaryContainer">@color/day_primary_container</item>
+        <item name="colorOnPrimaryContainer">@color/day_on_primary_container</item>
+        <item name="colorSecondary">@color/day_brand</item>
+        <item name="android:colorBackground">@color/day_surface</item>
+        <item name="colorSurface">@color/day_surface_card</item>
+        <item name="colorOnSurface">@color/day_text_primary</item>
+        <item name="colorOutline">@color/day_text_tertiary</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
+        <item name="android:windowAnimationStyle">@style/Anim.Cpa</item>
+    </style>
+
+    <style name="Anim.Cpa" parent="@android:style/Animation.Activity">
+        <item name="android:activityOpenEnterAnimation">@anim/slide_in_right</item>
+        <item name="android:activityOpenExitAnimation">@anim/fade_out</item>
+        <item name="android:activityCloseEnterAnimation">@anim/fade_in</item>
+        <item name="android:activityCloseExitAnimation">@anim/slide_out_right</item>
+    </style>
+</resources>

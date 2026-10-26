@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dialogs otherwise inherit Material3's baseline lavender surfaceContainer roles, which
+         looked pasted-on next to our own palettes. UiKit wraps every dialog in one of these. -->
+
+    <style name="ThemeOverlay.Cpa.Dialog.Day" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorSurface">@color/day_surface_card</item>
+        <item name="colorSurfaceContainerHigh">@color/day_surface_card</item>
+        <item name="colorSurfaceContainerLow">@color/day_surface</item>
+        <item name="colorSurfaceContainer">@color/day_surface_card</item>
+        <item name="colorSurfaceContainerHighest">@color/day_surface_card</item>
+        <item name="colorSurfaceVariant">@color/day_primary_container</item>
+        <item name="colorOnSurface">@color/day_text_primary</item>
+        <item name="colorOnSurfaceVariant">@color/day_text_secondary</item>
+        <item name="colorPrimary">@color/day_brand</item>
+        <item name="colorOnPrimary">@color/day_on_brand</item>
+        <item name="android:textColorPrimary">@color/day_text_primary</item>
+        <item name="android:textColorSecondary">@color/day_text_secondary</item>
+    </style>
+
+    <style name="ThemeOverlay.Cpa.Dialog.Night" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorSurface">@color/night_surface_card</item>
+        <item name="colorSurfaceContainerHigh">@color/night_surface_card</item>
+        <item name="colorSurfaceContainerLow">@color/night_surface</item>
+        <item name="colorSurfaceContainer">@color/night_surface_card</item>
+        <item name="colorSurfaceContainerHighest">@color/night_surface_card</item>
+        <item name="colorSurfaceVariant">@color/night_primary_container</item>
+        <item name="colorOnSurface">@color/night_text_primary</item>
+        <item name="colorOnSurfaceVariant">@color/night_text_secondary</item>
+        <item name="colorPrimary">@color/night_brand</item>
+        <item name="colorOnPrimary">@color/night_on_brand</item>
+        <item name="android:textColorPrimary">@color/night_text_primary</item>
+        <item name="android:textColorSecondary">@color/night_text_secondary</item>
+    </style>
+
+    <style name="ThemeOverlay.Cpa.Dialog.Paper" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorSurface">@color/paper_surface_card</item>
+        <item name="colorSurfaceContainerHigh">@color/paper_surface_card</item>
+        <item name="colorSurfaceContainerLow">@color/paper_surface</item>
+        <item name="colorSurfaceContainer">@color/paper_surface_card</item>
+        <item name="colorSurfaceContainerHighest">@color/paper_surface_card</item>
+        <item name="colorSurfaceVariant">@color/paper_primary_container</item>
+        <item name="colorOnSurface">@color/paper_text_primary</item>
+        <item name="colorOnSurfaceVariant">@color/paper_text_secondary</item>
+        <item name="colorPrimary">@color/paper_brand</item>
+        <item name="colorOnPrimary">@color/paper_on_brand</item>
+        <item name="android:textColorPrimary">@color/paper_text_primary</item>
+        <item name="android:textColorSecondary">@color/paper_text_secondary</item>
+    </style>
+</resources>

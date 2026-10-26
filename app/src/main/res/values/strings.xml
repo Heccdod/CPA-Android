@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CPA 网关</string>
+
+    <string name="notif_channel_name">网关状态</string>
+    <string name="notif_channel_desc">内嵌代理引擎的前台常驻状态</string>
+    <string name="notif_title">CPA 网关运行中</string>
+    <string name="action_restart">重启网关</string>
+    <string name="action_stop">停止服务</string>
+
+    <string name="title_panel">管理面板</string>
+    <string name="title_settings">设置</string>
+
+    <string name="state_running">运行中</string>
+    <string name="state_starting">正在启动</string>
+    <string name="state_stopped">已停止</string>
+    <string name="state_error">异常</string>
+
+    <string name="label_address">服务地址</string>
+    <string name="label_api_key">API 密钥（点按复制）</string>
+    <string name="label_credentials">已登录凭据</string>
+
+    <string name="action_open_panel">管理面板</string>
+    <string name="action_add_provider">添加账号</string>
+    <string name="action_start">启动</string>
+    <string name="action_copied">已复制</string>
+    <string name="action_settings">设置</string>
+
+    <string name="section_quick">快捷操作</string>
+
+    <string name="settings_network">网络</string>
+    <string name="settings_proxy">上游代理</string>
+    <string name="settings_lan">允许局域网访问</string>
+    <string name="settings_engine">引擎</string>
+    <string name="settings_words">敏感词混淆</string>
+    <string name="settings_words_hint">逗号分隔，命中时做零宽字符替换</string>
+    <string name="settings_config">编辑 config.yaml</string>
+    <string name="settings_config_desc">高级设置，保存后引擎自动热重载</string>
+    <string name="settings_update">更新</string>
+    <string name="settings_hot_update">内核热更新</string>
+    <string name="settings_hot_update_desc">允许从 GitHub Release 下载并加载新内核。关闭时只用安装包内置内核</string>
+    <string name="settings_check_update">检查更新</string>
+    <string name="settings_sync_rules">同步远程规则</string>
+    <string name="settings_system">系统</string>
+    <string name="settings_battery">忽略电池优化</string>
+    <string name="settings_battery_desc">避免后台被系统冻结导致网关掉线</string>
+    <string name="settings_restart">重启网关</string>
+    <string name="settings_about">关于</string>
+    <string name="settings_version">版本</string>
+    <string name="settings_abi">架构</string>
+    <string name="settings_hot_state">热更新状态</string>
+    <string name="hot_on">已开启</string>
+    <string name="hot_off">已关闭</string>
+    <string name="notif_starting">正在启动网关…</string>
+    <string name="notif_listening">正在监听 %1$s</string>
+    <string name="notif_failed">启动失败：%1$s</string>
+    <string name="notif_stopped">网关已停止</string>
+    <string name="action_theme">切换主题</string>
+    <string name="action_quick_add">快捷添加</string>
+    <string name="label_accounts">AI 提供商</string>
+    <string name="label_no_accounts">尚未登录任何账号 · 点「快捷添加」开始授权</string>
+    <string name="add_more">更多方式…</string>
+    <string name="provider_needs_key">需配置密钥</string>
+    <string name="toast_engine_not_ready">网关尚未就绪，请稍候</string>
+    <string name="toast_auth_unavailable">该提供商未返回授权链接，请在管理面板中配置</string>
+    <string name="settings_theme">主题</string>
+    <string name="theme_system">跟随系统</string>
+    <string name="theme_day">日间</string>
+    <string name="theme_night">黑夜</string>
+    <string name="theme_paper">羊皮纸</string>
+    <string name="settings_appearance">外观</string>
+    <string name="settings_lan_desc">同一 Wi-Fi 下的设备也能访问本机网关</string>
+</resources>

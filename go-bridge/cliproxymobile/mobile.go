@@ -1,0 +1,554 @@
+// Package cliproxymobile exposes the embedded CLIProxyAPI engine to Android through
+// gomobile. Every exported symbol uses only primitive types (string / bool) because
+// gobind cannot marshal structs, context.Context, errors or multi-value returns.
+package cliproxymobile
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	// ConfigFileName is the file the Android host keeps inside filesDir.
+	ConfigFileName = "config.yaml"
+	// AuthDirName is the OAuth credential store created next to the config file.
+	AuthDirName = "auths"
+	// DefaultPort is the gateway port used by every generated configuration.
+	DefaultPort = 8317
+	// ManagementKey is the local management secret seeded into the panel.
+	ManagementKey = "cpa-android-local"
+	// defaultAPIKey is the local proxy key accepted by the /v1 endpoints.
+	defaultAPIKey = "cpa-android-local"
+
+	loopbackHost = "127.0.0.1"
+	anyHost      = "0.0.0.0"
+
+	readyTimeout  = 3 * time.Second
+	probeInterval = 50 * time.Millisecond
+	stopTimeout   = 10 * time.Second
+)
+
+// defaultSensitiveWords ship by default. Antigravity intermittently answers with a
+// fake 429 when these literals reach the upstream WAF, so the engine obfuscates them
+// with zero-width spaces before the request leaves the device.
+var defaultSensitiveWords = []string{
+	"Claude Agent SDK",
+	"RFC 2119",
+	"system-conventions",
+	"system_conventions",
+	"system-directive",
+	"system_directive",
+	"Hermes Agent",
+	"Codex",
+}
+
+type runtimeState struct {
+	mu         sync.Mutex
+	service    *cliproxy.Service
+	cancel     context.CancelFunc
+	done       chan struct{}
+	dataDir    string
+	listenAddr string
+	logFile    *os.File
+}
+
+var state runtimeState
+var lastError string
+
+// StartProxy boots the embedded CLIProxyAPI engine.
+// dataDir is Android  context.filesDir.absolutePath.
+// It returns "" on success and a readable error description otherwise.
+func StartProxy(dataDir string) string {
+	if err := startProxy(dataDir); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// StopProxy gracefully stops the running gateway.
+func StopProxy() string {
+	if err := stopProxy(); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// RestartProxy stops the gateway and starts it again against dataDir.
+func RestartProxy(dataDir string) string {
+	if err := stopProxy(); err != nil {
+		return err.Error()
+	}
+	time.Sleep(150 * time.Millisecond)
+	if err := startProxy(dataDir); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// IsRunning reports whether the HTTP gateway is currently serving.
+func IsRunning() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.service != nil
+}
+
+// GetListenAddress returns the effective host:port the gateway binds to.
+func GetListenAddress() string {
+	state.mu.Lock()
+	addr := state.listenAddr
+	state.mu.Unlock()
+	if addr != "" {
+		return addr
+	}
+	return net.JoinHostPort(loopbackHost, itoa(DefaultPort))
+}
+
+// GetManagementKey returns the local management secret the Android WebView must
+// present to the bundled control panel.
+func GetManagementKey() string { return ManagementKey }
+
+// GetLastError returns the last startup failure recorded by the engine, if any.
+func GetLastError() string {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return lastError
+}
+
+// EnsureDefaultConfig writes the hardened default config.yaml when it is missing.
+// proxyURL seeds requests.proxy-url ("" keeps a direct connection).
+// allowLan binds 0.0.0.0 instead of 127.0.0.1.
+func EnsureDefaultConfig(dataDir string, proxyURL string, allowLan bool) string {
+	if err := ensureDefaultConfig(dataDir, proxyURL, allowLan); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// UpdateQuickSettings rewrites proxy-url, the bind host and the sensitive-word list.
+// The atomic rename triggers the engine file watcher (L2 hot reload).
+// sensitiveWordsCSV is comma separated; an empty value restores the defaults.
+func UpdateQuickSettings(dataDir string, proxyURL string, allowLan bool, sensitiveWordsCSV string) string {
+	if err := updateQuickSettings(dataDir, proxyURL, allowLan, sensitiveWordsCSV); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func itoa(v int) string { return fmt.Sprintf("%d", v) }
+
+func configPath(dataDir string) string { return filepath.Join(dataDir, ConfigFileName) }
+
+func authDir(dataDir string) string { return filepath.Join(dataDir, AuthDirName) }
+
+func ensureDir(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("empty directory")
+	}
+	return os.MkdirAll(dir, 0o700)
+}
+
+func startProxy(dataDir string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("dataDir is required")
+	}
+	state.mu.Lock()
+	already := state.service != nil
+	state.mu.Unlock()
+	if already {
+		return nil
+	}
+
+	if err := ensureDir(dataDir); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	if err := ensureDir(authDir(dataDir)); err != nil {
+		return fmt.Errorf("create auth dir: %w", err)
+	}
+	if err := ensureDefaultConfig(dataDir, "", false); err != nil {
+		return err
+	}
+
+	path := configPath(dataDir)
+	cfg, err := sdkconfig.LoadConfig(path)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if cfg == nil {
+		return fmt.Errorf("load config: empty result")
+	}
+	cfg.AuthDir = authDir(dataDir)
+
+	listen := net.JoinHostPort(bindHost(cfg.Host), itoa(bindPort(cfg.Port)))
+
+	svc, err := cliproxy.NewBuilder().
+		WithConfig(cfg).
+		WithConfigPath(path).
+		WithLocalManagementPassword(ManagementKey).
+		Build()
+	if err != nil {
+		return fmt.Errorf("build engine: %w", err)
+	}
+
+	attachLogger(dataDir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if errRun := svc.Run(ctx); errRun != nil && !strings.Contains(errRun.Error(), "context canceled") {
+			recordError(errRun)
+		}
+	}()
+
+	if err := waitForListen(listen, readyTimeout); err != nil {
+		cancel()
+		<-done
+		return fmt.Errorf("engine did not become ready on %s: %w", listen, err)
+	}
+
+	state.mu.Lock()
+	state.service = svc
+	state.cancel = cancel
+	state.done = done
+	state.dataDir = dataDir
+	state.listenAddr = listen
+	lastError = ""
+	state.mu.Unlock()
+	return nil
+}
+
+func recordError(err error) {
+	state.mu.Lock()
+	lastError = err.Error()
+	state.mu.Unlock()
+	log.Errorf("cpa engine stopped: %v", err)
+}
+
+func stopProxy() error {
+	state.mu.Lock()
+	svc := state.service
+	cancel := state.cancel
+	done := state.done
+	logFile := state.logFile
+	state.service = nil
+	state.cancel = nil
+	state.done = nil
+	state.listenAddr = ""
+	state.logFile = nil
+	state.mu.Unlock()
+
+	if svc == nil || cancel == nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return nil
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(stopTimeout):
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return fmt.Errorf("engine shutdown timed out after %s", stopTimeout)
+	}
+	if logFile != nil {
+		_ = logFile.Close()
+	}
+	return nil
+}
+
+func attachLogger(dataDir string) {
+	path := filepath.Join(dataDir, "cpa-engine.log")
+	if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+		state.mu.Lock()
+		state.logFile = f
+		state.mu.Unlock()
+		log.SetOutput(io.MultiWriter(f))
+		log.SetLevel(log.InfoLevel)
+		log.SetFormatter(&log.TextFormatter{DisableColors: true, FullTimestamp: true})
+		return
+	}
+	log.SetOutput(io.Discard)
+}
+
+func waitForListen(addr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+		time.Sleep(probeInterval)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timeout")
+	}
+	return lastErr
+}
+
+func bindHost(configured string) string {
+	if strings.TrimSpace(configured) == "" {
+		return loopbackHost
+	}
+	return configured
+}
+
+func bindPort(configured int) int {
+	if configured <= 0 {
+		return DefaultPort
+	}
+	return configured
+}
+
+func yamlScalar(v string) string {
+	if v == "" {
+		return "\"\""
+	}
+	out, err := yaml.Marshal(v)
+	if err != nil {
+		return "\"\""
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+func renderDefaultConfig(dataDir, proxyURL string, allowLan bool) string {
+	host := loopbackHost
+	if allowLan {
+		host = anyHost
+	}
+	words := make([]string, 0, len(defaultSensitiveWords))
+	for _, w := range defaultSensitiveWords {
+		words = append(words, "        - "+yamlScalar(w))
+	}
+	return fmt.Sprintf(defaultConfigTemplate,
+		yamlScalar(host), DefaultPort, yamlScalar(proxyURL), yamlScalar(defaultAPIKey),
+		yamlScalar(ManagementKey), yamlScalar(authDir(dataDir)), strings.Join(words, "\n"))
+}
+
+const defaultConfigTemplate = `# CPA-Android default configuration (CLIProxyAPI v8 layout).
+# Hardened defaults: antigravity thinking-block signature cache, credits fallback,
+# zero-width-space obfuscation of WAF trigger words, and a 15s SSE keep-alive so long
+# "thinking" phases survive mobile NAT idle timers.
+config-version: 8
+
+server:
+  host: %s
+  port: %d
+
+requests:
+  # Upstream proxy for provider calls (socks5/http/https, "direct" or "none").
+  proxy-url: %s
+  streaming:
+    # Emit ": keep-alive" SSE heartbeats every 15s while the model is thinking.
+    keepalive-seconds: 15
+    # Retry a streaming request before any byte reached the client.
+    bootstrap-retries: 2
+    send-keepalive-before-ft: true
+
+access:
+  api-keys:
+    - %s
+
+management:
+  allow-remote: false
+  secret-key: %s
+  disable-control-panel: false
+  disable-auto-update-panel: true
+
+oauth:
+  auth-dir: %s
+  providers:
+    antigravity:
+      # Cache and re-validate thought signatures (cpa-gemini-carrier-v1 / R..E.. base64).
+      signature-cache-enabled: true
+      # Last-resort fallback to Google One AI credits after the free tier is exhausted.
+      antigravity-credits: true
+      # Obfuscated with U+200B before the payload leaves the device.
+      sensitive-words:
+%s
+      connection-pool:
+        enabled: true
+        idle-conn-timeout: "30s"
+        max-idle-conns-per-host: 2
+
+routing:
+  retry:
+    request-retry: 3
+    max-retry-credentials: 2
+    max-retry-interval: 30
+
+observability:
+  logs:
+    debug: false
+    logging-to-file: false
+`
+
+func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("dataDir is required")
+	}
+	if err := ensureDir(dataDir); err != nil {
+		return err
+	}
+	if err := ensureDir(authDir(dataDir)); err != nil {
+		return err
+	}
+	path := configPath(dataDir)
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return writeFileAtomic(path, []byte(renderDefaultConfig(dataDir, proxyURL, allowLan)))
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := ensureDir(dir); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".config-*.yaml")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWordsCSV string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("dataDir is required")
+	}
+	path := configPath(dataDir)
+	if _, err := os.Stat(path); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		if err := ensureDefaultConfig(dataDir, proxyURL, allowLan); err != nil {
+			return err
+		}
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	if len(doc.Content) == 0 {
+		if err := yaml.Unmarshal([]byte("config-version: 8\n"), &doc); err != nil {
+			return err
+		}
+	}
+	root := doc.Content[0]
+
+	host := loopbackHost
+	if allowLan {
+		host = anyHost
+	}
+	setPath(root, []string{"server", "host"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: host})
+	setPath(root, []string{"requests", "proxy-url"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: strings.TrimSpace(proxyURL)})
+	setPath(root, []string{"oauth", "auth-dir"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: authDir(dataDir)})
+
+	seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	for _, w := range parseSensitiveWords(sensitiveWordsCSV) {
+		seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: w})
+	}
+	setPath(root, []string{"oauth", "providers", "antigravity", "sensitive-words"}, seq)
+
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, out)
+}
+
+func parseSensitiveWords(csv string) []string {
+	out := make([]string, 0, len(defaultSensitiveWords))
+	seen := make(map[string]bool, len(defaultSensitiveWords))
+	for _, part := range strings.Split(csv, ",") {
+		w := strings.TrimSpace(part)
+		if w == "" || seen[w] {
+			continue
+		}
+		seen[w] = true
+		out = append(out, w)
+	}
+	if len(out) == 0 {
+		return append([]string(nil), defaultSensitiveWords...)
+	}
+	return out
+}
+
+func setPath(root *yaml.Node, path []string, value *yaml.Node) {
+	if root == nil {
+		return
+	}
+	if root.Kind != yaml.MappingNode {
+		root.Kind = yaml.MappingNode
+		root.Tag = "!!map"
+		root.Content = nil
+	}
+	cur := root
+	for i, key := range path {
+		last := i == len(path)-1
+		var child *yaml.Node
+		for j := 0; j+1 < len(cur.Content); j += 2 {
+			if cur.Content[j].Value == key {
+				child = cur.Content[j+1]
+				break
+			}
+		}
+		if last {
+			if child != nil {
+				*child = *value
+				return
+			}
+			cur.Content = append(cur.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, value)
+			return
+		}
+		if child == nil {
+			child = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			cur.Content = append(cur.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, child)
+		} else if child.Kind != yaml.MappingNode {
+			*child = yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		}
+		cur = child
+	}
+}
