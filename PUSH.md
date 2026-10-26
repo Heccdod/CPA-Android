@@ -1,53 +1,30 @@
-# 推送到 GitHub
+# 发布状态
 
-本机没有 GitHub 凭据（`gh` 未安装、无 token、无 SSH key），所以这四条 commit 与 v2.1.0 tag
-还没有推出去。仓库已经就绪：remote 指向 `Heccdod/CPA-Android`，历史干净地接在 `Initial commit` 之上，
-`.git` 只有 2.9 MB（构建产物全部 gitignore，由 Release 承载）。
+已发布：https://github.com/Heccdod/CPA-Android/releases/tag/v2.1.0
 
-## 1. 推送代码与 tag
+## 已上线的东西
 
-```bash
-cd /root/AgyAndriod
-git push https://<YOUR_TOKEN>@github.com/Heccdod/CPA-Android.git main
-git push https://<YOUR_TOKEN>@github.com/Heccdod/CPA-Android.git v2.1.0
-```
+| 内容 | 位置 |
+| :--- | :--- |
+| v2.1.0 正式包 | https://github.com/Heccdod/CPA-Android/releases/tag/v2.1.0 |
+| CI 自动同步流水线 | `.github/workflows/auto-sync-upstream.yml`，每 6 小时对一次上游 |
+| 安装说明 | README.md |
 
-token 在 https://github.com/settings/tokens 生成，勾 `repo` 即可。
+## token
 
-## 2. 发布 Release
+GitHub 的 device-flow token 存在 `/root/.cpa-gh-token`（权限 600，scope `repo workflow`）。
+失效后用 `bash scripts/gh-device-login.sh` 重新授权。
 
-资产已经构建好放在 `dist/`：
+## 下次发版
 
-```
-dist/CPA-Android-2.1.0.apk        33 MB   release，优先装这个
-dist/CPA-Android-2.1.0-debug.apk  36 MB   调试用，签名与 release 一致
-dist/libgojni-v2.1.0.so           90 MB   裸内核，供热更新使用
-dist/SHA256SUMS.txt                      校验和
-dist/RELEASE_NOTES.md                    发布说明
-```
+1. 改 `app/build.gradle.kts` 的 `versionCode` / `versionName`
+2. `./gradlew assembleRelease assembleDebug`
+3. `git tag -a vX.Y.Z -m 'CPA-Android X.Y.Z' && git push origin main vX.Y.Z`
+4. 到 Releases 页面基于该 tag 建 release，上传 release APK、debug APK、裸内核 .so、SHA256SUMS.txt
 
-网页操作：仓库 → Releases → Draft a new release → 选 tag `v2.1.0` → 粘贴 RELEASE_NOTES.md
-→ 上传 dist/ 里除 RELEASE_NOTES.md 外的四个文件 → Publish。
+## 两条护栏
 
-或者装 `gh` 一条命令搞定：
-
-```bash
-gh release create v2.1.0 \
-  dist/CPA-Android-2.1.0.apk \
-  dist/CPA-Android-2.1.0-debug.apk \
-  dist/libgojni-v2.1.0.so \
-  dist/SHA256SUMS.txt \
-  --title 'CPA-Android 2.1.0' \
-  --notes-file dist/RELEASE_NOTES.md
-```
-
-## 3. tag 名要对上
-
-App 里的更新检查认 `releases/latest` 的 `tag_name`，并且已经忽略 `v` 前缀，所以 `v2.1.0`
-和 `2.1.0` 都行。内核资产名只要含 `libgojni` 且以 `.so` 结尾就能被热更新识别，
-含 `debug` 的 APK 会被跳过（避免用调试包覆盖已签名的正式包）。
-
-## 4. 之后自动化
-
-`.github/workflows/auto-sync-upstream.yml` 已经就位：每 6 小时对一次上游 head，变了就重编
-AAR、跑测试、出包、发 Release。推上去之后这条流水线会自己接管后续版本。
+- **CI 的 release 必须带 `--prerelease`**。App 读的是 `releases/latest`，普通 release 一创建就会顶掉正式版，
+  更新检查会永远提示有新版本。已固化在 workflow 里。
+- **资产名规则**：内核名含 `libgojni` 且以 `.so` 结尾才会被热更新识别；含 `debug` 的 APK 会被跳过，
+  避免用调试包覆盖已签名正式包。
