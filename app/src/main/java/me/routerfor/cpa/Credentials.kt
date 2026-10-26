@@ -1,6 +1,5 @@
 package me.routerfor.cpa
 
-import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -10,7 +9,8 @@ import java.net.URL
  *
  * Reading the credential JSON files directly was the earlier approach and could not tell an
  * account's enabled/disabled state, which is exactly what the aggregation switch needs.
- * GET /v8/management/credentials returns files:[{name,provider,email,disabled,status}].
+ * GET /v8/management/credentials returns files:[{name, auth_index, provider, email, disabled,
+ * status, project_id}]. auth_index is what the quota proxy needs, so it is carried on the entry.
  */
 object Credentials {
 
@@ -19,7 +19,9 @@ object Credentials {
         val provider: String,
         val email: String,
         val disabled: Boolean,
-        val status: String
+        val status: String,
+        val authIndex: String = "",
+        val projectId: String? = null
     ) {
         val providerLabel: String get() = Provider.labelOf(provider)
     }
@@ -28,7 +30,7 @@ object Credentials {
 
     fun list(): List<Entry> = runCatching {
         val body = request("GET", "/v8/management/credentials", null) ?: return emptyList()
-        val files = JSONObject(body).optJSONArray("files") ?: JSONArray()
+        val files = JSONObject(body).optJSONArray("files") ?: return emptyList()
         (0 until files.length()).mapNotNull { i ->
             files.optJSONObject(i)?.let { o ->
                 Entry(
@@ -36,7 +38,9 @@ object Credentials {
                     provider = o.optString("provider").ifEmpty { o.optString("type") },
                     email = o.optString("email").ifEmpty { o.optString("account") }.ifEmpty { "—" },
                     disabled = o.optBoolean("disabled", false),
-                    status = o.optString("status")
+                    status = o.optString("status"),
+                    authIndex = o.optString("auth_index"),
+                    projectId = o.optString("project_id").ifEmpty { null }
                 )
             }
         }.filter { it.name.isNotEmpty() }

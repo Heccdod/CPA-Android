@@ -70,4 +70,11 @@
     <string name="theme_paper">羊皮纸</string>
     <string name="settings_appearance">外观</string>
     <string name="settings_lan_desc">同一 Wi-Fi 下的设备也能访问本机网关</string>
+    <string name="action_refresh">刷新</string>
+    <string name="quota_loading">正在查询额度…</string>
+    <string name="quota_unknown">点右侧刷新查询额度</string>
+    <string name="quota_unavailable">该提供商不提供额度查询</string>
+    <string name="settings_status_quota">状态栏显示额度</string>
+    <string name="settings_status_quota_desc">下拉通知栏展开网关通知，显示已启用账号的剩余额度</string>
+    <string name="action_ok">好</string>
 </resources>

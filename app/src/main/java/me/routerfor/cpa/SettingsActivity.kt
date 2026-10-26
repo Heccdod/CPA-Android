@@ -103,6 +103,7 @@ class SettingsActivity : AppCompatActivity() {
         )))
 
         body.addView(ui.sectionTitle(getString(R.string.settings_update)))
+        body.addView(buildStatusQuotaCard())
         body.addView(buildHotUpdateCard())
 
         body.addView(ui.sectionTitle(getString(R.string.settings_system)))
@@ -221,6 +222,32 @@ class SettingsActivity : AppCompatActivity() {
         ) { on ->
             AppPrefs.get(this).edit().putBoolean(AppPrefs.KEY_LAN, on).apply()
             applyQuickSettings()
+        }
+
+    /**
+     * Opt-in quota block in the expanded notification. Turning it off clears the cached body so
+     * the next repaint drops the lines immediately rather than leaving a stale block behind.
+     */
+    private fun buildStatusQuotaCard(): View =
+        buildSwtichCard(
+            getString(R.string.settings_status_quota),
+            getString(R.string.settings_status_quota_desc),
+            AppPrefs.statusBarQuota(this)
+        ) { on ->
+            AppPrefs.setStatusBarQuota(this, on)
+            if (on) {
+                Thread {
+                    val entries = Credentials.list()
+                    val results = LinkedHashMap<String, Quota.Result>()
+                    for (entry in entries) {
+                        if (entry.disabled) continue
+                        results[entry.name] = Quota.fetch(entry)
+                    }
+                    runOnUiThread { QuotaNotifier.publish(this, entries, results) }
+                }.start()
+            } else {
+                QuotaNotifier.clear(this)
+            }
         }
 
     private fun buildHotUpdateCard(): View {

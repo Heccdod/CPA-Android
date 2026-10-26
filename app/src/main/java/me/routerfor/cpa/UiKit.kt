@@ -113,6 +113,62 @@ class UiKit(private val context: Context, val colors: Palette.Colors) {
         layoutParams = LinearLayout.LayoutParams(width, height)
     }
 
+    /**
+     * A thin horizontal meter for quota. Drawn rather than composed from a ProgressBar because
+     * the bar has to sit on one line under an account row and follow the palette without the
+     * platform's own track tint leaking through.
+     */
+    class QuotaBar(context: Context, private val colors: Palette.Colors) : View(context) {
+
+        /** 0..100, or null for "unknown" which draws an empty track. */
+        var percent: Double? = null
+            set(value) {
+                field = value
+                invalidate()
+            }
+
+        private val track = GradientDrawable()
+        private val fill = GradientDrawable()
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            val h = (HEIGHT_DP * resources.displayMetrics.density).toInt()
+            setMeasuredDimension(
+                resolveSize(suggestedMinimumWidth, widthMeasureSpec),
+                resolveSize(h, heightMeasureSpec)
+            )
+        }
+
+        override fun onDraw(canvas: android.graphics.Canvas) {
+            val h = HEIGHT_DP * resources.displayMetrics.density
+            val w = width.toFloat()
+            val r = h / 2f
+
+            track.setColor(colors.switchOff)
+            track.cornerRadius = r
+            track.setBounds(0, 0, w.toInt(), h.toInt())
+            track.draw(canvas)
+
+            val p = (percent ?: 0.0).coerceIn(0.0, 100.0)
+            if (p <= 0.0) return
+            // Remaining, not used: a full green bar reads as "plenty left" at a glance.
+            val remaining = (100.0 - p) / 100.0
+            val fw = (w * remaining).toFloat()
+            if (fw < h) return
+            fill.setColor(when {
+                remaining >= 0.5 -> colors.ok
+                remaining >= 0.2 -> colors.warn
+                else -> colors.err
+            })
+            fill.cornerRadius = r
+            fill.setBounds(0, 0, fw.toInt(), h.toInt())
+            fill.draw(canvas)
+        }
+
+        companion object {
+            private const val HEIGHT_DP = 6f
+        }
+    }
+
     /** Circular icon button: flat, no ripple ring left behind after a tap. */
     fun iconButton(resId: Int, description: String, size: Int = 40, onClick: () -> Unit): ImageView =
         ImageView(context).apply {
@@ -192,8 +248,10 @@ class UiKit(private val context: Context, val colors: Palette.Colors) {
         }
 
         companion object {
-            private const val TRACK_WIDTH_DP = 52f
-            private const val TRACK_HEIGHT_DP = 32f
+            // Asked to be a little smaller than the first pass: 46x28 still clears the 24dp
+            // minimum touch target once the row's own padding is counted.
+            private const val TRACK_WIDTH_DP = 46f
+            private const val TRACK_HEIGHT_DP = 28f
         }
     }
 }

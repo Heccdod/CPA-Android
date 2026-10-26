@@ -41,11 +41,24 @@ class MainActivity : AppCompatActivity() {
     private lateinit var accountsCard: MaterialCardView
     private lateinit var accountsBox: LinearLayout
     private lateinit var themeButton: ImageView
+    private lateinit var refreshButton: ImageView
 
     private var retryCount = 0
     private var firstPaint = true
     private var accountsLoading = false
     private var applied: Palette.Resolved? = null
+
+    /** Set once the inventory has been read against a live gateway. */
+    private var accountsLoaded = false
+
+    /** Quota results keyed by credential file name. */
+    private val quotas = LinkedHashMap<String, Quota.Result>()
+
+    /** Accounts whose quota request is in flight, so their row can show a spinner state. */
+    private val quotaLoading = mutableSetOf<String>()
+
+    /** Rebind targets, keyed by credential name, rebuilt on every inventory render. */
+    private val quotaHolders = LinkedHashMap<String, QuotaHolder>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,7 +76,10 @@ class MainActivity : AppCompatActivity() {
             return
         }
         refresh(animate = !firstPaint)
-        loadAccounts()
+        // Reading the inventory before the gateway answers returns an empty list, which renders
+        // as "no accounts logged in". The first read happens in refresh() once it is up; every
+        // later resume reads again to pick up accounts added from the panel.
+        if (accountsLoaded) loadAccounts()
     }
 
     /** "跟随系统" has to react to a live OS switch, not only at launch. */
@@ -124,19 +140,39 @@ class MainActivity : AppCompatActivity() {
         }
         bar.addView(ui.title(getString(R.string.app_name)), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         // Theme switcher sits to the left of the gear, exactly as asked.
+        refreshButton = ui.iconButton(R.drawable.ic_refresh, getString(R.string.action_refresh)) {
+            refreshAll()
+        }
+        bar.addView(refreshButton)
         themeButton = ui.iconButton(themeGlyph(), getString(R.string.action_theme)) { cycleTheme() }
         bar.addView(themeButton)
         bar.addView(ui.iconButton(R.drawable.ic_settings, getString(R.string.action_settings)) { openSettings() })
         return bar
     }
 
-    /** SYSTEM shows whatever the OS is on right now, so the glyph never lies. */
+    /**
+     * The one refresh control: re-reads the inventory, then every account's quota.
+     *
+     * Everything that was already loading is marked again rather than skipped, so the whole
+     * card visibly enters the refreshing state together — the per-account buttons included.
+     */
+    private fun refreshAll() {
+        if (accountsLoading) return
+        refreshButton.animate().rotationBy(360f).setDuration(650).start()
+        loadAccounts(forceQuota = true)
+    }
+
+    /**
+     * One glyph per mode, and "跟随系统" gets its own half-and-half icon.
+     *
+     * It used to borrow the day or night glyph depending on the OS setting, which made
+     * "follow system, currently light" indistinguishable from "explicitly day".
+     */
     private fun themeGlyph(): Int = when (ThemeManager.mode(this)) {
         Palette.Mode.DAY -> R.drawable.ic_theme_day
         Palette.Mode.NIGHT -> R.drawable.ic_theme_night
         Palette.Mode.PAPER -> R.drawable.ic_theme_paper
-        Palette.Mode.SYSTEM ->
-            if (ThemeManager.isDark(this)) R.drawable.ic_theme_night else R.drawable.ic_theme_day
+        Palette.Mode.SYSTEM -> R.drawable.ic_theme_auto
     }
 
     private fun cycleTheme() {
@@ -248,20 +284,59 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------------------------------------------------------- accounts
 
-    private fun loadAccounts() {
+    /**
+     * Reads the inventory, then kicks off quota for every account.
+     *
+     * [forceQuota] re-fetches quota even when a value is already cached, which is what the top
+     * refresh button means; a normal resume only fills in accounts that have no value yet, so
+     * returning to the screen does not hammer every provider.
+     */
+    private fun loadAccounts(forceQuota: Boolean = false) {
         if (accountsLoading) return
         accountsLoading = true
         Thread {
             val entries = Credentials.list()
             runOnUiThread {
                 accountsLoading = false
+                accountsLoaded = true
                 renderAccounts(entries)
+                val stale = if (forceQuota) entries else entries.filter { !quotas.containsKey(it.name) }
+                if (stale.isNotEmpty()) fetchQuota(stale)
             }
         }.start()
     }
 
+    /** Fetches quota for the given accounts, publishing each result as it lands. */
+    private fun fetchQuota(targets: List<Credentials.Entry>) {
+        if (targets.isEmpty()) return
+        targets.forEach { quotaLoading.add(it.name) }
+        renderQuotaStates()
+        Thread {
+            for (entry in targets) {
+                val result = Quota.fetch(entry)
+                quotas[entry.name] = result
+                quotaLoading.remove(entry.name)
+                runOnUiThread { renderQuotaStates() }
+            }
+            // The notification needs the whole inventory, not just the accounts just fetched,
+            // so it lists every enabled credential rather than the last refresh subset.
+            val all = Credentials.list()
+            runOnUiThread { QuotaNotifier.publish(this, all, quotas) }
+        }.start()
+    }
+
+    /** Rebinds every account row currently on screen to its latest quota state. */
+    private fun renderQuotaStates() {
+        for ((name, holder) in quotaHolders) {
+            holder.bind(quotas[name], quotaLoading.contains(name))
+        }
+    }
+
     private fun renderAccounts(entries: List<Credentials.Entry>) {
         accountsBox.removeAllViews()
+        // Row bindings belong to the views just removed; without clearing, a rebind would write
+        // into detached views and the freshly built rows would never update.
+        quotaHolders.clear()
         accountsBox.setPadding(ui.dp(18), ui.dp(16), ui.dp(18), ui.dp(12))
 
         val head = LinearLayout(this).apply {
@@ -349,11 +424,20 @@ class MainActivity : AppCompatActivity() {
         return row
     }
 
+    /**
+     * One account: email + its own refresh button + the on/off switch, with the quota meter
+     * underneath. The refresh button is per account on purpose — a slow provider must not
+     * block the others, and a single account is usually all that needs re-asking.
+     */
     private fun accountRow(entry: Credentials.Entry): View {
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(ui.dp(34), ui.dp(6), 0, ui.dp(8))
+        }
+
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(ui.dp(34), ui.dp(4), 0, ui.dp(4))
         }
         row.addView(TextView(this).apply {
             text = entry.email
@@ -363,8 +447,17 @@ class MainActivity : AppCompatActivity() {
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-            rightMargin = ui.dp(8)
+            rightMargin = ui.dp(6)
         })
+
+        // Per-account refresh: spins itself, and only re-asks this one credential.
+        val holder = QuotaHolder(ui)
+        val spin = ui.iconButton(R.drawable.ic_refresh, getString(R.string.action_refresh), size = 30) {
+            if (quotaLoading.contains(entry.name)) return@iconButton
+            loadQuota(entry)
+        }
+        holder.spin = spin
+        row.addView(spin)
 
         row.addView(UiKit.ClassicSwitch(this, ui.colors).apply {
             isChecked = !entry.disabled
@@ -376,7 +469,96 @@ class MainActivity : AppCompatActivity() {
                 }.start()
             }
         })
-        return row
+        column.addView(row)
+
+        holder.attach(column)
+        quotaHolders[entry.name] = holder
+        holder.bind(quotas[entry.name], quotaLoading.contains(entry.name))
+        return column
+    }
+
+    /** Re-asks one account's quota and animates just that account's button. */
+    private fun loadQuota(entry: Credentials.Entry) {
+        fetchQuota(listOf(entry))
+    }
+
+    /**
+     * One account's quota line: a meter plus a caption, or the reason there is none.
+     *
+     * The row's own refresh button is held here so [bind] can spin it while that account is in
+     * flight and stop it when the answer lands — the button belongs to the row, the state
+     * belongs to the holder.
+     */
+    private inner class QuotaHolder(private val kit: UiKit) {
+
+        var spin: ImageView? = null
+
+        private val bar = UiKit.QuotaBar(this@MainActivity, kit.colors)
+        // Two lines: a provider can report several windows ("5 小时额度 剩 98% · 3 小时"
+        // plus "每周额度 剩 62% · 4 天") and cutting them off hides most of the information.
+        private val caption = TextView(this@MainActivity).apply {
+            textSize = 11f
+            setTextColor(kit.colors.textTertiary)
+            includeFontPadding = false
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+
+        private var attached = false
+
+        /** Adds the meter and caption under an account row. */
+        fun attach(parent: LinearLayout) {
+            if (attached) return
+            attached = true
+            parent.addView(bar, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = kit.dp(4) })
+            parent.addView(caption, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = kit.dp(3) })
+        }
+
+        fun bind(result: Quota.Result?, loading: Boolean) {
+            if (!attached) {
+                // Not placed yet: nothing to draw into, and bind is called once right after
+                // attach in the normal path.
+                return
+            }
+            spin?.let { button ->
+                button.animate().cancel()
+                button.alpha = if (loading) 0.45f else 1f
+                if (loading) button.animate().rotationBy(360f).setDuration(650).start()
+            }
+            when {
+                loading -> {
+                    bar.percent = null
+                    caption.text = getString(R.string.quota_loading)
+                }
+                result == null -> {
+                    bar.percent = null
+                    caption.text = getString(R.string.quota_unknown)
+                }
+                result.error != null -> {
+                    bar.percent = null
+                    caption.text = result.error
+                }
+                result.unsupported || !result.hasData -> {
+                    bar.percent = null
+                    caption.text = getString(R.string.quota_unavailable)
+                }
+                else -> {
+                    bar.percent = result.windows.mapNotNull { it.usedPercent }.maxOrNull()
+                    caption.text = buildString {
+                        for ((i, w) in result.windows.withIndex()) {
+                            if (i > 0) append("\n")
+                            append(w.label)
+                            w.usedPercent?.let { append(" 剩 ").append((100.0 - it).toInt()).append("%") }
+                            w.resetLabel?.let { append(" · ").append(it) }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun providerGlyph(provider: Provider?): View {
@@ -499,6 +681,13 @@ class MainActivity : AppCompatActivity() {
             "内核 " + BuildConfig.VERSION_NAME + " · 热更新" + hot
         }
         startStopButton.text = if (running) getString(R.string.action_restart) else getString(R.string.action_start)
+
+        // Repaint only: the quota snapshot is owned by fetchQuota(), and passing nothing here
+        // keeps whatever it last collected instead of blanking the expanded notification.
+
+        // The inventory is read as soon as the gateway answers, and again on any later retry
+        // that finds it up after it was down.
+        if (running && !accountsLoaded) loadAccounts()
 
         if (animate) playEntrance()
         firstPaint = false

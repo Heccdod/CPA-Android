@@ -49,6 +49,8 @@ CPA-Android/
 │       ├── AppPrefs.kt              # 设置持久化（热更新默认关闭）
 │       ├── Credentials.kt           # 经 /v8/management/credentials 读写账号与启停
 │       ├── OauthLauncher.kt         # 走 /v8/management/oauth/auth-url 取授权链接
+│       ├── Quota.kt                 # 各家额度接口的代理调用与解析
+│       ├── QuotaNotifier.kt         # 状态栏通知里的额度快照
 │       └── WebBridgeCompat.kt       # gomobile 绑定的安全包装
 └── .github/workflows/auto-sync-upstream.yml
 ```
@@ -59,8 +61,8 @@ CPA-Android/
 
 | 页面 | 内容 |
 | :--- | :--- |
-| 首页 `MainActivity` | 标题右侧是主题按钮（齿轮左边）+ 齿轮。状态卡：运行绿点 / 服务地址 / API 密钥点按复制 / 内核版本 + 热更新状态。AI 提供商卡：按提供商分组聚合所有账号，每组一个整组开关、每账号一个开关（走 `PATCH /v8/management/credentials/status`）。快捷操作四按钮同形（管理面板 / 快捷添加 / 重启网关 / 设置）。 |
-| 设置 `SettingsActivity` | 外观：跟随系统 / 日间 / 黑夜 / 羊皮纸四选一（当前项打勾）。网络：上游代理（`socks5://…` 或「直连」）、允许局域网访问（经典圆形开关）。引擎：敏感词混淆、直接编辑 `config.yaml`（等宽字体，保存后热重载）。更新：内核热更新开关（经典圆形开关）、检查更新、同步远程规则。系统：忽略电池优化、重启网关。关于：版本 / 架构 / 热更新状态。 |
+| 首页 `MainActivity` | 右上角三个按钮：刷新（全局，同时让每个账号的独立刷新按钮进入刷新态）、主题、齿轮。状态卡：运行绿点 / 服务地址 / API 密钥点按复制 / 内核版本 + 热更新状态。AI 提供商卡：按提供商分组聚合所有账号，每组一个整组开关、每账号一个开关（走 `PATCH /v8/management/credentials/status`），账号下方是额度条 + 额度文案 + 独立刷新按钮。快捷操作四按钮同形（管理面板 / 快捷添加 / 重启网关 / 设置）。 |
+| 设置 `SettingsActivity` | 外观：跟随系统 / 日间 / 黑夜 / 羊皮纸四选一（当前项打勾）。网络：上游代理（`socks5://…` 或「直连」）、允许局域网访问（经典圆形开关）。引擎：敏感词混淆、直接编辑 `config.yaml`（等宽字体，保存后热重载）。更新：状态栏显示额度（经典圆形开关）、内核热更新开关、检查更新、同步远程规则。系统：忽略电池优化、重启网关。关于：版本 / 架构 / 热更新状态。 |
 | 面板 `PanelActivity` | 全屏 `/management.html`，预置登录态直接进；供应商 OAuth 与 `localhost:51121` 回调交给 Chrome Custom Tabs，全程零粘贴。返回箭头与系统返回键都直接回主界面，不走 SPA 历史。 |
 
 全中文，无英文残留。界面不再用 M3 的默认配色与阴影，改为手写视图 + `UiKit` 统一绘制：
@@ -108,6 +110,32 @@ WebView 永远看不到未净化版本（推广串在模块脚本内部，只改
 ```
 I CpaPanel: panel raw=3160171 clean=3159826 patched=3162391 sponsor=false
 ```
+
+## 额度显示（2.2 新增）
+
+内核没有现成的「还剩多少额度」接口：`/v8/management/credentials` 里的 `quota.signals` 只是上一次真实请求带回来的响应头水位，新账号是空的。面板的做法是**代理请求各家的官方额度接口**，走的正是 `POST /v8/management/requests/api-call`：内核用选定凭据的 access token 替换请求头里的字面量 `Bearer $TOKEN$`（必要时先刷新），所以 App 自己从不碰 token。
+
+各家返回格式不同，解析按 provider 分开：
+
+| provider | 接口 | 取什么 |
+| :--- | :--- | :--- |
+| antigravity | `POST v1internal:retrieveUserQuotaSummary`（三个 host 依次回退） | `groups[].buckets[].remainingFraction` |
+| claude | `GET /api/oauth/usage` | `five_hour` / `seven_day` 等的 `utilization` |
+| codex | `GET /backend-api/wham/usage` | `rate_limit.primary/secondary.used_percent` |
+| xai / kimi | 各自的 usage 接口 | `used_percent` |
+| 其他 | — | 显示「该提供商不提供额度查询」，不算错误 |
+
+**踩过的坑**：antigravity 的额度接口按 `User-Agent` 认客户端，少带这个头会返回 403「You do not have a valid license of this product」——看起来像账号没权限，其实只是少一个 header。用 curl 手测时 UA 是 curl 默认值所以能通，App 里就得显式带上 `antigravity/hub/2.23.0 darwin/arm64`。
+
+antigravity 同一组额度会按模型族各报一遍（`Gemini Models` 与 `Claude and GPT models` 各有 weekly / 5h），所以标签必须带族名，否则看起来像四条重复数据。
+
+刷新机制分三层，都不轮询：
+
+1. **自动**：进入首页且引擎已就绪时，只补拉还没有缓存值的账号。
+2. **全局刷新**：右上角那颗按钮，重拉所有账号，同时让每个账号的独立刷新按钮一起进入刷新态。
+3. **单账号刷新**：账号行里的按钮，只重问这一个凭据，不阻塞其他账号。
+
+「状态栏显示额度」开关默认关闭：把账号名放到锁屏上不该是默认行为。开启后下拉展开网关通知，正文列出每个已启用账号的剩余额度与采集时间。通知正文是**缓存快照**，由额度拉取完成或网关状态刷新触发重绘，不跑定时器——前台服务里的轮询正是 Android 会掐掉的东西，而一个悄悄停住的数字比一个带时间戳的旧数字更糟。
 
 ## 构建
 
@@ -328,8 +356,20 @@ CI 里已在 bind 后与 assemble 后各加一道 `scripts/check16k.py`，防止
 （"could not read ok from ADB Server"）；先在 WSL 里 adb kill-server 清场，Windows 侧才能正常枚举。
 无线那台反过来要先 adb tcpip 5555 再 adb connect <ip>:5555。
 
-界面截图在 docs/screens/：home-day.png / home-dark.png / home-paper.png（首页三套主题）、
-settings-day.png（设置页）、panel-day.png / panel-dark.png / panel-paper.png（面板跟随 App 主题）、
+在 WSL2 下手机挂在 Windows 侧，WSL 自己的 adb 根本看不到设备；把 `ADB_SERVER_SOCKET` 指过去也没用
+（跨 WSL/Windows 边界的 adb 握手会被 reset）。所以设备命令一律走 `scripts/adbw.sh`，它固定调用
+`adb.exe -s <serial>`，用之前确认 5037 没被 WSL 的 adb 抢走：
+
+```bash
+pkill -f platform-tools/adb            # 放掉 5037
+adb.exe start-server                   # Windows 侧重新拉起
+scripts/adbw.sh shell getprop ro.product.model
+```
+
+界面截图在 docs/screens/：home-day.png / home-dark.png / home-paper.png / home-follow-system.png
+（首页四个主题态）、home-quota.png（额度条与账号行）、home-refreshing.png（全局刷新态）、
+settings-day.png / settings-quota.png（设置页与状态栏额度开关）、
+panel-day.png / panel-dark.png / panel-paper.png（面板跟随 App 主题）、
 quick-add.png（快捷添加的品牌图标）。
 
 > 提醒：装新包前先 am force-stop 再截屏，否则 QQ 之类的悬浮窗和软键盘会压在截图上。

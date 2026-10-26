@@ -17,6 +17,7 @@ object AppPrefs {
     const val KEY_LAN = "allow-lan"
     const val KEY_HOT_UPDATE = "hot-update-enabled"
     const val KEY_RULE_SYNC = "rule-sync-enabled"
+    const val KEY_STATUS_QUOTA = "status-bar-quota"
 
     fun get(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -40,5 +41,16 @@ object AppPrefs {
 
     fun setRuleSyncEnabled(context: Context, enabled: Boolean) {
         get(context).edit().putBoolean(KEY_RULE_SYNC, enabled).apply()
+    }
+
+    /**
+     * Shows the per-account quota block in the expanded gateway notification.
+     *
+     * Off by default: account names on a lock screen are not something to opt someone into.
+     */
+    fun statusBarQuota(context: Context): Boolean = get(context).getBoolean(KEY_STATUS_QUOTA, false)
+
+    fun setStatusBarQuota(context: Context, enabled: Boolean) {
+        get(context).edit().putBoolean(KEY_STATUS_QUOTA, enabled).apply()
     }
 }

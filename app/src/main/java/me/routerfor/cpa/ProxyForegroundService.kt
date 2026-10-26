@@ -32,6 +32,12 @@ class ProxyForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_REPAINT -> {
+                // Only the notification body changes; the engine is untouched.
+                Log.i(TAG, "repaint, quotaLines=" + QuotaNotifier.cachedBody().length)
+                updateNotification(getString(R.string.notif_listening, WebBridgeCompat.listenAddress()))
+                return START_STICKY
+            }
             ACTION_STOP -> {
                 stopGateway()
                 stopForegroundCompat()
@@ -124,6 +130,8 @@ class ProxyForegroundService : Service() {
     }
 
     private fun buildNotification(content: String): Notification {
+        val quota = QuotaNotifier.cachedBody()
+        val body = if (quota.isEmpty()) content else content + "\n" + quota
         val openIntent = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -136,7 +144,7 @@ class ProxyForegroundService : Service() {
             this, 2, Intent(this, ProxyForegroundService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notif_title))
             .setContentText(content)
             .setSmallIcon(android.R.drawable.stat_sys_upload_done)
@@ -146,7 +154,11 @@ class ProxyForegroundService : Service() {
             .addAction(0, getString(R.string.action_restart), restartIntent)
             .addAction(0, getString(R.string.action_stop), stopIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+        // The expanded body is where the quota lines live; collapsed it stays one short line.
+        if (quota.isNotEmpty()) {
+            builder.setStyle(NotificationCompat.BigTextStyle().bigText(body))
+        }
+        return builder.build()
     }
 
     private fun updateNotification(content: String) {
@@ -167,6 +179,7 @@ class ProxyForegroundService : Service() {
         const val ACTION_START = "me.routerfor.cpa.action.START"
         const val ACTION_STOP = "me.routerfor.cpa.action.STOP"
         const val ACTION_RESTART = "me.routerfor.cpa.action.RESTART"
+        const val ACTION_REPAINT = "me.routerfor.cpa.action.REPAINT"
         private const val TAG = "CpaService"
         private const val CHANNEL_ID = "cpa-gateway"
         private const val NOTIFICATION_ID = 8317
