@@ -35,27 +35,23 @@ android {
         }
     }
 
+    // Personal-use build: a private release key would be cpa-release.jks plus a
+    // keystore.properties, but this checkout has none, and an unsigned release APK cannot be
+    // installed. When the properties file is absent the release build borrows the debug signing
+    // config, which AGP materialises on its own — referencing ~/.android/debug.keystore by path
+    // instead would break on a clean CI runner where that file does not exist yet.
+    val releaseKeystore = rootProject.file("keystore.properties")
+    val releaseProps = Properties().apply {
+        if (releaseKeystore.exists()) releaseKeystore.inputStream().use { load(it) }
+    }
+
     signingConfigs {
-        // Personal-use build: a private release key would live here as cpa-release.jks plus a
-        // keystore.properties, but this checkout has none, and an unsigned release APK cannot
-        // be installed. Falling back to the debug key keeps assembleRelease producing an
-        // installable artifact. Add the two files and the release block picks them up without
-        // any further change.
-        create("release") {
-            val props = Properties()
-            val propsFile = rootProject.file("keystore.properties")
-            if (propsFile.exists()) {
-                propsFile.inputStream().use { props.load(it) }
-                storeFile = rootProject.file(props.getProperty("storeFile"))
-                storePassword = props.getProperty("storePassword")
-                keyAlias = props.getProperty("keyAlias")
-                keyPassword = props.getProperty("keyPassword")
-            } else {
-                val debug = File(System.getProperty("user.home"), ".android/debug.keystore")
-                storeFile = debug
-                storePassword = "android"
-                keyAlias = "androiddebugkey"
-                keyPassword = "android"
+        if (releaseKeystore.exists()) {
+            create("release") {
+                storeFile = rootProject.file(releaseProps.getProperty("storeFile"))
+                storePassword = releaseProps.getProperty("storePassword")
+                keyAlias = releaseProps.getProperty("keyAlias")
+                keyPassword = releaseProps.getProperty("keyPassword")
             }
         }
     }
@@ -63,7 +59,11 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (releaseKeystore.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         debug {

@@ -95,7 +95,10 @@ class UpdateManager(private val context: Context) {
                         val url = asset.optString("browser_download_url")
                         val digest = asset.optString("digest")
                         when {
-                            name.endsWith("libgojni.so") -> {
+                            // Releases name the kernel libgojni-<tag>.so, so an exact
+                            // endsWith("libgojni.so") never matched anything.
+                            name.contains("libgojni", ignoreCase = true) &&
+                                name.endsWith(".so", ignoreCase = true) -> {
                                 soAssetUrl = url
                                 soDigest = digest
                             }
