@@ -78,7 +78,9 @@ class UpdateManager(private val context: Context) {
                 if (tag.isNullOrEmpty()) {
                     return@runCatching "远程 Release 没有 tag_name"
                 }
-                if (tag == current) {
+                // Release tags are conventionally "v2.1.0" while versionName is "2.1.0";
+                // comparing them verbatim would report an update on every single check.
+                if (tag.removePrefix("v") == current.removePrefix("v")) {
                     return@runCatching "已是最新版本（$current）"
                 }
                 val assets = release.optJSONArray("assets")
@@ -97,7 +99,10 @@ class UpdateManager(private val context: Context) {
                                 soAssetUrl = url
                                 soDigest = digest
                             }
-                            name.endsWith(".apk") -> {
+                            // A release ships both a signed and a debug APK. Installing the
+                            // debug one over the release one fails the signature check, so
+                            // only the release asset is offered here.
+                            name.endsWith(".apk") && !name.contains("debug", ignoreCase = true) -> {
                                 apkAssetUrl = url
                                 apkName = name
                             }

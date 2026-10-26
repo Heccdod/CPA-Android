@@ -21,3 +21,6 @@ keystore.properties
 
 # Local agent/skill scratch directories are not part of the app.
 .dsh/
+
+# Built assets live outside git; they are attached to a release.
+dist/
