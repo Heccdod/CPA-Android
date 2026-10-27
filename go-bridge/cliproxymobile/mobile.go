@@ -25,6 +25,8 @@ const (
 	ConfigFileName = "config.yaml"
 	// AuthDirName is the OAuth credential store created next to the config file.
 	AuthDirName = "auths"
+	// modelsFileName is the corrected model catalog the host copies into filesDir.
+	modelsFileName = "models.json"
 	// DefaultPort is the gateway port used by every generated configuration.
 	DefaultPort = 8317
 	// ManagementKey is the local management secret seeded into the panel.
@@ -337,9 +339,22 @@ func renderDefaultConfig(dataDir, proxyURL string, allowLan bool) string {
 	for _, w := range defaultSensitiveWords {
 		words = append(words, "        - "+yamlScalar(w))
 	}
+	// Argument order follows the template: host, port, proxy-url, models.catalog,
+	// api-keys, secret-key, auth-dir, sensitive-words.
 	return fmt.Sprintf(defaultConfigTemplate,
-		yamlScalar(host), DefaultPort, yamlScalar(proxyURL), yamlScalar(defaultAPIKey),
+		yamlScalar(host), DefaultPort, yamlScalar(proxyURL),
+		yamlScalar(catalogPath(dataDir)), yamlScalar(defaultAPIKey),
 		yamlScalar(ManagementKey), yamlScalar(authDir(dataDir)), strings.Join(words, "\n"))
+}
+
+// catalogPath returns the model catalog written next to config.yaml.
+//
+// The upstream registry ships a catalog missing some variants (antigravity advertises only
+// gemini-3.8-flash-high despite the API accepting low/medium), and the remote catalog repeats
+// the same gap. Pointing models.catalog at a file we control lets the APK carry the corrected
+// table without forking the registry package.
+func catalogPath(dataDir string) string {
+	return filepath.Join(dataDir, modelsFileName)
 }
 
 const defaultConfigTemplate = `# CPA-Android default configuration (CLIProxyAPI v8 layout).
@@ -361,6 +376,11 @@ requests:
     # Retry a streaming request before any byte reached the client.
     bootstrap-retries: 2
     send-keepalive-before-ft: true
+
+# Model catalog carried by the APK. The upstream table advertises only
+# gemini-3.8-flash-high for antigravity although the API also accepts low/medium.
+models:
+  catalog: %s
 
 access:
   api-keys:
@@ -410,13 +430,97 @@ func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool) error {
 	if err := ensureDir(authDir(dataDir)); err != nil {
 		return err
 	}
+	// The catalog file itself is copied from the APK assets by the Android host before this
+	// runs (Go cannot read packed assets). It is rewritten on every APK update rather than
+	// preserved, because unlike config.yaml it holds no user state.
 	path := configPath(dataDir)
 	if _, err := os.Stat(path); err == nil {
-		return nil
+		// The file predates this build: it has no models.catalog, so the corrected table never
+		// gets loaded. Patch the one key in place and leave everything else the user may have
+		// tuned (proxy, api-keys, sensitive words) exactly as it is.
+		return ensureCatalogKey(path, catalogPath(dataDir))
 	} else if !os.IsNotExist(err) {
 		return err
 	}
 	return writeFileAtomic(path, []byte(renderDefaultConfig(dataDir, proxyURL, allowLan)))
+}
+
+// ensureCatalogKey sets models.catalog on an existing config without touching other keys.
+//
+// Rewriting the whole file would discard the user's proxy, api-keys and sensitive-word edits,
+// so only the one path is set, and only when it is absent or points somewhere else.
+func ensureCatalogKey(configPath, catalog string) error {
+	raw, errRead := os.ReadFile(configPath)
+	if errRead != nil {
+		return errRead
+	}
+	var root yaml.Node
+	if errUnmarshal := yaml.Unmarshal(raw, &root); errUnmarshal != nil {
+		return errUnmarshal
+	}
+	// Already pointing at the right file: nothing to do, and no need to rewrite.
+	if existing := lookupPath(&root, []string{"models", "catalog"}); existing == catalog {
+		return nil
+	}
+	// setPath works on a mapping node. Unmarshalling produces a DocumentNode wrapping it, and
+	// handing the document straight to setPath makes it see "not a map" and replace the whole
+	// tree with an empty one — that wiped a live config down to a single key, so the engine
+	// then started on ":0" because server.host and server.port were gone.
+	doc := &root
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = doc.Content[0]
+	}
+	if doc.Kind != yaml.MappingNode {
+		return fmt.Errorf("config root is not a YAML mapping")
+	}
+	value := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: catalog}
+	setPath(doc, []string{"models", "catalog"}, value)
+	out, errMarshal := yaml.Marshal(&root)
+	if errMarshal != nil {
+		return errMarshal
+	}
+	// Re-insert the leading comment block; yaml.Marshal drops all comments.
+	return writeFileAtomic(configPath, append(headComments(raw), out...))
+}
+
+// lookupPath returns the scalar value at path, or "" when it is absent.
+func lookupPath(root *yaml.Node, path []string) string {
+	cur := root
+	if cur != nil && cur.Kind == yaml.DocumentNode && len(cur.Content) > 0 {
+		cur = cur.Content[0]
+	}
+	for _, key := range path {
+		if cur == nil || cur.Kind != yaml.MappingNode {
+			return ""
+		}
+		var next *yaml.Node
+		for j := 0; j+1 < len(cur.Content); j += 2 {
+			if cur.Content[j].Value == key {
+				next = cur.Content[j+1]
+				break
+			}
+		}
+		cur = next
+	}
+	if cur == nil {
+		return ""
+	}
+	return cur.Value
+}
+
+// headComments returns the leading comment lines of a YAML file, newline-terminated.
+func headComments(raw []byte) []byte {
+	var out []byte
+	for _, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+			out = append(out, line...)
+			out = append(out, '\n')
+			continue
+		}
+		break
+	}
+	return out
 }
 
 func writeFileAtomic(path string, data []byte) error {

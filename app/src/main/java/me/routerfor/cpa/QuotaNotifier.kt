@@ -90,16 +90,22 @@ object QuotaNotifier {
         for (entry in entries) {
             if (entry.disabled) continue
             val result = results[entry.name] ?: continue
-            val label = Provider.labelOf(entry.provider)
-            val detail = when {
+            // Header names the provider *and* the account: with several accounts on one
+            // provider, "Antigravity · 98%" alone does not say whose quota that is.
+            lines.add(Provider.labelOf(entry.provider) + " · " + entry.email)
+            val body = when {
                 result.error != null -> result.error
                 result.unsupported || !result.hasData -> "额度不可用"
-                else -> result.windows.joinToString("  ") { w ->
+                else -> Quota.condense(result.windows).joinToString("  ") { w ->
                     val left = w.usedPercent?.let { (100.0 - it).toInt() }
-                    if (left != null) w.label + " " + left + "%" else w.label
+                    buildString {
+                        append(w.label)
+                        if (left != null) append(" ").append(left).append("%")
+                        w.resetLabel?.let { append(" ").append(it).append(" 重置") }
+                    }
                 }
             }
-            lines.add(label + " · " + detail)
+            lines.add("  " + body)
         }
         if (lines.isEmpty()) return ""
         // The clock is read here rather than from cachedAt: publish() builds the body before it

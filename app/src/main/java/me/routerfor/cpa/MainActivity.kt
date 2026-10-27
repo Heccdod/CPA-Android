@@ -48,6 +48,15 @@ class MainActivity : AppCompatActivity() {
     private var accountsLoading = false
     private var applied: Palette.Resolved? = null
 
+    /**
+     * The mode the UI was built for, not just its resolved palette.
+     *
+     * "Day" and "follow system while the system is light" resolve to the same colours but need
+     * different glyphs, so comparing only the resolved palette left the sun icon in place after
+     * switching to follow-system on a light phone.
+     */
+    private var appliedMode: Palette.Mode? = null
+
     /** Set once the inventory has been read against a live gateway. */
     private var accountsLoaded = false
 
@@ -70,8 +79,12 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         // The palette can be changed from the settings screen; rebuilding is the only honest
-        // way to repaint views that were inflated with the old colours.
-        if (applied != null && applied != Palette.resolve(ThemeManager.mode(this), this)) {
+        // way to repaint views that were inflated with the old colours. The mode is compared
+        // too, because day and follow-system-light share colours but not the theme glyph.
+        val mode = ThemeManager.mode(this)
+        if (appliedMode != null && (appliedMode != mode ||
+                applied != Palette.resolve(mode, this))
+        ) {
             recreate()
             return
         }
@@ -89,7 +102,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyChrome() {
-        val resolved = Palette.resolve(ThemeManager.mode(this), this)
+        val mode = ThemeManager.mode(this)
+        val resolved = Palette.resolve(mode, this)
+        appliedMode = mode
         applied = resolved
         ui = UiKit(this, Palette.load(this, resolved))
         ThemeManager.applySystemBars(this, ui.colors)
@@ -175,17 +190,12 @@ class MainActivity : AppCompatActivity() {
         Palette.Mode.SYSTEM -> R.drawable.ic_theme_auto
     }
 
+    /**
+     * Cycles the palette. The result is visible in the glyph and in every surface on screen,
+     * so no toast: a popup under the button on every tap was pure noise.
+     */
     private fun cycleTheme() {
-        val next = ThemeManager.next(ThemeManager.mode(this))
-        ThemeManager.setMode(this, next)
-        toast(
-            when (next) {
-                Palette.Mode.DAY -> "日间主题"
-                Palette.Mode.NIGHT -> "黑夜主题"
-                Palette.Mode.PAPER -> "羊皮纸主题"
-                Palette.Mode.SYSTEM -> "跟随系统"
-            }
-        )
+        ThemeManager.setMode(this, ThemeManager.next(ThemeManager.mode(this)))
         recreate()
     }
 
@@ -496,6 +506,8 @@ class MainActivity : AppCompatActivity() {
         private val bar = UiKit.QuotaBar(this@MainActivity, kit.colors)
         // Two lines: a provider can report several windows ("5 小时额度 剩 98% · 3 小时"
         // plus "每周额度 剩 62% · 4 天") and cutting them off hides most of the information.
+        // Two rows by design: the 5-hour window and the weekly one. condense() guarantees
+        // that shape, so two lines is exactly enough and never truncates.
         private val caption = TextView(this@MainActivity).apply {
             textSize = 11f
             setTextColor(kit.colors.textTertiary)
@@ -547,13 +559,16 @@ class MainActivity : AppCompatActivity() {
                     caption.text = getString(R.string.quota_unavailable)
                 }
                 else -> {
-                    bar.percent = result.windows.mapNotNull { it.usedPercent }.maxOrNull()
+                    // Exactly two rows: 5-hour and weekly. Per-family duplicates are folded by
+                    // condense(), which keeps whichever family is closest to running out.
+                    val windows = Quota.condense(result.windows)
+                    bar.percent = windows.mapNotNull { it.usedPercent }.maxOrNull()
                     caption.text = buildString {
-                        for ((i, w) in result.windows.withIndex()) {
+                        for ((i, w) in windows.withIndex()) {
                             if (i > 0) append("\n")
                             append(w.label)
                             w.usedPercent?.let { append(" 剩 ").append((100.0 - it).toInt()).append("%") }
-                            w.resetLabel?.let { append(" · ").append(it) }
+                            w.resetLabel?.let { append(" · ").append(it).append(" 重置") }
                         }
                     }
                 }
@@ -672,7 +687,9 @@ class MainActivity : AppCompatActivity() {
                 else -> ui.colors.warn
             }
         )
-        addressText.text = if (running) address else "—"
+        // The OpenAI-compatible surface lives under /v1, which is what a client has to paste
+        // into SillyTavern and friends; showing the bare host:port made everyone add it by hand.
+        addressText.text = if (running) address.trimEnd('/') + "/v1" else "—"
         keyText.text = WebBridgeCompat.managementKey()
         engineText.text = if (!error.isNullOrEmpty()) {
             "内核异常：" + error
@@ -744,8 +761,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openSettings() {
-        startActivity(Intent(this, SettingsActivity::class.java))
+        startActivityForResult(Intent(this, SettingsActivity::class.java), REQ_SETTINGS)
         overridePendingTransition(R.anim.slide_in_right, R.anim.fade_out)
+    }
+
+    /**
+     * Settings reports a palette change through a result rather than relying on onResume
+     * comparisons alone: when the new mode resolves to the same colours (day -> follow
+     * system on a light phone) nothing else would tell this screen to rebuild.
+     */
+    @Deprecated("startActivityForResult is fine here; the only data is a single flag")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_SETTINGS && resultCode == SettingsActivity.RESULT_THEME_CHANGED) {
+            recreate()
+        }
     }
 
     private fun copyToClipboard(value: String) {
@@ -758,5 +788,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val MAX_RETRY = 30
+        private const val REQ_SETTINGS = 1001
     }
 }

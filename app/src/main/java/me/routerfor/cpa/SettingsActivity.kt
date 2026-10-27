@@ -29,8 +29,16 @@ import com.google.android.material.card.MaterialCardView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.io.File
 
-/** 设置页：首页只留状态，配置全在这里。外观、网络、引擎、更新、系统。 */
+/**
+ * 设置页：首页只留状态，配置全在这里。外观、网络、引擎、更新、系统。
+ *
+ * Theme changes are applied with [setResult] so the caller knows to rebuild: returning from
+ * settings used to leave MainActivity showing whatever palette it was created with when the
+ * new mode only differed by *mode* (day vs follow-system while the system is light).
+ */
 class SettingsActivity : AppCompatActivity() {
+
+    private var themeChanged = false
 
     private lateinit var ui: UiKit
     private lateinit var body: LinearLayout
@@ -44,8 +52,13 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     override fun onBackPressed() {
+        if (themeChanged) setResult(RESULT_THEME_CHANGED)
         super.onBackPressed()
         overridePendingTransition(R.anim.fade_in, R.anim.slide_out_right)
+    }
+
+    companion object {
+        const val RESULT_THEME_CHANGED = RESULT_FIRST_USER
     }
 
     private fun buildUi(): View {
@@ -146,6 +159,7 @@ class SettingsActivity : AppCompatActivity() {
                 setPadding(ui.dp(18), ui.dp(14), ui.dp(18), ui.dp(14))
                 setOnClickListener {
                     ThemeManager.setMode(this@SettingsActivity, mode)
+                    themeChanged = true
                     recreate()
                 }
             }

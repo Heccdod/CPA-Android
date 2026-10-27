@@ -1,0 +1,131 @@
+diff --git a/internal/registry/models/models.json b/internal/registry/models/models.json
+index 3164935..a423a70 100644
+--- a/internal/registry/models/models.json
++++ b/internal/registry/models/models.json
+@@ -4288,6 +4288,74 @@
+       "native_capabilities": {
+         "web_search": true
+       }
++    },
++    {
++      "id": "gemini-3.8-flash-low",
++      "object": "model",
++      "owned_by": "antigravity",
++      "type": "antigravity",
++      "supports_web_search": true,
++      "display_name": "Gemini 3.8 Flash",
++      "name": "gemini-3.8-flash-low",
++      "description": "Gemini 3.8 Flash (Low)",
++      "context_length": 1048576,
++      "max_completion_tokens": 65536,
++      "thinking": {
++        "min": 1,
++        "max": 65535,
++        "dynamic_allowed": true,
++        "levels": [
++          "low",
++          "medium",
++          "high"
++        ]
++      },
++      "supportedInputModalities": [
++        "text",
++        "image",
++        "audio",
++        "video"
++      ],
++      "supportedOutputModalities": [
++        "text"
++      ],
++      "native_capabilities": {
++        "web_search": true
++      }
++    },
++    {
++      "id": "gemini-3.8-flash-medium",
++      "object": "model",
++      "owned_by": "antigravity",
++      "type": "antigravity",
++      "supports_web_search": true,
++      "display_name": "Gemini 3.8 Flash",
++      "name": "gemini-3.8-flash-medium",
++      "description": "Gemini 3.8 Flash (Medium)",
++      "context_length": 1048576,
++      "max_completion_tokens": 65536,
++      "thinking": {
++        "min": 1,
++        "max": 65535,
++        "dynamic_allowed": true,
++        "levels": [
++          "low",
++          "medium",
++          "high"
++        ]
++      },
++      "supportedInputModalities": [
++        "text",
++        "image",
++        "audio",
++        "video"
++      ],
++      "supportedOutputModalities": [
++        "text"
++      ],
++      "native_capabilities": {
++        "web_search": true
++      }
+     }
+   ],
+   "xai": [
+diff --git a/internal/runtime/executor/antigravity_executor_buildrequest_test.go b/internal/runtime/executor/antigravity_executor_buildrequest_test.go
+index 69e7a1c..184edd3 100644
+--- a/internal/runtime/executor/antigravity_executor_buildrequest_test.go
++++ b/internal/runtime/executor/antigravity_executor_buildrequest_test.go
+@@ -390,9 +390,13 @@ func assertNonSchemaRequestPreserved(t *testing.T, body map[string]any) {
+ 		t.Fatalf("x-extra should be preserved outside schema cleanup path, got=%v", nonSchema["x-extra"])
+ 	}
+ 
++	// maxOutputTokens must survive for non-Claude requests: the upstream honours it, and
++	// stripping it made a capped request unbounded while still reporting finish_reason "stop".
+ 	if generationConfig, ok := request["generationConfig"].(map[string]any); ok {
+-		if _, ok := generationConfig["maxOutputTokens"]; ok {
+-			t.Fatalf("maxOutputTokens should still be removed for non-Claude requests")
++		if got, ok := generationConfig["maxOutputTokens"]; !ok {
++			t.Fatalf("maxOutputTokens should be preserved for non-Claude requests")
++		} else if v, _ := got.(float64); v <= 0 {
++			t.Fatalf("maxOutputTokens = %v, want a positive cap", got)
+ 		}
+ 	}
+ }
+diff --git a/internal/runtime/executor/antigravity_executor_request.go b/internal/runtime/executor/antigravity_executor_request.go
+index 0774070..fd6752f 100644
+--- a/internal/runtime/executor/antigravity_executor_request.go
++++ b/internal/runtime/executor/antigravity_executor_request.go
+@@ -79,9 +79,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
+ 		if strings.Contains(modelName, "claude") {
+ 			updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+ 			payloadStr = string(updated)
+-		} else {
+-			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
+ 		}
++		// maxOutputTokens is preserved here for the same reason as in the non-sanitized path:
++		// the upstream honours it, and dropping it turns a capped request into an unbounded one
++		// whose truncation still reports finish_reason "stop".
+ 
+ 		payloadStrBytes := applyAntigravityNativeSignatureReplayIfNeeded(modelName, []byte(payloadStr))
+ 		payloadStrBytes = helps.FinalizePayload(ctx, payloadStrBytes)
+@@ -92,9 +93,12 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
+ 	} else {
+ 		if strings.Contains(modelName, "claude") {
+ 			payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+-		} else {
+-			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
+ 		}
++		// maxOutputTokens used to be stripped for every non-Claude model here. The upstream
++		// honours the field (it answers finishReason MAX_TOKENS when the cap is reached), so
++		// deleting it meant a client's max_tokens was silently ignored: a request capped at 1
++		// token produced 3289, and a truncated stream still reported finish_reason "stop",
++		// which leaves clients like SillyTavern waiting for a completion that already ended.
+ 
+ 		payload = applyAntigravityNativeSignatureReplayIfNeeded(modelName, payload)
+ 		payload = helps.FinalizePayload(ctx, payload)

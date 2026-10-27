@@ -61,8 +61,30 @@ class ProxyForegroundService : Service() {
 
     private fun dataDir(): String = filesDir.absolutePath
 
+    /** Copies assets/models.json into filesDir, replacing any older copy. */
+    private fun installModelsCatalog(dir: File) {
+        val target = File(dir, MODELS_FILE)
+        runCatching {
+            assets.open(MODELS_FILE).use { input ->
+                val tmp = File(dir, MODELS_FILE + ".tmp")
+                tmp.outputStream().use { out ->
+                    input.copyTo(out)
+                    out.flush()
+                }
+                if (!tmp.renameTo(target)) {
+                    target.delete()
+                    tmp.renameTo(target)
+                }
+            }
+        }.onFailure { Log.w(TAG, "models catalog install failed: " + it.message) }
+    }
+
     private fun startGateway(restart: Boolean) {
         val dataDir = dataDir()
+        // The corrected model catalog ships as an APK asset (Go cannot read packed assets), so
+        // copy it out first: config.yaml points models.catalog at this path. It is overwritten
+        // every start because it carries no user state — an app update must refresh it.
+        installModelsCatalog(File(dataDir))
         // Seed filesDir/config.yaml + filesDir/auths before the engine reads them.
         val ensureError = WebBridgeCompat.ensureDefaultConfig(dataDir, "", false)
         if (ensureError.isNotEmpty()) {
@@ -183,6 +205,7 @@ class ProxyForegroundService : Service() {
         private const val TAG = "CpaService"
         private const val CHANNEL_ID = "cpa-gateway"
         private const val NOTIFICATION_ID = 8317
+        private const val MODELS_FILE = "models.json"
         private const val WAKE_LOCK_TAG = "me.routerfor.cpa:gateway"
         private const val WAKE_LOCK_TIMEOUT_MS = 12L * 60L * 60L * 1000L
     }

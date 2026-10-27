@@ -264,11 +264,19 @@ object Quota {
 
     // --------------------------------------------------------------- formatting
 
+    /**
+     * Reset time as an absolute clock value ("14:12" today, "10月31日 14:12" later on).
+     *
+     * "4 天" reads nicely but is useless when deciding whether to start a long task; the actual
+     * moment is what the panel shows and what was asked for.
+     */
     private fun resetLabel(iso: String?): String? {
         if (iso.isNullOrBlank()) return null
         val parsed = runCatching { java.time.Instant.parse(iso) }.getOrNull() ?: return null
-        val minutes = java.time.Duration.between(java.time.Instant.now(), parsed).toMinutes()
-        return secondsLabel(minutes * 60)
+        val local = parsed.atZone(java.time.ZoneId.systemDefault())
+        val now = java.time.ZonedDateTime.now()
+        val pattern = if (local.toLocalDate() == now.toLocalDate()) "HH:mm" else "M月d日 HH:mm"
+        return local.format(java.time.format.DateTimeFormatter.ofPattern(pattern))
     }
 
     /**
@@ -300,6 +308,32 @@ object Quota {
             name.length > 16 -> ""
             else -> name
         }
+    }
+
+    /**
+     * Collapses the per-family pairs into exactly two rows: the 5-hour window and the weekly one.
+     *
+     * A provider reports the same pair once per model family (Gemini, Claude/GPT). That detail
+     * is real but four rows of it buries the answer to "how much do I have left". The family
+     * with the worst remaining value is the one that will run out first, so the tightest number
+     * per window is the honest summary. Anything that is neither window (extra credits, a
+     * per-model cap) is kept as-is.
+     */
+    fun condense(windows: List<Window>): List<Window> {
+        if (windows.isEmpty()) return windows
+        val fiveHour = windows.filter { it.label.contains("5 小时") }
+        val weekly = windows.filter { it.label.contains("每周") }
+        val other = windows.filter { !it.label.contains("5 小时") && !it.label.contains("每周") }
+        if (fiveHour.isEmpty() && weekly.isEmpty()) return windows
+        val out = mutableListOf<Window>()
+        fiveHour.maxByOrNull { it.usedPercent ?: 0.0 }?.let {
+            out.add(Window("5 小时额度", it.usedPercent, it.resetLabel))
+        }
+        weekly.maxByOrNull { it.usedPercent ?: 0.0 }?.let {
+            out.add(Window("每周额度", it.usedPercent, it.resetLabel))
+        }
+        out.addAll(other)
+        return out
     }
 
     private fun secondsLabel(seconds: Long): String? {

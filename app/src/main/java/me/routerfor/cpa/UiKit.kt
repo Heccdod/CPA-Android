@@ -209,6 +209,10 @@ class UiKit(private val context: Context, val colors: Palette.Colors) {
         init {
             isClickable = true
             isFocusable = true
+            // The drawn pill shrank, so the padding is what keeps the touch target usable:
+            // the view stays roughly 46x33 while the track itself is 34x21.
+            val pad = (6 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad, pad, pad)
             setOnClickListener {
                 isChecked = !isChecked
                 onCheckedChange?.invoke(isChecked)
@@ -229,29 +233,32 @@ class UiKit(private val context: Context, val colors: Palette.Colors) {
             val d = resources.displayMetrics.density
             val w = TRACK_WIDTH_DP * d
             val h = TRACK_HEIGHT_DP * d
+            val left = paddingLeft.toFloat()
+            val top = paddingTop.toFloat()
+
             val trackColor = if (isChecked) colors.ok else colors.switchOff
             track.setColor(trackColor)
             track.cornerRadius = h / 2f
-            track.setBounds(0, 0, w.toInt(), h.toInt())
+            track.setBounds(left.toInt(), top.toInt(), (left + w).toInt(), (top + h).toInt())
             track.draw(canvas)
 
-            val inset = 2.5f * d
+            val inset = 1.8f * d
             val radius = h / 2f - inset
-            val cx = if (isChecked) w - h / 2f else h / 2f
+            val cx = if (isChecked) left + w - h / 2f else left + h / 2f
             knob.setColor(0xFFFFFFFF.toInt())
             knob.setBounds(
-                (cx - radius).toInt(), (h / 2f - radius).toInt(),
-                (cx + radius).toInt(), (h / 2f + radius).toInt()
+                (cx - radius).toInt(), (top + h / 2f - radius).toInt(),
+                (cx + radius).toInt(), (top + h / 2f + radius).toInt()
             )
             knob.cornerRadius = radius
             knob.draw(canvas)
         }
 
         companion object {
-            // Asked to be a little smaller than the first pass: 46x28 still clears the 24dp
-            // minimum touch target once the row's own padding is counted.
-            private const val TRACK_WIDTH_DP = 46f
-            private const val TRACK_HEIGHT_DP = 28f
+            // Sizes are steps down from the original 52x32: 46x28 first, then 75% of that.
+            // 34x21 stays legible, and the row padding around it keeps a comfortable touch area.
+            private const val TRACK_WIDTH_DP = 34f
+            private const val TRACK_HEIGHT_DP = 21f
         }
     }
 }
