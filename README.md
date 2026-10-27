@@ -125,14 +125,38 @@ Android VectorDrawable。两个坑：`antigravity` 的源 SVG **没有 viewBox**
 
 ### 面板净化：为什么不是在文件上改
 
-上游面板是 3.35 MB 单文件内联发布，里面带中转站推广（`apikey.fan` 的注册链接、`APIKEY.FUN` 的导航文案）。
-但它**每次引擎启动都会从上游 Release 重新下载**，所以在磁盘上打补丁活不过一次启动。改成 `PanelDocument`
-在 `shouldInterceptRequest` 里取回原文、先 `PanelSanitizer.strip()` 再 `PanelPolyfill.inject()`，
-WebView 永远看不到未净化版本（推广串在模块脚本内部，只改 DOM 是改不掉的）。真机日志：
+上游面板是 3.2 MB 单文件内联发布，里面带中转站推广（`apikey.fan` 的注册链接、`APIKEY.FUN` 的
+导航文案，以及同样带 `aff=` 的 `fenno.ai`）。但它**每次引擎启动都会从上游 Release 重新下载**，
+所以在磁盘上打补丁活不过一次启动。改成 `PanelDocument` 在 `shouldInterceptRequest` 里取回原文、
+先 `PanelSanitizer.strip()` 再 `PanelPolyfill.inject()`，WebView 永远看不到未净化版本
+（推广串在模块脚本内部，只改 DOM 是改不掉的）。真机日志：
 
 ```
-I CpaPanel: panel raw=3160171 clean=3159826 patched=3162391 sponsor=false
+I CpaPanel: panel raw=3194020 clean=3193699 patched=3197897 sponsor=false theme=DAY
 ```
+
+#### 净化规则只认域名，不认变量名
+
+第一版按最小化标识符替换，比如「cS=``https://apikey.fan/register?aff=AKCPA``」这种整串字面量。上游下一次构建把
+**每一个**名字都换了（`cS` 变成 `GS`），还并排加了第二个赞助商 `fenno.ai`，于是规则一条都匹配不上——
+而 `hasSponsorContent` 当时只看 `apikey.fan` 与 `APIKEY`，净化失败也没有任何信号，页面照常渲染，
+只是推广回来了。
+
+现在的规则按「重建也改不掉的东西」分类：
+
+| 类别 | 做法 |
+| :--- | :--- |
+| 赞助商域名 | 一条正则（`apikey.fan` 或 `fenno.ai` 的任意子域、任意路径）整段删掉 |
+| 返利参数 | `[?&]aff=[A-Za-z0-9_-]+` 单独删（合法 provider 链接上的也删） |
+| provider 数组 | 删的是「,``apikeyFun``」这样带反引号的完整成员，不会吃掉相邻逗号 |
+| `/quick-start` 路由 | **不改路由，只改 brand**：`fixedBrand` 指向 `openaiCompatibility`，路由还活着但成了普通表单页 |
+| 多语言文案 | 七种语言的 `APIKEY.FUN …` / `FennoAI` 逐条替换 |
+
+不删路由是刻意的：它躺在一条最小化数组字面量里，逗号必须配平，删错一个括号整个面板白屏。
+
+`hasSponsorContent` 现在也查 `aff=` 标记，所以「域名清了但返利参数漏了」不会再被当成干净。
+配套 6 条 JVM 单元测试（`app/src/test/java/me/routerfor/cpa/PanelSanitizerTest.kt`），其中一份 fixture
+用的就是**和当前 bundle 不同的变量名**——正是之前漏掉的那种情况。
 
 ## 额度显示
 

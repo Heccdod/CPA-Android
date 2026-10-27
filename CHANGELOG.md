@@ -20,6 +20,9 @@
 - **max_tokens 生效**：上游不再删除 `maxOutputTokens`，截断时 `finish_reason` 正确报 `max_tokens`，
   客户端不会卡在「生成中」。
 - **模型列表补档**：`gemini-3.8-flash-low` / `-medium` 出现在 `/v1/models` 里。
+- **中转站推广彻底清掉**：上游换了新版面板（标识符全部重命名，还多了一个 `fenno.ai` 赞助商），旧规则一条都
+  匹配不上而自检仍报干净。净化规则改为只认域名与返利参数，「快速开始」页改为指向普通 provider 表单而非删除，
+  并补了 6 条 JVM 单元测试（其中一份 fixture 用的就是旧标识符）。
 
 ## v2.2.0
 
