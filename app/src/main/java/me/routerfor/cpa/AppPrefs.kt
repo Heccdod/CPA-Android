@@ -18,6 +18,7 @@ object AppPrefs {
     const val KEY_HOT_UPDATE = "hot-update-enabled"
     const val KEY_RULE_SYNC = "rule-sync-enabled"
     const val KEY_STATUS_QUOTA = "status-bar-quota"
+    const val KEY_THINKING = "thinking-visible"
 
     fun get(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -52,5 +53,18 @@ object AppPrefs {
 
     fun setStatusBarQuota(context: Context, enabled: Boolean) {
         get(context).edit().putBoolean(KEY_STATUS_QUOTA, enabled).apply()
+    }
+
+    /**
+     * Makes the upstream return the model's chain of thought.
+     *
+     * On by default: a client that renders reasoning should just work, without every user
+     * having to discover a payload rule. It is a switch because the thought tokens are
+     * generated and billed on every request.
+     */
+    fun thinkingVisible(context: Context): Boolean = get(context).getBoolean(KEY_THINKING, true)
+
+    fun setThinkingVisible(context: Context, enabled: Boolean) {
+        get(context).edit().putBoolean(KEY_THINKING, enabled).apply()
     }
 }

@@ -53,8 +53,14 @@ object WebBridgeCompat {
         t.message ?: t.javaClass.simpleName
     }
 
-    fun updateQuickSettings(dataDir: String, proxyUrl: String, allowLan: Boolean, csv: String): String = try {
-        Cliproxymobile.updateQuickSettings(dataDir, proxyUrl, allowLan, csv)
+    fun updateQuickSettings(
+        dataDir: String,
+        proxyUrl: String,
+        allowLan: Boolean,
+        csv: String,
+        thinkingVisible: Boolean
+    ): String = try {
+        Cliproxymobile.updateQuickSettings(dataDir, proxyUrl, allowLan, csv, thinkingVisible)
     } catch (t: Throwable) {
         t.message ?: t.javaClass.simpleName
     }

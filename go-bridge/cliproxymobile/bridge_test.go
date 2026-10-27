@@ -77,7 +77,7 @@ func TestBridgeLifecycle(t *testing.T) {
 	}
 
 	// Hot reload: rewrite the config in place exactly like the Android L2 channel.
-	if msg := UpdateQuickSettings(dir, "socks5://127.0.0.1:7890", false, "alpha,beta,Codex"); msg != "" {
+	if msg := UpdateQuickSettings(dir, "socks5://127.0.0.1:7890", false, "alpha,beta,Codex", true); msg != "" {
 		t.Fatalf("UpdateQuickSettings failed: %s", msg)
 	}
 	updated, err := os.ReadFile(cfgPath)
@@ -128,7 +128,7 @@ func TestUpdateQuickSettingsRestoresDefaults(t *testing.T) {
 	if msg := EnsureDefaultConfig(dir, "", true); msg != "" {
 		t.Fatalf("EnsureDefaultConfig failed: %s", msg)
 	}
-	if msg := UpdateQuickSettings(dir, "", true, ""); msg != "" {
+	if msg := UpdateQuickSettings(dir, "", true, "", true); msg != "" {
 		t.Fatalf("UpdateQuickSettings failed: %s", msg)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, ConfigFileName))

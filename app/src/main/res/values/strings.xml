@@ -74,7 +74,9 @@
     <string name="quota_loading">正在查询额度…</string>
     <string name="quota_unknown">点右侧刷新查询额度</string>
     <string name="quota_unavailable">该提供商不提供额度查询</string>
-    <string name="settings_status_quota">状态栏显示额度</string>
-    <string name="settings_status_quota_desc">下拉通知栏展开网关通知，显示已启用账号的剩余额度</string>
+    <string name="settings_status_quota">状态栏显示 5h 额度</string>
+    <string name="settings_status_quota_desc">下拉展开网关通知，按账号与模型族显示 5 小时限额和重置时间</string>
     <string name="action_ok">好</string>
+    <string name="settings_thinking">显示思维链</string>
+    <string name="settings_thinking_desc">让上游返回模型的思考过程，客户端才能显示。开启后每次请求都会产生思考 token</string>
 </resources>

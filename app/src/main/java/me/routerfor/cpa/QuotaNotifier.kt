@@ -96,16 +96,24 @@ object QuotaNotifier {
             val body = when {
                 result.error != null -> result.error
                 result.unsupported || !result.hasData -> "额度不可用"
-                else -> Quota.condense(result.windows).joinToString("  ") { w ->
-                    val left = w.usedPercent?.let { (100.0 - it).toInt() }
-                    buildString {
-                        append(w.label)
-                        if (left != null) append(" ").append(left).append("%")
-                        w.resetLabel?.let { append(" ").append(it).append(" 重置") }
+                // Only the 5-hour window: the notification is a glance, and the weekly
+                // budget changes slowly enough that the app is the right place to read it.
+                else -> Quota.byFamily(result.windows)
+                    .mapNotNull { (family, windows) ->
+                        val five = windows.firstOrNull { it.label.contains("5 小时") } ?: return@mapNotNull null
+                        buildString {
+                            if (family.isNotEmpty()) append(family).append(" · ")
+                            append("5h 额度 ")
+                            five.usedPercent?.let { append((100.0 - it).toInt()).append("%") }
+                            five.resetLabel?.let { append(" ").append(it).append(" 重置") }
+                        }
                     }
-                }
+                    .joinToString("\n")
             }
-            lines.add("  " + body)
+            // Indent every line: the body is multi-line once a provider reports more than one
+            // model family, and indenting only the first line left the rest flush with the
+            // account header.
+            for (line in body.split("\n")) lines.add("   " + line)
         }
         if (lines.isEmpty()) return ""
         // The clock is read here rather than from cachedAt: publish() builds the body before it

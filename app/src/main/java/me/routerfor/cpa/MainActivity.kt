@@ -493,86 +493,97 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * One account's quota line: a meter plus a caption, or the reason there is none.
+     * One account's quota: a block per model family, each with a meter and a line per window.
+     *
+     * Gemini and Claude are separate budgets on antigravity, so they get separate blocks —
+     * folding them into one summary would show a single number where the account really has
+     * two independent limits. The container is rebuilt on every bind because the number of
+     * families is only known once the answer lands.
      *
      * The row's own refresh button is held here so [bind] can spin it while that account is in
-     * flight and stop it when the answer lands — the button belongs to the row, the state
-     * belongs to the holder.
+     * flight and stop it when the answer arrives.
      */
     private inner class QuotaHolder(private val kit: UiKit) {
 
         var spin: ImageView? = null
 
-        private val bar = UiKit.QuotaBar(this@MainActivity, kit.colors)
-        // Two lines: a provider can report several windows ("5 小时额度 剩 98% · 3 小时"
-        // plus "每周额度 剩 62% · 4 天") and cutting them off hides most of the information.
-        // Two rows by design: the 5-hour window and the weekly one. condense() guarantees
-        // that shape, so two lines is exactly enough and never truncates.
-        private val caption = TextView(this@MainActivity).apply {
-            textSize = 11f
-            setTextColor(kit.colors.textTertiary)
-            includeFontPadding = false
-            maxLines = 2
-            ellipsize = android.text.TextUtils.TruncateAt.END
+        private val box = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
         }
 
         private var attached = false
 
-        /** Adds the meter and caption under an account row. */
+        /** Adds the block container under an account row. */
         fun attach(parent: LinearLayout) {
             if (attached) return
             attached = true
-            parent.addView(bar, LinearLayout.LayoutParams(
+            parent.addView(box, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = kit.dp(4) })
-            parent.addView(caption, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = kit.dp(3) })
+            ).apply { topMargin = kit.dp(6) })
         }
 
         fun bind(result: Quota.Result?, loading: Boolean) {
-            if (!attached) {
-                // Not placed yet: nothing to draw into, and bind is called once right after
-                // attach in the normal path.
-                return
-            }
+            if (!attached) return
             spin?.let { button ->
                 button.animate().cancel()
                 button.alpha = if (loading) 0.45f else 1f
                 if (loading) button.animate().rotationBy(360f).setDuration(650).start()
             }
+            box.removeAllViews()
             when {
-                loading -> {
-                    bar.percent = null
-                    caption.text = getString(R.string.quota_loading)
-                }
-                result == null -> {
-                    bar.percent = null
-                    caption.text = getString(R.string.quota_unknown)
-                }
-                result.error != null -> {
-                    bar.percent = null
-                    caption.text = result.error
-                }
-                result.unsupported || !result.hasData -> {
-                    bar.percent = null
-                    caption.text = getString(R.string.quota_unavailable)
-                }
+                loading -> box.addView(note(getString(R.string.quota_loading)))
+                result == null -> box.addView(note(getString(R.string.quota_unknown)))
+                result.error != null -> box.addView(note(result.error))
+                result.unsupported || !result.hasData -> box.addView(note(getString(R.string.quota_unavailable)))
                 else -> {
-                    // Exactly two rows: 5-hour and weekly. Per-family duplicates are folded by
-                    // condense(), which keeps whichever family is closest to running out.
-                    val windows = Quota.condense(result.windows)
-                    bar.percent = windows.mapNotNull { it.usedPercent }.maxOrNull()
-                    caption.text = buildString {
-                        for ((i, w) in windows.withIndex()) {
-                            if (i > 0) append("\n")
-                            append(w.label)
-                            w.usedPercent?.let { append(" 剩 ").append((100.0 - it).toInt()).append("%") }
-                            w.resetLabel?.let { append(" · ").append(it).append(" 重置") }
+                    for ((family, windows) in Quota.byFamily(result.windows)) {
+                        if (family.isNotEmpty()) {
+                            box.addView(TextView(this@MainActivity).apply {
+                                text = family
+                                textSize = 12f
+                                typeface = Typeface.DEFAULT_BOLD
+                                setTextColor(kit.colors.textSecondary)
+                                includeFontPadding = false
+                                setPadding(0, kit.dp(6), 0, kit.dp(2))
+                            })
                         }
+                        for (w in windows) box.addView(windowRow(w))
                     }
                 }
             }
+        }
+
+        /** One window inside a family: the meter, then "5 小时额度 余 99% · 10:30 重置". */
+        private fun windowRow(w: Quota.Window): View {
+            val column = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, kit.dp(3), 0, 0)
+            }
+            column.addView(UiKit.QuotaBar(this@MainActivity, kit.colors).apply {
+                percent = w.usedPercent
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+            column.addView(TextView(this@MainActivity).apply {
+                text = buildString {
+                    append(w.label)
+                    w.usedPercent?.let { append(" 余 ").append((100.0 - it).toInt()).append("%") }
+                    w.resetLabel?.let { append(" · ").append(it).append(" 重置") }
+                }
+                textSize = 11f
+                setTextColor(kit.colors.textTertiary)
+                includeFontPadding = false
+                setPadding(0, kit.dp(3), 0, 0)
+            })
+            return column
+        }
+
+        /** A plain caption used for the loading / error / unavailable states. */
+        private fun note(text: String?): View = TextView(this@MainActivity).apply {
+            this.text = text
+            textSize = 11f
+            setTextColor(kit.colors.textTertiary)
+            includeFontPadding = false
         }
     }
 

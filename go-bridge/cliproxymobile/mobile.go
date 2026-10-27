@@ -25,6 +25,12 @@ const (
 	ConfigFileName = "config.yaml"
 	// AuthDirName is the OAuth credential store created next to the config file.
 	AuthDirName = "auths"
+	// thinkingParamPath is the payload key that makes the upstream return thoughts.
+	thinkingParamPath = "generationConfig.thinkingConfig.includeThoughts"
+	// thinkingLevelPath must accompany it: visibility without effort is dropped during the
+	// translator's thinking normalisation, and the response carries no reasoning at all.
+	thinkingLevelPath    = "generationConfig.thinkingConfig.thinkingLevel"
+	thinkingLevelDefault = "high"
 	// modelsFileName is the corrected model catalog the host copies into filesDir.
 	modelsFileName = "models.json"
 	// DefaultPort is the gateway port used by every generated configuration.
@@ -138,11 +144,11 @@ func EnsureDefaultConfig(dataDir string, proxyURL string, allowLan bool) string 
 	return ""
 }
 
-// UpdateQuickSettings rewrites proxy-url, the bind host and the sensitive-word list.
-// The atomic rename triggers the engine file watcher (L2 hot reload).
+// UpdateQuickSettings rewrites proxy-url, the bind host, the sensitive-word list and the
+// reasoning-visibility rule. The atomic rename triggers the engine file watcher (L2 hot reload).
 // sensitiveWordsCSV is comma separated; an empty value restores the defaults.
-func UpdateQuickSettings(dataDir string, proxyURL string, allowLan bool, sensitiveWordsCSV string) string {
-	if err := updateQuickSettings(dataDir, proxyURL, allowLan, sensitiveWordsCSV); err != nil {
+func UpdateQuickSettings(dataDir string, proxyURL string, allowLan bool, sensitiveWordsCSV string, thinkingVisible bool) string {
+	if err := updateQuickSettings(dataDir, proxyURL, allowLan, sensitiveWordsCSV, thinkingVisible); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -551,7 +557,7 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmpName, path)
 }
 
-func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWordsCSV string) error {
+func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWordsCSV string, thinkingVisible bool) error {
 	if strings.TrimSpace(dataDir) == "" {
 		return fmt.Errorf("dataDir is required")
 	}
@@ -594,11 +600,142 @@ func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWords
 	}
 	setPath(root, []string{"oauth", "providers", "antigravity", "sensitive-words"}, seq)
 
+	applyThinkingVisibility(root, thinkingVisible)
+
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
 		return err
 	}
 	return writeFileAtomic(path, out)
+}
+
+// applyThinkingVisibility turns the reasoning-visibility payload rule on or off.
+//
+// Showing the chain of thought costs thought tokens on every request, so it is a user choice
+// rather than something baked into the build. Implemented as a requests.payload.override rule
+// so the behaviour is visible in config.yaml and survives an upstream sync.
+//
+// includeThoughts alone is not enough: the translator's thinking normalisation drops a payload
+// that carries visibility but no effort, so the rule sets thinkingLevel alongside it. With both
+// the response stream carries delta.reasoning_content; with only includeThoughts it stays null
+// and the thought tokens are spent for nothing.
+func applyThinkingVisibility(root *yaml.Node, visible bool) {
+	path := []string{"requests", "payload", "override"}
+	if !visible {
+		// Drop only the rule this function owns; leave any user rule alone.
+		removeThinkingRule(root, path)
+		return
+	}
+	if hasThinkingRule(root, path) {
+		return
+	}
+	rule := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	models := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", Content: []*yaml.Node{
+		{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "name"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "*"},
+		}},
+	}}
+	params := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+		{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingParamPath},
+		{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
+		{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingLevelPath},
+		{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingLevelDefault},
+	}}
+	setPath(rule, []string{"models"}, models)
+	setPath(rule, []string{"params"}, params)
+
+	seq := lookupNode(root, path)
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		seq = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		setPath(root, path, seq)
+	}
+	seq.Content = append(seq.Content, rule)
+}
+
+// hasThinkingRule reports whether one of the override rules already sets includeThoughts.
+func hasThinkingRule(root *yaml.Node, path []string) bool {
+	seq := lookupNode(root, path)
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return false
+	}
+	for _, rule := range seq.Content {
+		if rule.Kind != yaml.MappingNode {
+			continue
+		}
+		if params := lookupNode(rule, []string{"params"}); params != nil {
+			// The param key is a literal dotted path ("generationConfig.thinkingConfig.
+			// includeThoughts"), not a nested tree, so it has to be matched as one scalar.
+			if lookupNode(params, []string{thinkingParamPath}) != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// removeThinkingRule deletes just the rule that sets includeThoughts.
+func removeThinkingRule(root *yaml.Node, path []string) {
+	seq := lookupNode(root, path)
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return
+	}
+	kept := seq.Content[:0]
+	for _, rule := range seq.Content {
+		owned := false
+		if rule.Kind == yaml.MappingNode {
+			if params := lookupNode(rule, []string{"params"}); params != nil {
+				owned = lookupNode(params, []string{thinkingParamPath}) != nil
+			}
+		}
+		if !owned {
+			kept = append(kept, rule)
+		}
+	}
+	seq.Content = kept
+	if len(seq.Content) == 0 {
+		removePath(root, path)
+	}
+}
+
+func lookupNode(root *yaml.Node, path []string) *yaml.Node {
+	cur := root
+	if cur != nil && cur.Kind == yaml.DocumentNode && len(cur.Content) > 0 {
+		cur = cur.Content[0]
+	}
+	for _, key := range path {
+		if cur == nil || cur.Kind != yaml.MappingNode {
+			return nil
+		}
+		var next *yaml.Node
+		for j := 0; j+1 < len(cur.Content); j += 2 {
+			if cur.Content[j].Value == key {
+				next = cur.Content[j+1]
+				break
+			}
+		}
+		cur = next
+	}
+	return cur
+}
+
+func removePath(root *yaml.Node, path []string) {
+	if len(path) == 0 {
+		return
+	}
+	parent := lookupNode(root, path[:len(path)-1])
+	if parent == nil || parent.Kind != yaml.MappingNode {
+		return
+	}
+	key := path[len(path)-1]
+	kept := parent.Content[:0]
+	for j := 0; j+1 < len(parent.Content); j += 2 {
+		if parent.Content[j].Value == key {
+			continue
+		}
+		kept = append(kept, parent.Content[j], parent.Content[j+1])
+	}
+	parent.Content = kept
 }
 
 func parseSensitiveWords(csv string) []string {

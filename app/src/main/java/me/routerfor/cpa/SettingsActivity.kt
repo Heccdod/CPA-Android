@@ -114,6 +114,7 @@ class SettingsActivity : AppCompatActivity() {
                 editConfig()
             }
         )))
+        body.addView(buildThinkingCard())
 
         body.addView(ui.sectionTitle(getString(R.string.settings_update)))
         body.addView(buildStatusQuotaCard())
@@ -262,6 +263,23 @@ class SettingsActivity : AppCompatActivity() {
             } else {
                 QuotaNotifier.clear(this)
             }
+        }
+
+    /**
+     * Makes the upstream include the model's reasoning in the response.
+     *
+     * Implemented by rewriting the requests.payload.override rule, so the behavior is visible
+     * in config.yaml and survives an upstream sync. On by default; every request pays for the
+     * thought tokens while it is on.
+     */
+    private fun buildThinkingCard(): View =
+        buildSwtichCard(
+            getString(R.string.settings_thinking),
+            getString(R.string.settings_thinking_desc),
+            AppPrefs.thinkingVisible(this)
+        ) { on ->
+            AppPrefs.setThinkingVisible(this, on)
+            applyQuickSettings()
         }
 
     private fun buildHotUpdateCard(): View {
@@ -447,7 +465,8 @@ class SettingsActivity : AppCompatActivity() {
             filesDir.absolutePath,
             AppPrefs.proxyUrl(this),
             AppPrefs.allowLan(this),
-            AppPrefs.sensitiveWords(this)
+            AppPrefs.sensitiveWords(this),
+            AppPrefs.thinkingVisible(this)
         )
         if (err.isEmpty()) {
             toast("已保存，引擎正在热重载")

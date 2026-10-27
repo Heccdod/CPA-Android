@@ -21,12 +21,20 @@ import java.net.URL
  */
 object Quota {
 
-    /** One measured limit: what it is called, how much is used, and when it resets. */
+    /**
+     * One measured limit.
+     *
+     * [family] is the model family the limit belongs to ("Gemini", "Claude"), because a
+     * provider reports the same 5-hour / weekly pair once per family and each pair is a
+     * separate budget — merging them would show one number where the account actually has two.
+     * It is empty for providers that only report one budget.
+     */
     data class Window(
         val label: String,
         /** 0..100, or null when the provider only reports a boolean state. */
         val usedPercent: Double?,
-        val resetLabel: String?
+        val resetLabel: String?,
+        val family: String = ""
     )
 
     data class Result(
@@ -111,15 +119,17 @@ object Quota {
                 val window = bucket.optString("window")
                 val reset = bucket.optString("resetTime").ifEmpty { bucket.optString("reset_time") }
                 // Antigravity reports the same weekly/hourly pair once per model family
-                // ("Gemini Models", "Claude and GPT models"), so the group has to stay in the
-                // label or the list reads as four duplicated rows.
+                // ("Gemini Models", "Claude and GPT models"). Those are two independent
+                // budgets, so the family is carried as its own field and drawn as a heading
+                // with the pair underneath — not folded into one summary number.
                 val family = friendlyGroup(groupName)
                 val base = friendlyLabel(bucket.optString("displayName"), window)
                 windows.add(
                     Window(
-                        label = if (family.isEmpty()) base else family + " " + base,
+                        label = base,
                         usedPercent = (1.0 - fraction) * 100.0,
-                        resetLabel = resetLabel(reset)
+                        resetLabel = resetLabel(reset),
+                        family = family
                     )
                 )
             }
@@ -311,29 +321,32 @@ object Quota {
     }
 
     /**
-     * Collapses the per-family pairs into exactly two rows: the 5-hour window and the weekly one.
+     * Groups the measured windows by model family, in a stable display order.
      *
-     * A provider reports the same pair once per model family (Gemini, Claude/GPT). That detail
-     * is real but four rows of it buries the answer to "how much do I have left". The family
-     * with the worst remaining value is the one that will run out first, so the tightest number
-     * per window is the honest summary. Anything that is neither window (extra credits, a
-     * per-model cap) is kept as-is.
+     * Each family is its own budget: Gemini can be exhausted while Claude still has room, so
+     * they must be drawn as separate blocks with their own 5-hour and weekly rows. Providers
+     * that report a single budget come back as one group with an empty name.
      */
-    fun condense(windows: List<Window>): List<Window> {
-        if (windows.isEmpty()) return windows
-        val fiveHour = windows.filter { it.label.contains("5 小时") }
-        val weekly = windows.filter { it.label.contains("每周") }
-        val other = windows.filter { !it.label.contains("5 小时") && !it.label.contains("每周") }
-        if (fiveHour.isEmpty() && weekly.isEmpty()) return windows
-        val out = mutableListOf<Window>()
-        fiveHour.maxByOrNull { it.usedPercent ?: 0.0 }?.let {
-            out.add(Window("5 小时额度", it.usedPercent, it.resetLabel))
+    fun byFamily(windows: List<Window>): List<Pair<String, List<Window>>> {
+        if (windows.isEmpty()) return emptyList()
+        val order = mutableListOf<String>()
+        val buckets = LinkedHashMap<String, MutableList<Window>>()
+        for (w in windows) {
+            if (!buckets.containsKey(w.family)) {
+                order.add(w.family)
+                buckets[w.family] = mutableListOf()
+            }
+            buckets.getValue(w.family).add(w)
         }
-        weekly.maxByOrNull { it.usedPercent ?: 0.0 }?.let {
-            out.add(Window("每周额度", it.usedPercent, it.resetLabel))
+        // Five-hour first, then weekly, then anything else with a stable name.
+        fun rank(w: Window): Int = when {
+            w.label.contains("5 小时") -> 0
+            w.label.contains("每周") -> 1
+            else -> 2
         }
-        out.addAll(other)
-        return out
+        return order.map { family ->
+            family to buckets.getValue(family).sortedBy { rank(it) }
+        }
     }
 
     private fun secondsLabel(seconds: Long): String? {
