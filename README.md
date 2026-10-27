@@ -21,15 +21,20 @@ CPA-Android/
 ├── go-bridge/             # gomobile 桥接模块，replace 指向 ../upstream-cliproxy
 │   └── cliproxymobile/
 │       ├── mobile.go          # 仅导出 string / bool 单返回值
-│       └── bridge_test.go     # 启动 / 端口 / 热重载 / 快速设置 / 停止
+│       ├── bridge_test.go     # 启动 / 端口 / 热重载 / 快速设置 / 停止
+│       └── thinking_test.go   # 思维链 payload 规则：成对写入、只删自己那条、catalog 键共存
 ├── rules/config.yaml      # L2 远程规则下发的源文件
 ├── scripts/
 │   ├── check16k.py            # ELF PT_LOAD p_align >= 16384 回归检查
-│   └── device-smoke.sh        # 真机端到端断言
+│   ├── device-smoke.sh        # 真机端到端断言
+│   ├── tap.py                 # 按文本/content-desc 找 bounds 再点，不写死坐标
+│   ├── ui_text.py             # uiautomator dump 的文本抽取
+│   └── notif_expand.py        # 展开通知栏，用于核对状态栏额度正文
 ├── app/
 │   ├── libs/cliproxy.aar  # gomobile bind 产物
+│   ├── src/main/assets/models.json  # 修正后的模型目录：APK 资产，启动时复制到 filesDir，由 models.catalog 指向
 │   └── src/main/java/me/routerfor/cpa/
-│       ├── MainActivity.kt          # 首页：主题按钮 + 齿轮 + 状态卡 + 提供商聚合卡 + 四按钮
+│       ├── MainActivity.kt          # 首页：刷新 + 主题 + 齿轮三个图标按钮、状态卡、提供商聚合卡（含按族分组的额度）、四颗快捷按钮
 │       ├── SettingsActivity.kt      # 设置：外观 / 网络 / 引擎 / 更新 / 系统 / 关于
 │       ├── PanelActivity.kt         # 全屏管理面板（返回直接回主界面）
 │       ├── Palette.kt               # 三套调色板 + ThemeManager（四态主题、系统栏上色）
@@ -49,8 +54,8 @@ CPA-Android/
 │       ├── AppPrefs.kt              # 设置持久化（热更新默认关闭）
 │       ├── Credentials.kt           # 经 /v8/management/credentials 读写账号与启停
 │       ├── OauthLauncher.kt         # 走 /v8/management/oauth/auth-url 取授权链接
-│       ├── Quota.kt                 # 各家额度接口的代理调用与解析
-│       ├── QuotaNotifier.kt         # 状态栏通知里的额度快照
+│       ├── Quota.kt                 # 各家额度接口的代理调用与解析，按模型族把窗口分组（byFamily）
+│       ├── QuotaNotifier.kt         # 状态栏通知里的 5h 额度快照
 │       └── WebBridgeCompat.kt       # gomobile 绑定的安全包装
 └── .github/workflows/auto-sync-upstream.yml
 ```
@@ -61,8 +66,8 @@ CPA-Android/
 
 | 页面 | 内容 |
 | :--- | :--- |
-| 首页 `MainActivity` | 右上角三个按钮：刷新（全局，同时让每个账号的独立刷新按钮进入刷新态）、主题、齿轮。状态卡：运行绿点 / 服务地址 / API 密钥点按复制 / 内核版本 + 热更新状态。AI 提供商卡：按提供商分组聚合所有账号，每组一个整组开关、每账号一个开关（走 `PATCH /v8/management/credentials/status`），账号下方是额度条 + 额度文案 + 独立刷新按钮。快捷操作四按钮同形（管理面板 / 快捷添加 / 重启网关 / 设置）。 |
-| 设置 `SettingsActivity` | 外观：跟随系统 / 日间 / 黑夜 / 羊皮纸四选一（当前项打勾）。网络：上游代理（`socks5://…` 或「直连」）、允许局域网访问（经典圆形开关）。引擎：敏感词混淆、直接编辑 `config.yaml`（等宽字体，保存后热重载）。更新：状态栏显示额度（经典圆形开关）、内核热更新开关、检查更新、同步远程规则。系统：忽略电池优化、重启网关。关于：版本 / 架构 / 热更新状态。 |
+| 首页 `MainActivity` | 右上角三个图标按钮：刷新（全局，同时让每个账号的独立刷新按钮进入刷新态）、主题、齿轮。状态卡：运行绿点 / 服务地址（补了 `/v1` 后缀，即 `127.0.0.1:8317/v1`，客户端直接粘贴就能用）/ API 密钥点按复制 / 内核版本 + 热更新状态。AI 提供商卡：按提供商分组聚合所有账号，每组一个整组开关、每账号一个开关（走 `PATCH /v8/management/credentials/status`），账号下方是按模型族分组的额度块 + 独立刷新按钮。快捷操作四按钮同形（管理面板 / 快捷添加 / 重启网关 / 设置）。 |
+| 设置 `SettingsActivity` | 外观：跟随系统（半太阳半月亮专属图标）/ 日间 / 黑夜 / 羊皮纸四选一（当前项打勾）。网络：上游代理（`socks5://…` 或「直连」）、允许局域网访问（经典圆形开关）。引擎：敏感词混淆、编辑 `config.yaml`（等宽字体，保存后热重载）、**显示思维链**（经典圆形开关，默认开启）。更新：**状态栏显示 5h 额度**（经典圆形开关，默认关闭）、内核热更新开关、检查更新、同步远程规则。系统：忽略电池优化、重启网关。关于：版本 / 架构 / 热更新状态。 |
 | 面板 `PanelActivity` | 全屏 `/management.html`，预置登录态直接进；供应商 OAuth 与 `localhost:51121` 回调交给 Chrome Custom Tabs，全程零粘贴。返回箭头与系统返回键都直接回主界面，不走 SPA 历史。 |
 
 全中文，无英文残留。界面不再用 M3 的默认配色与阴影，改为手写视图 + `UiKit` 统一绘制：
@@ -74,6 +79,17 @@ CPA-Android/
 
 `Palette.Mode` 是 `SYSTEM / DAY / NIGHT / PAPER` 四态，实际解析成三种 palette：
 跟随系统时读 `uiMode` 决定 day 还是 night，`onConfigurationChanged` 里重建界面。
+
+两处容易踩的细节：
+
+- **切主题不弹 toast**。首页右上角的主题按钮点一下就 `recreate()`，整屏配色立刻变，
+  再叠一条「已切换」的提示纯属噪音，已删掉。
+- **从设置页改主题后主页必须重建，而且不能只比配色**。日间 → 跟随系统（此时系统是浅色）
+  解析出的 palette 完全一样，只比较颜色就发现不了变化。`SettingsActivity` 因此比较的是
+  `Palette.Mode`，并在 `onBackPressed` 里 `setResult(RESULT_THEME_CHANGED)`；
+  `MainActivity.onActivityResult` 收到后 `recreate()`。
+- 「跟随系统」有专属的半太阳半月亮图标（`ic_theme_auto`），不再借用日间/黑夜图标——
+  否则「跟随系统且系统为浅色」和「明确选了日间」在按钮上长得一模一样。
 
 难点在管理面板：它是一个独立 SPA，自带 zustand theme store（`localStorage['cli-proxy-theme']`，
 明文 JSON，未混淆），只有 `auto / white / light / dark` 四种，**没有羊皮纸**，而且主色被硬编码成灰色
@@ -111,23 +127,46 @@ WebView 永远看不到未净化版本（推广串在模块脚本内部，只改
 I CpaPanel: panel raw=3160171 clean=3159826 patched=3162391 sponsor=false
 ```
 
-## 额度显示（2.2 新增）
+## 额度显示
 
-内核没有现成的「还剩多少额度」接口：`/v8/management/credentials` 里的 `quota.signals` 只是上一次真实请求带回来的响应头水位，新账号是空的。面板的做法是**代理请求各家的官方额度接口**，走的正是 `POST /v8/management/requests/api-call`：内核用选定凭据的 access token 替换请求头里的字面量 `Bearer $TOKEN$`（必要时先刷新），所以 App 自己从不碰 token。
+内核没有现成的「还剩多少额度」接口：`/v8/management/credentials` 里的 `quota.signals` 只是上一次真实请求带回来的响应头水位，新账号是空的。App 的做法是**代理请求各家的官方额度接口**，走的正是 `POST /v8/management/requests/api-call`：内核用选定凭据的 access token 替换请求头里的字面量 `Bearer $TOKEN$`（必要时先刷新），所以 App 自己从不碰 token。
 
 各家返回格式不同，解析按 provider 分开：
 
 | provider | 接口 | 取什么 |
 | :--- | :--- | :--- |
 | antigravity | `POST v1internal:retrieveUserQuotaSummary`（三个 host 依次回退） | `groups[].buckets[].remainingFraction` |
-| claude | `GET /api/oauth/usage` | `five_hour` / `seven_day` 等的 `utilization` |
-| codex | `GET /backend-api/wham/usage` | `rate_limit.primary/secondary.used_percent` |
+| claude | `GET https://api.anthropic.com/api/oauth/usage` | `five_hour` / `seven_day` 等的 `utilization` |
+| codex | `GET https://chatgpt.com/backend-api/wham/usage` | `rate_limit.primary/secondary.used_percent` |
 | xai / kimi | 各自的 usage 接口 | `used_percent` |
 | 其他 | — | 显示「该提供商不提供额度查询」，不算错误 |
 
 **踩过的坑**：antigravity 的额度接口按 `User-Agent` 认客户端，少带这个头会返回 403「You do not have a valid license of this product」——看起来像账号没权限，其实只是少一个 header。用 curl 手测时 UA 是 curl 默认值所以能通，App 里就得显式带上 `antigravity/hub/2.23.0 darwin/arm64`。
 
-antigravity 同一组额度会按模型族各报一遍（`Gemini Models` 与 `Claude and GPT models` 各有 weekly / 5h），所以标签必须带族名，否则看起来像四条重复数据。
+### 按模型族分组，一族两条进度条
+
+antigravity 会把同一份额度按模型族各报一遍：`Gemini Models` 和 `Claude and GPT models`
+各有一对 5 小时 / 每周窗口。这两对是**两笔独立的预算**（Gemini 见底时 Claude 可能还剩满），
+所以不能折成一个数字。`Quota.byFamily()` 按族名归组，首页每个账号下方就变成：
+
+```text
+Gemini
+  ▓▓▓▓▓▓▓▓▓▓▓▓░░  5 小时额度 余 99% · 15:43 重置
+  ▓▓▓▓▓▓▓▓▓▓▓▓░░  每周额度   余 98% · 10月31日 14:12 重置
+Claude
+  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓  5 小时额度 余 100% · 18:51 重置
+  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓  每周额度   余 100% · 10月31日 18:51 重置
+```
+
+几个刻意的取舍：
+
+- **一条窗口一条进度条**，族名作为小标题（`friendlyGroup()` 把 `Gemini Models` 缩成 `Gemini`，
+  `Claude and GPT models` 缩成 `Claude`）。族内固定按 5 小时、再每周排序，不吃接口返回顺序。
+- **进度条画的是「剩余」不是「已用」**（`UiKit.QuotaBar` 取 `100 - used`）。一根满绿条一眼就是
+  「还够用」，画已用量则反过来要脑内换算。颜色按剩余量分档：≥50% 绿、≥20% 黄、其余红。
+- **重置时间是绝对时刻，不是倒计时**。「还有 4 天」看着顺口，但决定「现在要不要开一个长任务」时
+  没用；面板上显示的也是绝对时间。今天内的显示 `HH:mm`，其他日期显示 `M月d日 HH:mm`。
+- 只报单一预算的 provider（claude / codex / xai / kimi）归成一组、族名留空，不额外画标题。
 
 刷新机制分三层，都不轮询：
 
@@ -135,7 +174,101 @@ antigravity 同一组额度会按模型族各报一遍（`Gemini Models` 与 `Cl
 2. **全局刷新**：右上角那颗按钮，重拉所有账号，同时让每个账号的独立刷新按钮一起进入刷新态。
 3. **单账号刷新**：账号行里的按钮，只重问这一个凭据，不阻塞其他账号。
 
-「状态栏显示额度」开关默认关闭：把账号名放到锁屏上不该是默认行为。开启后下拉展开网关通知，正文列出每个已启用账号的剩余额度与采集时间。通知正文是**缓存快照**，由额度拉取完成或网关状态刷新触发重绘，不跑定时器——前台服务里的轮询正是 Android 会掐掉的东西，而一个悄悄停住的数字比一个带时间戳的旧数字更糟。
+### 状态栏只显示 5 小时额度
+
+设置 → 更新 → **「状态栏显示 5h 额度」**，默认关闭：把账号名放到锁屏上不该是默认行为。
+开启后下拉展开网关通知，每个已启用账号两行——
+
+```text
+Antigravity · someone@example.com
+   Gemini · 5h 额度 99% 15:43 重置
+   Claude · 5h 额度 100% 18:51 重置
+更新于 14:07
+```
+
+- 第一行是「提供商 · 邮箱」：同一提供商挂多个账号时，只写提供商根本分不清是谁的额度。
+- 只取 5 小时窗口：通知是一眼扫的，每周额度变得慢，回 App 里看更合适。
+- 余额行按模型族各一行并缩进，多族的 provider 才不会把第二行顶到和账号名齐平。
+- 正文是**缓存快照**，由额度拉取完成或网关状态刷新触发重绘，不跑定时器——前台服务里的轮询
+  正是 Android 会掐掉的东西，而一个悄悄停住的数字比一个带时间戳的旧数字更糟。关掉开关会立刻
+  清掉缓存，避免留着一条过期正文。
+
+## 思维链
+
+antigravity 的 gemini 默认**思考但不回传思考内容**：上游确实产生了 thought token
+（`usageMetadata.thoughtsTokenCount` 非零），可响应流里 `delta.reasoning_content` 是空的，
+客户端自然什么都显示不出来。
+
+### 触发条件是「两个键成对」
+
+必须同时给到下面两个键，缺一不可：
+
+```yaml
+request.generationConfig.thinkingConfig.includeThoughts: true
+request.generationConfig.thinkingConfig.thinkingLevel: high
+```
+
+- **只有 `includeThoughts` 不行**。实测：payload 里带着这个键、但没有 level/budget 时，
+  上游照常思考（`thoughtsTokenCount` 不为零），`delta.reasoning_content` 却始终为空——
+  思考 token 扣了，内容一个字节也拿不到。
+- **只有 `thinkingLevel` 也不行**。有强度但没打开可见性，表现相同。
+- 顺带还有一层：常见客户端写法（顶层 `include_thoughts`、`thinking: {type: enabled}`）
+  在翻译成 antigravity 协议时就被丢掉了，根本到不了 payload——所以「让客户端自己传」这条路
+  对大多数客户端根本不成立。
+- **客户端传 `reasoning_effort` 也能出内容**，因为翻译层会顺带把 `includeThoughts` 一起写进去；
+  但要求每个客户端都去配 `reasoning_effort` 不现实（SillyTavern 之外未必有这个旋钮）。
+  实测：开关打开后，客户端**不传** `reasoning_effort` 也能拿到 `reasoning_content`。
+
+### 为什么用 payload 规则，而不是改上游代码
+
+做法是往 `config.yaml` 写一条 `requests.payload.override` 规则（`go-bridge/cliproxymobile/mobile.go`
+的 `applyThinkingVisibility()`），由内核在请求出站前把这两个键塞进 payload：
+
+```yaml
+requests:
+  payload:
+    override:
+      - models:
+          - name: "*"
+        params:
+          generationConfig.thinkingConfig.includeThoughts: true
+          generationConfig.thinkingConfig.thinkingLevel: high
+```
+
+选这条路而不是在 `normalizeAntigravityOpenAIThinkingConfig` 里写死默认值，理由有三条：
+
+1. **可关**。思考内容本身计费，默认全开等于给每次请求加钱。开关关掉时规则被摘掉，
+   `config.yaml` 里看得见，不存在「以为关了其实还在扣」。
+2. **能热更**。规则是配置，改完引擎文件 watcher 毫秒级重载；改代码得重编 `libgojni.so`
+   再走热更或重新安装。
+3. **扛上游同步**。`.github/workflows/auto-sync-upstream.yml` 会定期对齐上游，改在 `internal/` 里的
+   代码会在同步时冲突或丢失；payload 规则是上游的公开能力，同步多少次都还在。
+
+只在开启时写这条规则，关闭时只删自己这一条（`removeThinkingRule()` 按 `includeThoughts`
+这个 key 认领），用户自己加的 override 规则原样保留——有回归测试
+（`go-bridge/cliproxymobile/thinking_test.go`）盯着这两点。
+
+### 开关位置与默认值
+
+设置 → 引擎 → **「显示思维链」**，经典圆形开关，**默认开启**
+（`AppPrefs.thinkingVisible()` 读 `KEY_THINKING = "thinking-visible"`，缺省 `true`）。
+拨动后 `applyQuickSettings()` 重写 `config.yaml` 并触发热重载，不需要重启网关。
+
+## 模型目录
+
+上游的静态模型表 `internal/registry/models/models.json` 里，antigravity 段只有
+`gemini-3.8-flash-high` 一条；远程目录（`raw.githubusercontent.com/router-for-me/models`）也是同一份，
+所以启动时的自动更新补不上 low / medium。模型本身是支持的（`gemini-3.8-flash-high(low)`
+用 thinking 后缀寻址能 200），缺的只是目录条目。
+
+修法是 App 自带一份修好的目录：`app/src/main/assets/models.json` 补了
+`gemini-3.8-flash-low` 与 `gemini-3.8-flash-medium`，`ProxyForegroundService.installModelsCatalog()`
+每次启动把它复制到 `filesDir/models.json`（覆盖旧副本，因为它不含用户状态），
+`config.yaml` 里 `models.catalog` 指向该路径，于是远程目录再也覆盖不掉它。
+Go 读不了 APK 里的 asset，所以复制这一步必须在 Kotlin 侧。
+
+> 上游侧的同款修复也在 `upstream-patches.diff` 里（补 models.json 两条），
+> 两处并存是刻意的：App 资产保证自己的 APK 一定对，补丁保证裸跑上游也对。
 
 ## 构建
 
@@ -210,7 +343,7 @@ netlink 实现）。
 
 ## 运行时踩坑与修复（实测记录）
 
-这四条都是真机/模拟器上跑出来的，不是推测；前两条会直接让交付物在目标设备上失效。
+下面几条都是真机/模拟器上跑出来的，不是推测；前两条会直接让交付物在目标设备上失效。
 
 ### 1. Go 1.23+ linkname 校验锁死 gomobile bind
 
@@ -273,38 +406,6 @@ I CpaWeb: dom "root=2 body=1581"  ← 仪表盘渲染完成
 `refreshStatus()` 在 `webView.url == null` 且引擎未就绪时自我 `postDelayed`；`loadPanel` 在未 running 时
 也排重试。
 
-## 设备侧验证（scripts/device-smoke.sh）
-
-```
-./gradlew assembleDebug -PwithEmulatorAbi=true   # 模拟器需要 x86_64
-bash scripts/device-smoke.sh [serial]
-```
-
-最近一次结果（主力机 25060RK16C / Android 17 / API 37）：**30 passed, 0 failed**。
-C 组覆盖前台服务 + WakeLock、/management.html 200、落盘配置、匿名 401 / 带 key 200、
-auth-url 的 redirect_uri=localhost:51121、:51121 转发器 302 转内核消费回调、D1 改 keepalive
-15 到 25 引擎 fsnotify 热重载；D2 组覆盖 2.0 的新契约：热更新默认关闭、关闭时无暂存内核、
-loader 走内置内核分支、面板日志 sponsor=false、SPA 真正挂载、RUM 信标被掐、三个 Activity 均已注册。
-
-D2 里有一处刻意绕开的坑：PanelActivity 是 exported="false"，系统会直接拒绝
-am start -n .../.PanelActivity（SecurityException: not exported from uid）。所以脚本改成
-uiautomator dump 找到「管理面板」按钮的 bounds、算出中心点、input tap 点进去 —— 和真人操作同一条路径。
-
-OAuth 端到端的人机验证（点「添加账号」→ 授权页登录 → 凭据落盘）需要真实 Google 账号，
-脚本只验证到「引擎起 51121 转发器 + 签发真实 consent URL + Custom Tabs 被拉起」这一步；
-真机上已确认点「添加账号」后 mark.via/.CustomTab 被拉起、引擎日志出现
-callback forwarder for antigravity listening on 0.0.0.0:51121。
-
-## 构建参数备忘
-
-```bash
-# 真机（只打 arm64，产物约 37 MB）
-./gradlew clean assembleDebug
-
-# 模拟器（额外打 x86_64，产物约 68 MB）
-./gradlew assembleDebug -PwithEmulatorAbi=true
-```
-
 ### 5. Android 17 拒绝加载：ELF 段只有 4 KB 对齐（真机实测）
 
 装到 Redmi Note 12 Turbo（Android 17 / API 37）首次启动，系统直接弹"Android 应用兼容性"：
@@ -343,6 +444,38 @@ python3 scripts/check16k.py app/libs/cliproxy.aar app/build/outputs/apk/debug/ap
 
 CI 里已在 bind 后与 assemble 后各加一道 `scripts/check16k.py`，防止上游同步把这条退化掉。
 
+## 设备侧验证（scripts/device-smoke.sh）
+
+```
+./gradlew assembleDebug -PwithEmulatorAbi=true   # 模拟器需要 x86_64
+bash scripts/device-smoke.sh [serial]
+```
+
+最近一次结果（主力机 25060RK16C / Android 17 / API 37）：**30 passed, 0 failed**。
+C 组覆盖前台服务 + WakeLock、/management.html 200、落盘配置、匿名 401 / 带 key 200、
+auth-url 的 redirect_uri=localhost:51121、:51121 转发器 302 转内核消费回调、D1 改 keepalive
+15 到 25 引擎 fsnotify 热重载；D2 组覆盖 2.0 的新契约：热更新默认关闭、关闭时无暂存内核、
+loader 走内置内核分支、面板日志 sponsor=false、SPA 真正挂载、RUM 信标被掐、三个 Activity 均已注册。
+
+D2 里有一处刻意绕开的坑：PanelActivity 是 exported="false"，系统会直接拒绝
+am start -n .../.PanelActivity（SecurityException: not exported from uid）。所以脚本改成
+uiautomator dump 找到「管理面板」按钮的 bounds、算出中心点、input tap 点进去 —— 和真人操作同一条路径。
+
+OAuth 端到端的人机验证（点「添加账号」→ 授权页登录 → 凭据落盘）需要真实 Google 账号，
+脚本只验证到「引擎起 51121 转发器 + 签发真实 consent URL + Custom Tabs 被拉起」这一步；
+真机上已确认点「添加账号」后 mark.via/.CustomTab 被拉起、引擎日志出现
+callback forwarder for antigravity listening on 0.0.0.0:51121。
+
+## 构建参数备忘
+
+```bash
+# 真机（只打 arm64，产物约 37 MB）
+./gradlew clean assembleDebug
+
+# 模拟器（额外打 x86_64，产物约 68 MB）
+./gradlew assembleDebug -PwithEmulatorAbi=true
+```
+
 ## 真机实测
 
 两台机器都跑过，都是 Android 17 / API 37 / arm64-v8a：
@@ -368,7 +501,7 @@ scripts/adbw.sh shell getprop ro.product.model
 
 界面截图在 docs/screens/：home-day.png / home-dark.png / home-paper.png / home-follow-system.png
 （首页四个主题态）、home-quota.png（额度条与账号行）、home-refreshing.png（全局刷新态）、
-settings-day.png / settings-quota.png（设置页与状态栏额度开关）、
+settings-day.png / settings-quota.png（设置页与「状态栏显示 5h 额度」开关）、
 panel-day.png / panel-dark.png / panel-paper.png（面板跟随 App 主题）、
 quick-add.png（快捷添加的品牌图标）。
 

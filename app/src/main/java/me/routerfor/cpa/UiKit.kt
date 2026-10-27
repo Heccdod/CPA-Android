@@ -148,12 +148,15 @@ class UiKit(private val context: Context, val colors: Palette.Colors) {
             track.setBounds(0, 0, w.toInt(), h.toInt())
             track.draw(canvas)
 
-            val p = (percent ?: 0.0).coerceIn(0.0, 100.0)
-            if (p <= 0.0) return
+            // Null means "no measurement": draw only the track. A measured 0% *used* is the
+            // opposite case — a full bar — and used to fall through the same early return,
+            // which is why an untouched Claude account rendered as one grey line.
+            val p = percent ?: return
             // Remaining, not used: a full green bar reads as "plenty left" at a glance.
-            val remaining = (100.0 - p) / 100.0
-            val fw = (w * remaining).toFloat()
-            if (fw < h) return
+            val remaining = (100.0 - p).coerceIn(0.0, 100.0) / 100.0
+            // Keep a sliver visible at 1%, and never draw a bar shorter than the cap so the
+            // rounded ends do not collapse into a dot.
+            val fw = (w * remaining).toFloat().coerceIn(minOf(h, w), w)
             fill.setColor(when {
                 remaining >= 0.5 -> colors.ok
                 remaining >= 0.2 -> colors.warn

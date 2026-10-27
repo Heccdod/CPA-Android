@@ -1,0 +1,34 @@
+config-version: 8
+server:
+  host: "127.0.0.1"
+  port: 18317
+requests:
+  proxy-url: ""
+  streaming:
+    keepalive-seconds: 15
+    bootstrap-retries: 2
+    send-keepalive-before-ft: true
+access:
+  api-keys:
+    - "cpa-android-local"
+management:
+  allow-remote: false
+  secret-key: "$2a$10$xTfePWPN0ho94U/bfzBTqe0FuPoFT5Gsr0l3Z6H3dVitPUqLjv4Ve"
+  disable-control-panel: true
+  disable-auto-update-panel: true
+oauth:
+  auth-dir: "/root/AgyAndriod/diag/auths"
+  providers:
+    antigravity:
+      signature-cache-enabled: true
+      antigravity-credits: false
+routing:
+  retry:
+    request-retry: 0
+    max-retry-credentials: 0
+    max-retry-interval: 5
+observability:
+  logs:
+    debug: true
+    request-log: true
+    logging-to-file: false
