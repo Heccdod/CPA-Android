@@ -3,6 +3,9 @@
 个人自用 Android 反向代理：把 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Go 内核
 经 `gomobile` 打进前台服务，在本机 `127.0.0.1:8317` 暴露 OpenAI / Anthropic / Gemini 兼容的流式 API。
 
+配套文档：[CHANGELOG.md](CHANGELOG.md)（版本变更）、[UPSTREAM_ISSUES.md](UPSTREAM_ISSUES.md)
+（上游三个问题的根因与补丁，补丁本体是 [upstream-patches.diff](upstream-patches.diff)）。
+
 ## 终态交付契约与验证方式
 
 | 契约 | 物证 | 验证命令 |
@@ -74,6 +77,10 @@ CPA-Android/
 卡片、分隔线、按钮、开关全部取自 `Palette` 的三套 ARGB 调色板。状态栏与导航栏由
 `ThemeManager.applySystemBars()` 填成当前 palette 的 surface 色（透明栏会露出主题白底），
 图标明暗跟随 `lightStatusBar`。
+
+`ClassicSwitch` 的轨道尺寸从 52×32 一路收到 **34×21**（`TRACK_WIDTH_DP = 34f`），
+但视图本身靠 padding 撑到约 46×33 —— 轨道要小、点击区不能小，否则一排开关点起来全是
+「差一点点」，手指落在缝里就变成滚动了。
 
 ### 三套主题与面板同步
 
@@ -164,6 +171,9 @@ Claude
   `Claude and GPT models` 缩成 `Claude`）。族内固定按 5 小时、再每周排序，不吃接口返回顺序。
 - **进度条画的是「剩余」不是「已用」**（`UiKit.QuotaBar` 取 `100 - used`）。一根满绿条一眼就是
   「还够用」，画已用量则反过来要脑内换算。颜色按剩余量分档：≥50% 绿、≥20% 黄、其余红。
+  这里踩过一个语义坑：`usedPercent == null`（没有数据）和 `== 0`（一点没用）曾被同一个早退吃掉，
+  结果是全新 Claude 账号（剩余 100%）只画出一条灰底。现在 null 只画槽、0 画满格，
+  填充宽度还夹了一个下限，剩 1% 时不会缩成一个比圆角还小的点。
 - **重置时间是绝对时刻，不是倒计时**。「还有 4 天」看着顺口，但决定「现在要不要开一个长任务」时
   没用；面板上显示的也是绝对时间。今天内的显示 `HH:mm`，其他日期显示 `M月d日 HH:mm`。
 - 只报单一预算的 provider（claude / codex / xai / kimi）归成一组、族名留空，不额外画标题。
@@ -212,12 +222,13 @@ request.generationConfig.thinkingConfig.thinkingLevel: high
   上游照常思考（`thoughtsTokenCount` 不为零），`delta.reasoning_content` 却始终为空——
   思考 token 扣了，内容一个字节也拿不到。
 - **只有 `thinkingLevel` 也不行**。有强度但没打开可见性，表现相同。
-- 顺带还有一层：常见客户端写法（顶层 `include_thoughts`、`thinking: {type: enabled}`）
-  在翻译成 antigravity 协议时就被丢掉了，根本到不了 payload——所以「让客户端自己传」这条路
-  对大多数客户端根本不成立。
-- **客户端传 `reasoning_effort` 也能出内容**，因为翻译层会顺带把 `includeThoughts` 一起写进去；
+- **客户端传 `reasoning_effort` 确实能出内容**，因为翻译层会顺带把 `includeThoughts` 一起写进去
+  （`reasoning_effort: medium` 翻出来的就是 `includeThoughts: true` + `thinkingLevel: "medium"`）。
   但要求每个客户端都去配 `reasoning_effort` 不现实（SillyTavern 之外未必有这个旋钮）。
-  实测：开关打开后，客户端**不传** `reasoning_effort` 也能拿到 `reasoning_content`。
+- 而常见客户端的「只开可见性」写法（顶层 `include_thoughts`、`thinking: {type: enabled}`）
+  在翻译成 antigravity 协议时就被丢掉了，根本到不了 payload——所以「让客户端自己传」这条路
+  对多数客户端不成立，必须由服务端补齐成对的两个键。
+- 实测结论：开关打开后，客户端**不传** `reasoning_effort` 也能拿到 `reasoning_content`。
 
 ### 为什么用 payload 规则，而不是改上游代码
 
@@ -281,7 +292,8 @@ export ANDROID_HOME=/opt/android-sdk ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.109
 gomobile init
 go test -v ./cliproxymobile
 gomobile bind -target=android/arm64 -androidapi 28 -javapkg=me.routerfor.cliproxy \
-  -ldflags="-checklinkname=0" -o ../app/libs/cliproxy.aar ./cliproxymobile
+  -ldflags="-checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+  -o ../app/libs/cliproxy.aar ./cliproxymobile
 
 # 2) APK
 cd ..
@@ -300,7 +312,9 @@ netlink 实现）。
 ## 运行
 
 1. 首次启动 `CpaApp` 先经 `HotSoLoader` 装载内核（热更的 `.so` 优先），随后 `ProxyForegroundService`
-   写出 `filesDir/config.yaml` 与 `filesDir/auths/` 并调用 `startProxy(filesDir)`。
+   按顺序做三件事：`installModelsCatalog()` 把 `assets/models.json` 复制成 `filesDir/models.json`、
+   经 `ensureDefaultConfig()` 写出 `filesDir/config.yaml` 并建 `filesDir/auths/`、最后 `startProxy(filesDir)`。
+   顺序不能反——`config.yaml` 里的 `models.catalog` 指向那个 json，文件先落地才不会让引擎读到空目录。
 2. Go 侧等待 `net.DialTimeout("tcp", "127.0.0.1:8317")` 成功后才返回，`WebView` 不会撞 `ERR_CONNECTION_REFUSED`。
 3. 顶部「Add Antigravity」→ `GET /v8/management/oauth/auth-url?provider=antigravity&is_webui=1`
    → Chrome Custom Tab 打开授权页 → 浏览器重定向到 `http://localhost:51121/oauth-callback`
@@ -326,6 +340,11 @@ netlink 实现）。
 - **L2 规则热重载**：`UpdateManager.syncRules()` 拉取 `BuildConfig.RULES_URL`
   （`raw.githubusercontent.com/Heccdod/CPA-Android/main/rules/config.yaml`）→ 原子覆写
   `filesDir/config.yaml` → 引擎的文件 watcher 毫秒级热重载。同样是手动触发，不再自动跑。
+
+  > 注意这条路是**整份覆盖**：远程规则里没有 `requests.payload.override`，也没有 `models.catalog`，
+  > 同步一次就会把「显示思维链」的规则和自定义模型目录一起冲掉。同步完回设置页拨一下
+  > 「显示思维链」（或重启网关）即可让 `applyThinkingVisibility()` / `ensureCatalogKey()` 把两者补回去。
+  > 想让它们长期共存，得在 `rules/config.yaml` 里也写上——见 [rules/config.yaml](rules/config.yaml)。
 - **L3 内核/整包热更**：`UpdateManager.checkForUpdates()` 读 `api.github.com/repos/Heccdod/CPA-Android/releases/latest`，
   比对 `tag_name` 与本地 `versionName`；`.so` 按 assets 的 `digest`（`sha256:...`）校验后落到
   `getDir("hotlibs")`；`.apk` 下载后经 `FileProvider` 拉起系统安装器覆盖安装。
