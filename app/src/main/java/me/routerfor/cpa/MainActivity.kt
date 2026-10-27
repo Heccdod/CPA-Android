@@ -39,6 +39,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var startStopButton: MaterialButton
     private lateinit var statusCard: MaterialCardView
     private lateinit var accountsCard: MaterialCardView
+    private lateinit var accountsHead: LinearLayout
+    private lateinit var accountsScroll: MaxHeightScrollView
     private lateinit var accountsBox: LinearLayout
     private lateinit var themeButton: ImageView
     private lateinit var refreshButton: ImageView
@@ -134,9 +136,29 @@ class MainActivity : AppCompatActivity() {
         statusCard.addView(buildStatusBlock())
         body.addView(statusCard)
 
+        // The account card is split into a fixed header and a capped scroll area: the title
+        // always says how many accounts there are, while the list inside can grow to any length
+        // without pushing the quick actions off screen.
         accountsCard = ui.card()
+        accountsHead = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(ui.dp(18), ui.dp(16), ui.dp(18), 0)
+        }
         accountsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        accountsCard.addView(accountsBox)
+        accountsScroll = MaxHeightScrollView(this).apply {
+            isFillViewport = false
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            addView(accountsBox)
+        }
+        // CardView is a FrameLayout, so a header and a list added side by side would stack on top
+        // of each other. One vertical column keeps them in flow.
+        val accountsColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(accountsHead)
+            addView(accountsScroll)
+        }
+        accountsCard.addView(accountsColumn)
         body.addView(accountsCard)
 
         body.addView(ui.sectionTitle(getString(R.string.section_quick)))
@@ -347,8 +369,11 @@ class MainActivity : AppCompatActivity() {
         // Row bindings belong to the views just removed; without clearing, a rebind would write
         // into detached views and the freshly built rows would never update.
         quotaHolders.clear()
-        accountsBox.setPadding(ui.dp(18), ui.dp(16), ui.dp(18), ui.dp(12))
+        accountsBox.setPadding(ui.dp(18), 0, ui.dp(18), ui.dp(12))
 
+        // The title lives outside the scroll area so the account count stays visible however far
+        // the list is scrolled.
+        accountsHead.removeAllViews()
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -368,7 +393,7 @@ class MainActivity : AppCompatActivity() {
                 includeFontPadding = false
             })
         }
-        accountsBox.addView(head)
+        accountsHead.addView(head)
 
         if (entries.isEmpty()) {
             accountsBox.addView(TextView(this).apply {
@@ -377,11 +402,16 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(ui.colors.textSecondary)
                 setPadding(0, ui.dp(8), 0, 0)
             })
+            capAccountsHeight()
             return
         }
 
+        // The first group sits directly under the fixed header, so it gets air rather than a rule;
+        // a divider there would read as a border under the card title.
+        var firstGroup = true
         for ((provider, mine) in Credentials.grouped(entries)) {
-            accountsBox.addView(dividerLine())
+            accountsBox.addView(if (firstGroup) verticalGap(10) else dividerLine())
+            firstGroup = false
             accountsBox.addView(providerHeader(provider, mine))
             mine.forEach { accountsBox.addView(accountRow(it)) }
         }
@@ -390,10 +420,40 @@ class MainActivity : AppCompatActivity() {
         val known = Provider.entries.map { it.id.lowercase() }.toSet()
         val others = entries.filter { it.provider.lowercase() !in known }
         if (others.isNotEmpty()) {
-            accountsBox.addView(dividerLine())
+            accountsBox.addView(if (firstGroup) verticalGap(10) else dividerLine())
             accountsBox.addView(providerHeader(null, others))
             others.forEach { accountsBox.addView(accountRow(it)) }
         }
+        capAccountsHeight()
+    }
+
+    /**
+     * Bounds the account list to a fraction of the window.
+     *
+     * The card is the only unbounded section on the home screen: every provider and credential
+     * adds a row, and four providers were enough to push the quick actions below the fold. Two
+     * fifths of the window keeps the card clearly present without letting it swallow the screen —
+     * and the cap is recomputed on every render because rotation changes the available height.
+     */
+    private fun capAccountsHeight() {
+        val window = resources.displayMetrics.heightPixels
+        accountsScroll.maxHeight = (window * ACCOUNT_CARD_SCREEN_FRACTION).toInt()
+        // Only scroll when the content really overflows, so a one-account card shows no hint of
+        // being scrollable and does not intercept a drag meant for the page.
+        accountsScroll.post {
+            val content = accountsBox.height
+            val visible = accountsScroll.height
+            val overflowing = content > visible
+            accountsScroll.isVerticalScrollBarEnabled = false
+            accountsScroll.isNestedScrollingEnabled = overflowing
+            accountsScroll.overScrollMode =
+                if (overflowing) View.OVER_SCROLL_IF_CONTENT_SCROLLS else View.OVER_SCROLL_NEVER
+            if (!overflowing && accountsScroll.scrollY != 0) accountsScroll.scrollTo(0, 0)
+        }
+    }
+
+    private fun verticalGap(height: Int): View = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ui.dp(height))
     }
 
     private fun dividerLine(): View = View(this).apply {
@@ -800,5 +860,15 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val MAX_RETRY = 30
         private const val REQ_SETTINGS = 1001
+
+        /**
+         * How much of the window the account list may occupy.
+         *
+         * Two fifths is the balance the layout needs: one provider with two accounts fits without
+         * scrolling at all, and a long inventory still leaves the status card above and the quick
+         * actions below on screen. Measured against the window rather than in dp so it holds on
+         * both a 6.7" phone and a tablet.
+         */
+        private const val ACCOUNT_CARD_SCREEN_FRACTION = 0.40f
     }
 }

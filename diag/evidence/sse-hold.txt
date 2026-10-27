@@ -1,0 +1,6 @@
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"正文说完了","reasoning_content":null},"finish_reason":"max_tokens","native_finish_reason":"max_tokens"}],"usage":{"completion_tokens":8,"total_tokens":20,"prompt_tokens":12,"completion_tokens_details":{"reasoning_tokens":3}}}
+
+: keep-alive
+
+data: [DONE]
+

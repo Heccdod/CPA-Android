@@ -27,12 +27,18 @@ const (
 	AuthDirName = "auths"
 	// thinkingParamPath is the payload key that makes the upstream return thoughts.
 	thinkingParamPath = "generationConfig.thinkingConfig.includeThoughts"
-	// thinkingLevelPath must accompany it: visibility without effort is dropped during the
-	// translator's thinking normalisation, and the response carries no reasoning at all.
-	thinkingLevelPath    = "generationConfig.thinkingConfig.thinkingLevel"
-	thinkingLevelDefault = "high"
+	// thinkingLevelPath used to be written alongside includeThoughts. Measured A/B on the
+	// current upstream (same prompt, max_tokens 3000, gemini-3.8-flash-high): includeThoughts
+	// alone produced 3257 reasoning chars for 853 completion tokens, while adding
+	// thinkingLevel:high produced 2486 chars for 1241 tokens — strictly worse, because forcing
+	// effort high overrides the level the caller asked for and burns budget on easy prompts.
+	// It is now only written when the user explicitly picks a level.
+	thinkingLevelPath = "generationConfig.thinkingConfig.thinkingLevel"
 	// modelsFileName is the corrected model catalog the host copies into filesDir.
 	modelsFileName = "models.json"
+	// configVersion is the schema version the config file declares. ValidateV8Config keys off
+	// it, so a document missing it is not a valid v8 config even if every other key is right.
+	configVersion = "8"
 	// DefaultPort is the gateway port used by every generated configuration.
 	DefaultPort = 8317
 	// ManagementKey is the local management secret seeded into the panel.
@@ -43,7 +49,12 @@ const (
 	loopbackHost = "127.0.0.1"
 	anyHost      = "0.0.0.0"
 
-	readyTimeout  = 3 * time.Second
+	// readyTimeout is how long StartProxy waits for the engine to accept connections before
+	// giving up. Three seconds was enough on an idle machine but not on a cold phone start or
+	// while a build is running: the bridge test flaked roughly one run in ten, and the app
+	// would report a failed start that a retry then fixed. Starting the engine is the slow
+	// part; ten seconds costs nothing when it succeeds on the first probe.
+	readyTimeout  = 10 * time.Second
 	probeInterval = 50 * time.Millisecond
 	stopTimeout   = 10 * time.Second
 )
@@ -376,6 +387,15 @@ server:
 requests:
   # Upstream proxy for provider calls (socks5/http/https, "direct" or "none").
   proxy-url: %s
+  # Show the chain of thought to the client. Visibility only — the effort level is left to
+  # whichever client asks for one, because forcing it here overrides that choice and spends
+  # the caller's token budget on it.
+  payload:
+    override:
+      - models:
+          - name: "*"
+        params:
+          generationConfig.thinkingConfig.includeThoughts: true
   streaming:
     # Emit ": keep-alive" SSE heartbeats every 15s while the model is thinking.
     keepalive-seconds: 15
@@ -441,21 +461,26 @@ func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool) error {
 	// preserved, because unlike config.yaml it holds no user state.
 	path := configPath(dataDir)
 	if _, err := os.Stat(path); err == nil {
-		// The file predates this build: it has no models.catalog, so the corrected table never
-		// gets loaded. Patch the one key in place and leave everything else the user may have
-		// tuned (proxy, api-keys, sensitive words) exactly as it is.
-		return ensureCatalogKey(path, catalogPath(dataDir))
+		// The file predates this build, so it carries whatever the build that wrote it did:
+		// no models.catalog, and possibly the thinking level this app used to hard-code.
+		// Patch those keys in place and leave everything else the user may have tuned
+		// (proxy, api-keys, sensitive words) exactly as it is.
+		return migrateExistingConfig(path, catalogPath(dataDir))
 	} else if !os.IsNotExist(err) {
 		return err
 	}
 	return writeFileAtomic(path, []byte(renderDefaultConfig(dataDir, proxyURL, allowLan)))
 }
 
-// ensureCatalogKey sets models.catalog on an existing config without touching other keys.
+// migrateExistingConfig brings a config written by an older build up to date without touching
+// any key the user may have tuned.
 //
-// Rewriting the whole file would discard the user's proxy, api-keys and sensitive-word edits,
-// so only the one path is set, and only when it is absent or points somewhere else.
-func ensureCatalogKey(configPath, catalog string) error {
+// Two things age out: models.catalog, which an old file does not have (so the corrected model
+// table never loads), and the thinkingLevel this app used to write next to includeThoughts,
+// which overrides whatever effort the caller asks for. Rewriting the whole file would discard
+// the user's proxy, api-keys and sensitive-word edits, so only those paths are touched, and the
+// file is only rewritten when something actually changed.
+func migrateExistingConfig(configPath, catalog string) error {
 	raw, errRead := os.ReadFile(configPath)
 	if errRead != nil {
 		return errRead
@@ -464,8 +489,18 @@ func ensureCatalogKey(configPath, catalog string) error {
 	if errUnmarshal := yaml.Unmarshal(raw, &root); errUnmarshal != nil {
 		return errUnmarshal
 	}
-	// Already pointing at the right file: nothing to do, and no need to rewrite.
-	if existing := lookupPath(&root, []string{"models", "catalog"}); existing == catalog {
+	// config-version is the schema selector rather than a user setting: the engine's v8
+	// validation keys off it. A document that lost it — a hand edit, a bad merge, a build that
+	// swallowed the line into a comment — has to get it back instead of silently running
+	// without it.
+	versionChanged := lookupPath(&root, []string{"config-version"}) != configVersion
+	catalogChanged := lookupPath(&root, []string{"models", "catalog"}) != catalog
+	levelChanged := stripForcedThinkingLevel(&root, []string{"requests", "payload", "override"})
+	// A file that already carries a repeated banner needs a rewrite even when the keys above
+	// are fine: the earlier build appended the banner on every migration, so installs updated
+	// several times are sitting on several copies with nothing else to fix.
+	bannerRepeated := hasRepeatedHeadComments(raw)
+	if !versionChanged && !catalogChanged && !levelChanged && !bannerRepeated {
 		return nil
 	}
 	// setPath works on a mapping node. Unmarshalling produces a DocumentNode wrapping it, and
@@ -479,14 +514,98 @@ func ensureCatalogKey(configPath, catalog string) error {
 	if doc.Kind != yaml.MappingNode {
 		return fmt.Errorf("config root is not a YAML mapping")
 	}
-	value := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: catalog}
-	setPath(doc, []string{"models", "catalog"}, value)
+	if versionChanged {
+		setPath(doc, []string{"config-version"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: configVersion})
+	}
+	if catalogChanged {
+		value := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: catalog}
+		setPath(doc, []string{"models", "catalog"}, value)
+	}
 	out, errMarshal := yaml.Marshal(&root)
 	if errMarshal != nil {
 		return errMarshal
 	}
-	// Re-insert the leading comment block; yaml.Marshal drops all comments.
-	return writeFileAtomic(configPath, append(headComments(raw), out...))
+	// yaml.v3 keeps the document's head comment, so marshalling already writes the banner
+	// back. Prepending headComments(raw) on top of that duplicated it once per migration —
+	// a config touched four times carried four copies of the same five-line banner, which
+	// is exactly what the in-app editor showed. collapseDuplicateHeadComments also repairs
+	// files that already accumulated copies.
+	return writeFileAtomic(configPath, collapseDuplicateHeadComments(out))
+}
+
+// hasRepeatedHeadComments reports whether the document's leading comment block contains a
+// run that repeats immediately, which is how the banner accumulated.
+func hasRepeatedHeadComments(doc []byte) bool {
+	lines := strings.Split(string(doc), "\n")
+	end := 0
+	for end < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[end]), "#") {
+		end++
+	}
+	head := lines[:end]
+	return len(dropRepeatedRuns(head)) != len(head)
+}
+
+// collapseDuplicateHeadComments removes repeated identical runs of comment lines at the top
+// of a document.
+//
+// It repairs configs written by an earlier build, which prepended the banner on every
+// migration: three migrations left the same five lines three times in a row, and because
+// they were contiguous they read as one long block. The loop below repeatedly drops a run
+// that repeats immediately after itself, so a banner followed by a genuinely different
+// comment keeps both — only exact repeats go.
+func collapseDuplicateHeadComments(doc []byte) []byte {
+	lines := strings.Split(string(doc), "\n")
+	// The comment run at the top of the file is the only place the banner can hide.
+	end := 0
+	for end < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[end]), "#") {
+		end++
+	}
+	head := dropRepeatedRuns(lines[:end])
+	tail := lines[end:]
+	if len(tail) == 0 {
+		return []byte(strings.Join(head, "\n"))
+	}
+	// The newline between the comment block and the first real line is load-bearing: dropping
+	// it glued "…idle timers." onto "config-version: 8", turning the key into a comment and
+	// silently deleting it from the document.
+	return []byte(strings.Join(append(head, tail...), "\n"))
+}
+
+// dropRepeatedRuns removes a leading run that repeats itself immediately, repeatedly, so
+// every distinct comment block appears once.
+func dropRepeatedRuns(lines []string) []string {
+	for {
+		dropped := false
+		// Try the longest run first: the banner is several lines, and matching the whole
+		// banner is what distinguishes a real repeat from two comments that happen to share
+		// a first line.
+		for size := len(lines) / 2; size >= 1; size-- {
+			if len(lines) < size*2 {
+				continue
+			}
+			if !equalLines(lines[:size], lines[size:size*2]) {
+				continue
+			}
+			lines = append(append([]string(nil), lines[:size]...), lines[size*2:]...)
+			dropped = true
+			break
+		}
+		if !dropped {
+			return lines
+		}
+	}
+}
+
+func equalLines(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // lookupPath returns the scalar value at path, or "" when it is absent.
@@ -615,10 +734,11 @@ func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWords
 // rather than something baked into the build. Implemented as a requests.payload.override rule
 // so the behaviour is visible in config.yaml and survives an upstream sync.
 //
-// includeThoughts alone is not enough: the translator's thinking normalisation drops a payload
-// that carries visibility but no effort, so the rule sets thinkingLevel alongside it. With both
-// the response stream carries delta.reasoning_content; with only includeThoughts it stays null
-// and the thought tokens are spent for nothing.
+// includeThoughts is written alone. An earlier build also forced thinkingLevel: high on the
+// theory that visibility without effort gets dropped; measured A/B on the current upstream shows
+// the opposite — the pair costs more tokens and returns less reasoning, and hard-coding "high"
+// silently overrides whatever effort the caller requested. A caller that wants a specific level
+// still gets it, because nothing here overwrites generationConfig.thinkingConfig.thinkingLevel.
 func applyThinkingVisibility(root *yaml.Node, visible bool) {
 	path := []string{"requests", "payload", "override"}
 	if !visible {
@@ -627,6 +747,10 @@ func applyThinkingVisibility(root *yaml.Node, visible bool) {
 		return
 	}
 	if hasThinkingRule(root, path) {
+		// Configs written by an earlier build also carried thinkingLevel: high. Strip it so an
+		// upgrade does not keep overriding the caller's effort — otherwise the fixed behaviour
+		// only reaches freshly generated configs and existing installs stay on the old behaviour.
+		stripForcedThinkingLevel(root, path)
 		return
 	}
 	rule := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
@@ -639,8 +763,6 @@ func applyThinkingVisibility(root *yaml.Node, visible bool) {
 	params := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
 		{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingParamPath},
 		{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
-		{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingLevelPath},
-		{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingLevelDefault},
 	}}
 	setPath(rule, []string{"models"}, models)
 	setPath(rule, []string{"params"}, params)
@@ -672,6 +794,37 @@ func hasThinkingRule(root *yaml.Node, path []string) bool {
 		}
 	}
 	return false
+}
+
+// stripForcedThinkingLevel removes the thinkingLevel our earlier builds hard-coded, leaving
+// the visibility flag and any level the user set themselves.
+//
+// Only a rule that carries includeThoughts is touched: a user's own scale rule that sets just a
+// level is not ours to edit.
+func stripForcedThinkingLevel(root *yaml.Node, path []string) bool {
+	seq := lookupNode(root, path)
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return false
+	}
+	changed := false
+	for _, rule := range seq.Content {
+		if rule.Kind != yaml.MappingNode {
+			continue
+		}
+		params := lookupNode(rule, []string{"params"})
+		if params == nil {
+			continue
+		}
+		if lookupNode(params, []string{thinkingParamPath}) == nil {
+			continue
+		}
+		if lookupNode(params, []string{thinkingLevelPath}) == nil {
+			continue
+		}
+		removePath(params, []string{thinkingLevelPath})
+		changed = true
+	}
+	return changed
 }
 
 // removeThinkingRule deletes just the rule that sets includeThoughts.

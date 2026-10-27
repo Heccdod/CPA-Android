@@ -1,0 +1,12 @@
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"正文","reasoning_content":null},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"后续还有内容","reasoning_content":null},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{},"finish_reason":"stop","native_finish_reason":"stop"}],"usage":{"completion_tokens":8,"total_tokens":20,"prompt_tokens":12,"completion_tokens_details":{"reasoning_tokens":3}}}
+
+data: [DONE]
+

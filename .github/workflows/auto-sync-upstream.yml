@@ -62,6 +62,34 @@ jobs:
           head -5 upstream-cliproxy/go.mod
           echo "${{ steps.upstream.outputs.sha }}" > .upstream-sha
 
+      # A fresh clone is pristine upstream, so without this step every CI-built kernel would
+      # silently lose the local fixes (max_tokens retention above all) while the local build
+      # kept them — the two artifacts would drift without anything reporting it.
+      #
+      # --3way merges instead of demanding exact context lines, which survives small edits
+      # around the touched hunks. When it cannot merge, this fails on purpose: publishing a
+      # kernel that quietly drops the fix is worse than not publishing one, and the failure
+      # is the reminder to rebase upstream-patches.diff.
+      - name: Apply the local upstream patches
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          if ! git -C upstream-cliproxy apply --3way ../upstream-patches.diff; then
+            echo "::error::upstream-patches.diff no longer applies to ${UPSTREAM_REPO}@${{ steps.upstream.outputs.sha }}."
+            echo "Rebase it locally: scripts/apply-upstream-patch.sh --rebase"
+            echo "Then regenerate: git -C upstream-cliproxy diff <upstream-sha> > upstream-patches.diff"
+            exit 1
+          fi
+          # The patch is only worth applying if it actually landed: assert the two things the
+          # fix is made of rather than trusting that git reported success.
+          if grep -q 'sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")' \
+              upstream-cliproxy/internal/runtime/executor/antigravity_executor_request.go; then
+            echo "::error::the maxOutputTokens deletion is still present after patching."
+            exit 1
+          fi
+          grep -q 'gemini-3.8-flash-low' upstream-cliproxy/internal/registry/models/models.json
+          echo "Patches applied and verified."
+
       - name: Set up Go
         if: steps.upstream.outputs.changed == 'true'
         uses: actions/setup-go@v5

@@ -1,0 +1,12 @@
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"这是会被截断的正文","reasoning_content":null},"finish_reason":null,"native_finish_reason":null}]}
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+

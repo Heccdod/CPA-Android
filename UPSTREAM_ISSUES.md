@@ -4,10 +4,13 @@
 的三个改动，覆盖 `internal/registry/models/models.json` 与
 `internal/runtime/executor/antigravity_executor_request.go` 及其测试，可以直接 `git apply` 到上游。
 
-- 基线：上游 `HEAD = 3078035`（`fix(aistudio): translate every SSE frame of a relay stream chunk`，
-  tag 对应见 `.upstream-sha`）。
-- 校验：`git apply --check` 在干净的 `HEAD` 工作树上通过；打上后
-  `go test ./internal/runtime/executor/ ./internal/translator/antigravity/... ./internal/registry/...` 全绿。
+- 基线：上游 `ad8bdd3`（`fix(middleware): bound zstd decompression output and window in request logging`），
+  见 `.upstream-sha`。上一版基线是 `3078035`，上游前进后补丁已 rebase 到新基线。
+- 校验：在干净的 `ad8bdd3` 工作树上 `git apply --check` 通过、打上后
+  `go test ./internal/runtime/executor/ ./internal/translator/antigravity/...` 全绿。
+  `internal/registry` 里 `TestCodexConfigurationUpdateCapability` 在**未打补丁的干净上游**上就失败
+  （与本补丁无关，已单独确认），所以不列入判据。
+- 应用方式：`scripts/apply-upstream-patch.sh`（幂等）。CI 也执行同一步，并在应用后断言修正确实生效。
 
 每个问题按 **现象 / 根因（精确到文件行号）/ 验证方式 / 修复方案** 记录，方便直接转成 issue。
 
@@ -105,26 +108,37 @@ gemini-3.8-flash-low           -> unknown provider
 
 ---
 
-## 3. 思维链：`includeThoughts` 与 `thinkingLevel` **必须成对**
+## 3. 思维链：可见性由 `includeThoughts` 单独决定，强度不该被写死
 
-**现象**：antigravity 的 gemini 在 SillyTavern 里看不到思维链。
+**现象**：antigravity 的 gemini 在 SillyTavern 里看不到思维链；后来发现打开可见性之后，
+又在 300 token 的预算下几乎只吐思考、正文被挤掉。
 
-**根因**：不是「上游不支持思考」，而是触发条件没被满足，且**两个键必须同时在 payload 里**：
+**根因**：两件事，别混在一起。
+
+**（a）可见性**：`generationConfig.thinkingConfig.includeThoughts: true` 就是开关。翻译层
+（`antigravity_openai_response.go:169-170`）只把 `part.thought == true` 的 part 写进
+`choices.0.delta.reasoning_content`，所以只要上游把 thought part 发回来就能看到。
+`reasoning_effort`、`thinking: {type: enabled}`、顶层 `include_thoughts` 在 OpenAI →
+antigravity 的翻译阶段就被丢掉，对这些客户端不成立。
+
+> **修正**：本文件早先记的是「`includeThoughts` 与 `thinkingLevel` 必须成对，单独给
+> `includeThoughts` 无效」。在当前上游上重测，只有可见性、不写强度时 thought part 照样回传。
+> 当时的结论混入了另一个变量（`thinkingLevel: high` 同时把预算放大），把「看得见」和
+> 「看得多」当成了同一件事。下面的表是新测量结果：
 
 | 请求里的东西 | `delta.reasoning_content` |
 | :--- | :--- |
 | 什么都不传 | 空（有 `reasoning_tokens`，内容被丢弃） |
-| `reasoning_effort: "low"` | 空 |
-| `reasoning_effort: "medium"` | **有** |
-| `reasoning_effort: "high"` | **有** |
-| 只给 `generationConfig.thinkingConfig.includeThoughts: true` | 空 |
-| `includeThoughts: true` + `thinkingLevel: "high"` | **有** |
+| `reasoning_effort: "low"` / `"medium"` / `"high"` | **有** |
+| `generationConfig.thinkingConfig.includeThoughts: true` | **有** |
+| `includeThoughts: true` + `thinkingLevel: "high"` | **有**，但思考长度明显变长 |
 | `thinking: {type: enabled}` | 空（OpenAI 路径不认这个字段） |
 
-关键结论：**单独给 `includeThoughts` 无效**。翻译层确实认这个字段，但只有当 payload 同时
-带着思考强度（`thinkingLevel` 或 `thinkingBudget`）时，上游才会把 thought 文本回传；
-只有可见性、没有强度时，上游照常思考（`thoughtsTokenCount` 非零）却一个字节也不外显——
-钱花了，什么都看不到。
+**（b）强度**：本项目的开关一度同时写 `thinkingLevel: high`，理由是「不写强度就看不到」。
+实测反了：写死 high 会在同一 prompt 下把思考拉长到接近两倍 token，而正文反而更短——
+在 SillyTavern 默认 `max_tokens: 300` 下，思考吃掉 285–289 token，正文只剩 9–42 字，
+表现就是「被截断」或「一直在生成」。现在规则只写 `includeThoughts`，强度交回调用方：
+客户端传 `reasoning_effort` 就按它的来，不传就用上游默认。
 
 另外，`include_thoughts`（顶层）与 `thinking: {type: enabled}` 这类常见客户端写法，在
 OpenAI → antigravity 的翻译阶段就被丢掉了，所以「让客户端自己传」对多数客户端不成立。
@@ -142,17 +156,16 @@ if partResult.Get("thought").Bool() {
 
 1. 用 `/v8/management/requests/api-call` 直接打 `v1internal:generateContent`，
    对比「只 includeThoughts」与「includeThoughts + thinkingLevel」两种 body：
-   前者的响应里 `parts[].thought` 全为 false / 缺失，后者出现 `thought: true` 的 part。
+   两者都出现 `thought: true` 的 part，但后者 `thoughtsTokenCount` 约为前者的两倍，
+   正文长度反而更短——这就是把强度写死的代价。
 2. 走 App 的 OpenAI 兼容口，开关关掉时 `curl -N ... | grep reasoning_content` 无输出；
    打开后同一条命令能抓到 `"reasoning_content":"…"` 帧，且**客户端没有传 `reasoning_effort`**。
 
 **修复方案（本项目采用：App 侧 payload 规则，不改上游代码）**
 
-往 `config.yaml` 写一条 `requests.payload.override` 规则，由内核在请求出站前把两个键塞进 payload。
+往 `config.yaml` 写一条 `requests.payload.override` 规则，由内核在请求出站前把可见性键塞进 payload。
 规则由 `go-bridge/cliproxymobile/mobile.go` 的 `applyThinkingVisibility()` 生成
-（`thinkingParamPath = "generationConfig.thinkingConfig.includeThoughts"`、
-`thinkingLevelPath = "generationConfig.thinkingConfig.thinkingLevel"`、`thinkingLevelDefault = "high"`），
-最终写出来的 YAML 是：
+（`thinkingParamPath = "generationConfig.thinkingConfig.includeThoughts"`），最终写出来的 YAML 是：
 
 ```yaml
 requests:
@@ -162,8 +175,12 @@ requests:
           - name: '*'
         params:
           generationConfig.thinkingConfig.includeThoughts: true
-          generationConfig.thinkingConfig.thinkingLevel: high
 ```
+
+只写可见性，不写强度。调用方要指定强度就自己传 `reasoning_effort`，这边不覆盖；
+旧版本写进去的 `thinkingLevel: high` 会在引擎启动时被 `migrateExistingConfig()` 摘掉
+（只摘带 `includeThoughts` 的那条规则，用户自己按模型设的强度规则不动，
+见 `TestApplyThinkingVisibilityLeavesUserLevelAlone`）。
 
 为什么这比改上游更合适：
 
@@ -180,15 +197,15 @@ requests:
 
 - 关闭时**只删自己那一条**规则——按 `params` 里是否存在 `includeThoughts` 这个 key 认领
   （`hasThinkingRule()` / `removeThinkingRule()`），用户手写的 override 规则原样保留。
-- 开启时是幂等的：已经有这条规则就不再追加，避免 `config.yaml` 越切越长。
-- 与 `models.catalog` 打补丁共存：`ensureCatalogKey()` 只 set 一个路径，不整份重写，
+- 开启时是幂等的：已经有这条规则就不再追加，避免 `config.yaml` 越切越长；
+  已有规则里若还留着旧版本写的强度，顺手摘掉（`stripForcedThinkingLevel`）。
+- 与 `models.catalog` 打补丁共存：`migrateExistingConfig()` 只 set 需要的路径，不整份重写，
   两者先后执行都不会把对方的键冲掉（`TestEnsureCatalogKeySurvivesThinkingPatch`）。
 
 **如果将来要改上游**（本项目没做，记在这里供上游参考）：更合适的落点是
 `internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go` 的
-`normalizeAntigravityOpenAIThinkingConfig`（`545` 起）：当 payload 有 `includeThoughts` 但没有任何
-强度键时，补一个默认 `thinkingLevel`（或反过来，在没有可见性时不要凭空造 `thinkingConfig`）。
-无论改哪边，**成对**这条约束都不能只在一边实现。
+`normalizeAntigravityOpenAIThinkingConfig`（`545` 起）：当 payload 带可见性却没有任何强度键时，
+**不要**替调用方补一个默认强度。默认强度是成本决策，应该由调用方做。
 
 ---
 
@@ -201,12 +218,20 @@ requests:
 | `internal/runtime/executor/antigravity_executor_buildrequest_test.go` | 断言从「必须删除」改为「必须保留且为正」 | +6 / −2 |
 
 ```bash
-# 1) 应用到上游
-cd upstream-cliproxy && git apply --check ../upstream-patches.diff && git apply ../upstream-patches.diff
+# 1) 应用到上游（幂等；已打则跳过）
+scripts/apply-upstream-patch.sh
 
 # 2) 跑相关测试
-go test ./internal/runtime/executor/ ./internal/translator/antigravity/... ./internal/registry/...
+cd upstream-cliproxy
+go test ./internal/runtime/executor/ ./internal/translator/antigravity/...
 
-# 3) 重新生成（前提：工作树里只有这三个文件的改动）
-cd upstream-cliproxy && git diff > ../upstream-patches.diff
+# 3) 上游前进、补丁打不上时，把修正搬到新 HEAD
+scripts/apply-upstream-patch.sh --rebase     # 冲突则手工解决再继续
+
+# 4) 从工作树重新生成补丁
+scripts/apply-upstream-patch.sh --refresh
 ```
+
+CI 的 `.github/workflows/auto-sync-upstream.yml` 在 clone 之后立刻做第 1 步的
+`git apply --3way`，并断言「源码里不再有删除 `maxOutputTokens` 的语句」且
+「模型表里有 `gemini-3.8-flash-low`」。任一条不成立就 fail，不会发布丢了修复的内核。

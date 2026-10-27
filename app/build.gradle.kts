@@ -18,8 +18,8 @@ android {
         // Personal-use build: the API 28 compatibility mode keeps cleartext loopback HTTP
         // and System.load() of a .so from the private hot-update dir working.
         targetSdk = 28
-        versionCode = 5
-        versionName = "2.3.0"
+        versionCode = 6
+        versionName = "2.4.0"
         // Shipped update channel: the app reads releases/latest from this repository only.
         buildConfigField("String", "UPDATE_REPO", "\"Heccdod/CPA-Android\"")
         buildConfigField("String", "RULES_URL", "\"https://raw.githubusercontent.com/Heccdod/CPA-Android/main/rules/config.yaml\"")

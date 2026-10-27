@@ -1,0 +1,8 @@
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"正文内容","reasoning_content":null},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{},"finish_reason":"max_tokens","native_finish_reason":"max_tokens"}]}
+
+data: [DONE]
+

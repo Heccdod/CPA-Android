@@ -38,10 +38,18 @@ func TestBridgeLifecycle(t *testing.T) {
 		"Claude Agent SDK",
 		"system-conventions",
 		"Hermes Agent",
+		// A fresh install has to carry the thinking-visibility rule. It used to be written
+		// only when the settings screen touched the switch, so a brand-new config had no rule
+		// at all while the switch still read "on".
+		"generationConfig.thinkingConfig.includeThoughts: true",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("default config missing %q", want)
 		}
+	}
+	// ...and it must not carry an effort level, which would override the caller's choice.
+	if strings.Contains(text, "thinkingLevel") {
+		t.Fatalf("default config forces a thinking level:\n%s", text)
 	}
 
 	cfg, err := sdkconfig.LoadConfig(cfgPath)

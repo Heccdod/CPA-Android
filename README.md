@@ -14,7 +14,7 @@
 | B 流式与防风控 | `go-bridge/cliproxymobile/{mobile.go,bridge_test.go}` + 内置 v8 `config.yaml` 模板 | `cd go-bridge && go test -v ./cliproxymobile` |
 | C 宿主保活 / OAuth | `ProxyForegroundService.kt`、`MainActivity.kt`、`PanelActivity.kt`、`SettingsActivity.kt`、`HotSoLoader.kt`、`OauthLauncher.kt` | `aapt dump badging app/build/outputs/apk/debug/app-debug.apk` |
 | D 双通道热更 | `UpdateManager.kt`、`rules/config.yaml`、`.github/workflows/auto-sync-upstream.yml` | 见下 |
-| E 物理产物 | `app/build/outputs/apk/debug/app-debug.apk`（37 MB，含 `lib/arm64-v8a/libgojni.so`） | `unzip -l ...app-debug.apk \| grep libgojni.so` |
+| E 物理产物 | `app/build/outputs/apk/debug/app-debug.apk`（约 70 MB，含 `lib/arm64-v8a/libgojni.so`。文件比内容大是因为未压缩的 `.so` 之后有一段对齐填充，见下文「构建参数备忘」） | `unzip -l ...app-debug.apk \| grep libgojni.so` |
 
 ## 目录
 
@@ -25,7 +25,7 @@ CPA-Android/
 │   └── cliproxymobile/
 │       ├── mobile.go          # 仅导出 string / bool 单返回值
 │       ├── bridge_test.go     # 启动 / 端口 / 热重载 / 快速设置 / 停止
-│       └── thinking_test.go   # 思维链 payload 规则：成对写入、只删自己那条、catalog 键共存
+│       └── thinking_test.go   # 思维链 payload 规则：只写可见性、只删自己那条、旧配置迁移
 ├── rules/config.yaml      # L2 远程规则下发的源文件
 ├── scripts/
 │   ├── check16k.py            # ELF PT_LOAD p_align >= 16384 回归检查
@@ -233,31 +233,31 @@ antigravity 的 gemini 默认**思考但不回传思考内容**：上游确实�
 （`usageMetadata.thoughtsTokenCount` 非零），可响应流里 `delta.reasoning_content` 是空的，
 客户端自然什么都显示不出来。
 
-### 触发条件是「两个键成对」
+### 一个键开可见性，强度不替调用方决定
 
-必须同时给到下面两个键，缺一不可：
+开可见性只要一个键：
 
 ```yaml
 request.generationConfig.thinkingConfig.includeThoughts: true
-request.generationConfig.thinkingConfig.thinkingLevel: high
 ```
 
-- **只有 `includeThoughts` 不行**。实测：payload 里带着这个键、但没有 level/budget 时，
-  上游照常思考（`thoughtsTokenCount` 不为零），`delta.reasoning_content` 却始终为空——
-  思考 token 扣了，内容一个字节也拿不到。
-- **只有 `thinkingLevel` 也不行**。有强度但没打开可见性，表现相同。
-- **客户端传 `reasoning_effort` 确实能出内容**，因为翻译层会顺带把 `includeThoughts` 一起写进去
-  （`reasoning_effort: medium` 翻出来的就是 `includeThoughts: true` + `thinkingLevel: "medium"`）。
-  但要求每个客户端都去配 `reasoning_effort` 不现实（SillyTavern 之外未必有这个旋钮）。
-- 而常见客户端的「只开可见性」写法（顶层 `include_thoughts`、`thinking: {type: enabled}`）
-  在翻译成 antigravity 协议时就被丢掉了，根本到不了 payload——所以「让客户端自己传」这条路
-  对多数客户端不成立，必须由服务端补齐成对的两个键。
-- 实测结论：开关打开后，客户端**不传** `reasoning_effort` 也能拿到 `reasoning_content`。
+- 常见客户端的「只开可见性」写法（顶层 `include_thoughts`、`thinking: {type: enabled}）
+  在翻译成 antigravity 协议时就被丢掉了，根本到不了 payload，所以这个键得由服务端补。
+  补上之后，客户端**不传** `reasoning_effort` 也能拿到 `reasoning_content`。
+- **强度不写死**。早先这里同时补了 `thinkingLevel: high`，理由是「不成对就看不到」。
+  在当前上游上重测，这个理由不成立：只写 `includeThoughts` 一样能看到思考内容。
+  写死 high 的代价是实打实的——同一 prompt 下思考 token 接近翻倍，正文反而更短；
+  SillyTavern 默认 `max_tokens: 300` 时，思考吃掉 285–289，正文只剩 9–42 字，
+  在客户端里看着就像被截断或者一直在生成。
+- 调用方想指定强度就自己传 `reasoning_effort`（`reasoning_effort: medium` 会翻成
+  `includeThoughts: true` + `thinkingLevel: "medium"`），这条规则不覆盖它。
+  旧版本写进 `config.yaml` 的 `thinkingLevel: high` 会在引擎启动时被
+  `migrateExistingConfig()` 摘掉；用户自己按模型设的强度规则不动。
 
 ### 为什么用 payload 规则，而不是改上游代码
 
 做法是往 `config.yaml` 写一条 `requests.payload.override` 规则（`go-bridge/cliproxymobile/mobile.go`
-的 `applyThinkingVisibility()`），由内核在请求出站前把这两个键塞进 payload：
+的 `applyThinkingVisibility()`），由内核在请求出站前把可见性键塞进 payload：
 
 ```yaml
 requests:
@@ -267,7 +267,6 @@ requests:
           - name: "*"
         params:
           generationConfig.thinkingConfig.includeThoughts: true
-          generationConfig.thinkingConfig.thinkingLevel: high
 ```
 
 选这条路而不是在 `normalizeAntigravityOpenAIThinkingConfig` 里写死默认值，理由有三条：
@@ -278,6 +277,8 @@ requests:
    再走热更或重新安装。
 3. **扛上游同步**。`.github/workflows/auto-sync-upstream.yml` 会定期对齐上游，改在 `internal/` 里的
    代码会在同步时冲突或丢失；payload 规则是上游的公开能力，同步多少次都还在。
+   （真正落在 `internal/` 下的那几个修正在 CI 里是靠 `upstream-patches.diff` 补回来的，
+   见下文「上游补丁」。）
 
 只在开启时写这条规则，关闭时只删自己这一条（`removeThinkingRule()` 按 `includeThoughts`
 这个 key 认领），用户自己加的 override 规则原样保留——有回归测试
@@ -305,9 +306,31 @@ Go 读不了 APK 里的 asset，所以复制这一步必须在 Kotlin 侧。
 > 上游侧的同款修复也在 `upstream-patches.diff` 里（补 models.json 两条），
 > 两处并存是刻意的：App 资产保证自己的 APK 一定对，补丁保证裸跑上游也对。
 
+## 上游补丁
+
+本地有三个改动要落在上游源码上，但又不能改上游仓库：`maxOutputTokens` 被无条件删除、
+静态模型表缺 `gemini-3.8-flash-low` / `-medium`、以及守着前两者的测试断言。
+它们存在 `upstream-patches.diff`，由构建流程打上去：
+
+```bash
+scripts/apply-upstream-patch.sh            # 打到 upstream-cliproxy（幂等，已打则跳过）
+scripts/apply-upstream-patch.sh --rebase   # 上游前进、补丁打不上时，把修正搬到新 HEAD
+scripts/apply-upstream-patch.sh --refresh  # 从工作树重新生成 upstream-patches.diff
+```
+
+**CI 也走这一步。** `auto-sync-upstream` 会 clone 一份干净上游，如果只在本地打补丁，
+CI 产出的内核就会静默丢掉这些修复，本地包和 CI 包行为不一致而没人知道。
+所以 workflow 在 clone 之后立刻 `git apply --3way`，然后**断言修正确实生效**
+（源码里不再出现删除 `maxOutputTokens` 的语句、模型表里有 `gemini-3.8-flash-low`）。
+打不上或断言失败就整个 job 失败——发布一个丢了修复的内核比不发布更糟。
+
 ## 构建
 
 ```bash
+# 0) 上游源码 + 补丁
+git clone --depth 1 https://github.com/router-for-me/CLIProxyAPI.git upstream-cliproxy
+scripts/apply-upstream-patch.sh
+
 # 1) Go 桥接层（需要 Go >= 上游 go.mod 声明的版本）
 cd go-bridge
 go install golang.org/x/mobile/cmd/gomobile@latest
@@ -513,12 +536,17 @@ callback forwarder for antigravity listening on 0.0.0.0:51121。
 ## 构建参数备忘
 
 ```bash
-# 真机（只打 arm64，产物约 37 MB）
+# 真机（只打 arm64）
 ./gradlew clean assembleDebug
 
-# 模拟器（额外打 x86_64，产物约 68 MB）
+# 模拟器（额外打 x86_64）
 ./gradlew assembleDebug -PwithEmulatorAbi=true
 ```
+
+`abiFilters` 默认只有 `arm64-v8a`，所以真机包只带一份 `libgojni.so`（未压缩约 93 MB）。
+APK 文件本身约 70 MB，比 37 MB 的压缩内容更大，原因不是打了两遍：SO 未压缩存放且要做
+16 KB 对齐，zipalign 在它后面留了约 32 MB 的填充空洞。`unzip -lv` 能看到这条空洞
+（`assets/models.json` 的偏移量比前一条记录结束处大出一大截）。
 
 ## 真机实测
 

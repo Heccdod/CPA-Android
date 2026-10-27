@@ -3,10 +3,23 @@
 按版本倒序。每条一行说明**用户能感知的变化**，实现细节见 [README.md](README.md)、
 上游问题的根因与验证见 [UPSTREAM_ISSUES.md](UPSTREAM_ISSUES.md)。
 
-## 未发布 —— v2.3.0（当前工作）
+## v2.4.0
 
-- **思维链开关**：设置 → 引擎 → 「显示思维链」，默认开启。通过 `requests.payload.override` 规则同时写入
-  `includeThoughts` 与 `thinkingLevel`，客户端不必再传 `reasoning_effort` 就能拿到 `reasoning_content`。
+- **AI 提供商卡片限高可滚**：账号再多也不会把主页顶下去。卡片最高占屏幕 40%，超出部分在卡片内滚动，
+  「AI 提供商」标题和 `n/m` 计数始终可见；不溢出时不拦截拖拽、不出滚动条。
+- **思维链不再吃掉预算**：开关仍然只开可见性，但不再顺手把思考强度写死成 high。之前那条
+  `thinkingLevel: high` 会在 SillyTavern 默认 `max_tokens: 300` 下把 285–289 token 花在思考上，
+  正文只剩 9–42 字，看起来像被截断。旧版本已经写进 `config.yaml` 的这条会在引擎启动时自动摘掉。
+- **修复配置文件头注释重复**：每次迁移都会在文件顶上再贴一遍那五行说明，迁移过四次就有四份，
+  在 App 内的 `config.yaml` 编辑器里看得很清楚。现在只保留一份，已经重复的会在下次启动时收敛掉。
+- **CI 与本地构建不再漂移**：`auto-sync-upstream` 以前对干净 clone 的上游直接构建，本地那两个上游修正
+  （max_tokens 保留、模型补档）在 CI 产物里是缺的。现在 CI 会先打 `upstream-patches.diff` 并断言修正确实落地，
+  打不上就失败，而不是默默发布一个丢了修复的内核。新增 `scripts/apply-upstream-patch.sh` 负责应用 / rebase / 重生成。
+
+## v2.3.0
+
+- **思维链开关**：设置 → 引擎 → 「显示思维链」，默认开启。通过 `requests.payload.override` 规则写入
+  `includeThoughts`，客户端不必再传 `reasoning_effort` 就能拿到 `reasoning_content`。
 - **额度按模型族分组**：Gemini 与 Claude 各自一块，每块下 5 小时与每周各一条进度条，重置时间改为绝对时刻
   （今天 `HH:mm`，其他日期 `M月d日 HH:mm`）。
 - **状态栏只显示 5h 额度**：设置项更名为「状态栏显示 5h 额度」，通知正文改为「提供商 · 邮箱」一行 + 按族缩进的

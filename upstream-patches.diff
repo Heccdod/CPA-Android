@@ -1,8 +1,8 @@
 diff --git a/internal/registry/models/models.json b/internal/registry/models/models.json
-index 3164935..a423a70 100644
+index eccedee..cae52c2 100644
 --- a/internal/registry/models/models.json
 +++ b/internal/registry/models/models.json
-@@ -4288,6 +4288,74 @@
+@@ -4350,6 +4350,74 @@
        "native_capabilities": {
          "web_search": true
        }
@@ -98,13 +98,13 @@ index 69e7a1c..184edd3 100644
  	}
  }
 diff --git a/internal/runtime/executor/antigravity_executor_request.go b/internal/runtime/executor/antigravity_executor_request.go
-index 0774070..fd6752f 100644
+index bdb56aa..7b5b514 100644
 --- a/internal/runtime/executor/antigravity_executor_request.go
 +++ b/internal/runtime/executor/antigravity_executor_request.go
-@@ -79,9 +79,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
- 		if strings.Contains(modelName, "claude") {
- 			updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
- 			payloadStr = string(updated)
+@@ -82,9 +82,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
+ 				updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+ 				payloadStr = string(updated)
+ 			}
 -		} else {
 -			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
  		}
@@ -114,10 +114,10 @@ index 0774070..fd6752f 100644
  
  		payloadStrBytes := applyAntigravityNativeSignatureReplayIfNeeded(modelName, []byte(payloadStr))
  		payloadStrBytes = helps.FinalizePayload(ctx, payloadStrBytes)
-@@ -92,9 +93,12 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
- 	} else {
- 		if strings.Contains(modelName, "claude") {
- 			payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+@@ -97,9 +98,12 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
+ 			if !promptStructuredOutput {
+ 				payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+ 			}
 -		} else {
 -			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
  		}

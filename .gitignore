@@ -24,3 +24,17 @@ keystore.properties
 
 # Built assets live outside git; they are attached to a release.
 dist/
+
+# Screenshots taken while checking a change against the phone. They are working notes, not
+# documentation: the README explains behaviour in prose, and a PNG of one build's pixels goes
+# stale the moment the next build changes a margin.
+/*.png
+
+# The diagnostic harness keeps mock_upstream.py, drive.py, run.sh and its fixture credential
+# under version control; the request logs its runs produce do not. A single run writes dozens of
+# files, each containing full request bodies.
+diag/auths/logs/
+
+# A scratch copy of the device's config.yaml, used to restore it after a diagnostic run edited
+# it. Regenerated on demand; never a source of truth.
+diag/config.restore.yaml

@@ -1,0 +1,4 @@
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"写了一半","reasoning_content":null},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"error":{"code":503,"message":"backend capacity exhausted","status":"UNAVAILABLE"}}
+

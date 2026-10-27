@@ -53,6 +53,24 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        elif SCENARIO == "slow_then_429":
+            time.sleep(DELAY or 18)
+            body = json.dumps({"error": {"code": 429, "message": "Resource exhausted after wait", "status": "RESOURCE_EXHAUSTED"}}).encode()
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", "3")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        elif SCENARIO == "plain_text_200":
+            body = b"upstream overloaded, try later"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         elif SCENARIO == "e429":
             body = json.dumps({"error": {"code": 429, "message": "Resource has been exhausted", "status": "RESOURCE_EXHAUSTED"}}).encode()
             self.send_response(429)
@@ -109,10 +127,36 @@ class H(BaseHTTPRequestHandler):
             w(chunk([{"text": "部分内容"}]))
             w(chunk([], finish="SAFETY", usage=u))
             end()
+        elif SCENARIO == "mid_silence":
+            # 发出部分正文后连接彻底静默（NAT 掉线 / 半开 TCP），既不 FIN 也不 RST
+            w(chunk([{"text": "写到一半突然"}]))
+            time.sleep(DELAY or 300)
+            end()
         elif SCENARIO == "mid_error":
             w(chunk([{"text": "写了一半"}]))
             time.sleep(0.2)
             w(frame({"error": {"code": 503, "message": "backend capacity exhausted", "status": "UNAVAILABLE"}}))
+            end()
+        elif SCENARIO == "envelope_only":
+            # 只有空信封，没有任何 candidates / usage，然后干净关闭
+            w(frame({"response": {}}))
+            w(frame({"response": {"candidates": []}}))
+            end()
+        elif SCENARIO == "usage_only_close":
+            # 只有 usage，从不给 finishReason，然后关闭
+            w(chunk([{"text": "正文"}]))
+            w(chunk([], usage=u))
+            end()
+        elif SCENARIO == "usage_then_finish_max":
+            # 上游把 usage 与 finishReason 拆成两帧：usage 帧在前（无 finish），finish 帧在后（无 usage）
+            w(chunk([{"text": "正文内容"}]))
+            w(chunk([], usage=u))
+            w(chunk([], finish="MAX_TOKENS"))
+            end()
+        elif SCENARIO == "finish_max_no_usage":
+            # 终止帧只带 finishReason，从不带 usage
+            w(chunk([{"text": "正文内容"}]))
+            w(chunk([], finish="MAX_TOKENS"))
             end()
         elif SCENARIO == "no_finish":
             w(chunk([{"text": "正文但上游没给 finishReason"}]))
