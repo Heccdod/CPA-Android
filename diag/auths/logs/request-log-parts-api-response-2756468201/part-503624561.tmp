@@ -1,0 +1,11 @@
+=== API RESPONSE 1 ===
+Timestamp: 2026-10-27T14:44:19.585144868+08:00
+
+Status: 200
+Headers:
+Content-Type: text/event-stream
+Date: Tue, 27 Oct 2026 06:44:19 GMT
+Server: BaseHTTP/0.6 Python/3.12.3
+
+Body:
+data: {"response": {"candidates": [{"content": {"role": "model", "parts": [{"text": "这是会被截断的正文"}]}}], "modelVersion": "gemini-3.8-flash-high", "responseId": "resp-1"}}

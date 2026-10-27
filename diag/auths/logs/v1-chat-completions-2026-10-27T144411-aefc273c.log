@@ -1,0 +1,66 @@
+=== REQUEST INFO ===
+Version: dev
+URL: /v1/chat/completions
+Method: POST
+Downstream Transport: http
+Upstream Transport: http
+Timestamp: 2026-10-27T14:44:11.223742424+08:00
+
+
+=== HEADERS ===
+User-Agent: curl/8.5.0
+Accept: */*
+Authorization: Bearer cpa-...ocal
+Content-Type: application/json
+Content-Length: 107
+
+
+=== REQUEST BODY ===
+{"model":"gemini-3.8-flash-high","stream":true,"messages":[{"role":"user","content":"hi"}],"max_tokens":40}
+
+
+=== API REQUEST 1 ===
+Timestamp: 2026-10-27T14:44:11.22478657+08:00
+Upstream URL: http://127.0.0.1:9911/v1internal:streamGenerateContent?alt=sse
+HTTP Method: POST
+Auth: provider=antigravity, auth_id=diag.json, label=diag@example.com, type=oauth
+
+Headers:
+Authorization: Bearer fake...oken
+Content-Type: application/json
+User-Agent: antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)
+
+Body:
+{"project":"diag-project","request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":40},"sessionId":"-2370320371933409096"},"model":"gemini-3.8-flash-high","userAgent":"antigravity","requestType":"agent","requestId":"agent-205cfb37-7903-41be-90e9-298c7cddd48f"}
+
+
+=== API RESPONSE ===
+Timestamp: 2026-10-27T14:44:11.228050556+08:00
+{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}
+
+
+=== API RESPONSE 1 ===
+Timestamp: 2026-10-27T14:44:11.226937846+08:00
+
+Status: 429
+Headers:
+Content-Length: 98
+Content-Type: application/json
+Date: Tue, 27 Oct 2026 06:44:11 GMT
+Retry-After: 2
+Server: BaseHTTP/0.6 Python/3.12.3
+
+Body:
+{"error": {"code": 429, "message": "Resource has been exhausted", "status": "RESOURCE_EXHAUSTED"}}
+
+
+=== RESPONSE ===
+Status: 429
+X-Cpa-Trace-Id: 20261027144411-5f20f8abe16e4305-01a17c1a-2757-7afe-8826-e0abaefc273c
+Access-Control-Allow-Headers: *
+Access-Control-Expose-Headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, ETag, X-Request-Id, OpenAI-Request-Id
+Content-Type: application/json
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+
+{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}

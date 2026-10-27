@@ -1,0 +1,63 @@
+=== REQUEST INFO ===
+Version: dev
+URL: /v1/chat/completions
+Method: POST
+Downstream Transport: http
+Upstream Transport: http
+Timestamp: 2026-10-27T14:39:54.915049017+08:00
+
+
+=== HEADERS ===
+User-Agent: curl/8.5.0
+Accept: */*
+Authorization: Bearer cpa-...ocal
+Content-Type: application/json
+Content-Length: 107
+
+
+=== REQUEST BODY ===
+{"model":"gemini-3.8-flash-high","stream":true,"messages":[{"role":"user","content":"hi"}],"max_tokens":40}
+
+
+=== API REQUEST 1 ===
+Timestamp: 2026-10-27T14:39:54.916148337+08:00
+Upstream URL: http://127.0.0.1:9911/v1internal:streamGenerateContent?alt=sse
+HTTP Method: POST
+Auth: provider=antigravity, auth_id=diag.json, label=diag@example.com, type=oauth
+
+Headers:
+Authorization: Bearer fake...oken
+Content-Type: application/json
+User-Agent: antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)
+
+Body:
+{"project":"diag-project","request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":40},"sessionId":"-2370320371933409096"},"model":"gemini-3.8-flash-high","userAgent":"antigravity","requestType":"agent","requestId":"agent-2d53935b-b862-4786-bd0a-75aecce2fd7b"}
+
+
+=== API RESPONSE ===
+Timestamp: 2026-10-27T14:39:54.918691447+08:00
+{"error":{"message":"invalid byte in chunk length","type":"server_error","code":"internal_server_error"}}
+
+
+=== API RESPONSE 1 ===
+Timestamp: 2026-10-27T14:39:54.917664534+08:00
+
+Status: 200
+Headers:
+Content-Type: text/event-stream
+Date: Tue, 27 Oct 2026 06:39:54 GMT
+Server: BaseHTTP/0.6 Python/3.12.3
+
+Error: invalid byte in chunk length
+
+
+=== RESPONSE ===
+Status: 500
+Content-Type: application/json
+Access-Control-Allow-Origin: *
+X-Cpa-Trace-Id: 20261027143954-5f20f8abe16e4305-01a17c16-3e23-705a-9089-2c624742e3b9
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+Access-Control-Allow-Headers: *
+Access-Control-Expose-Headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, ETag, X-Request-Id, OpenAI-Request-Id
+
+{"error":{"message":"invalid byte in chunk length","type":"server_error","code":"internal_server_error"}}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """假 Antigravity 上游：按 SCENARIO 返回不同 SSE，供本地 CPA 服务端翻译。"""
-import json, os, sys, time
+import json, os, socket, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SCENARIO = os.environ.get("SCENARIO", "normal")
@@ -47,6 +47,32 @@ class H(BaseHTTPRequestHandler):
                 "gemini-3.8-flash-low": {"displayName": "Gemini 3.8 Flash (Low)"},
                 "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6 (Thinking)"},
             }, "webSearchModelIds": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        elif SCENARIO == "e429":
+            body = json.dumps({"error": {"code": 429, "message": "Resource has been exhausted", "status": "RESOURCE_EXHAUSTED"}}).encode()
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", "2")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        elif SCENARIO == "e500":
+            body = json.dumps({"error": {"code": 500, "message": "internal", "status": "INTERNAL"}}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        elif SCENARIO == "json200_error":
+            # 上游 200 但 body 是 JSON 错误体（非 SSE）——GFE 限流常见
+            body = json.dumps({"error": {"code": 429, "message": "Resource exhausted", "status": "RESOURCE_EXHAUSTED"}}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -108,6 +134,25 @@ class H(BaseHTTPRequestHandler):
             time.sleep(DELAY)
             w(chunk([{"text": "结尾"}]))
             w(chunk([], finish="STOP", usage=u))
+            end()
+        elif SCENARIO == "truncate_rst":
+            w(chunk([{"text": "这是会被截断的正文"}]))
+            self.wfile.flush()
+            try:
+                import struct
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                self.connection.close()
+            except Exception:
+                pass
+            return
+        elif SCENARIO == "empty_candidates":
+            w(chunk([], finish=None))
+            w(frame({"response": {"candidates": [{"content": {"role": "model", "parts": []}}], "modelVersion": "gemini-3.8-flash-high"}}))
+            w(chunk([], finish="STOP", usage=u))
+            end()
+        elif SCENARIO == "hang_no_data":
+            # 上游接受请求后既不发送数据也不关闭——真实配额限流/NAT 静默丢弃时的表现
+            time.sleep(DELAY or 300)
             end()
         elif SCENARIO == "finish_then_hold":
             # 上游发出最终帧（finishReason + usage）后不关闭连接——真实 GFE/HTTP2 常见

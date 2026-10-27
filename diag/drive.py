@@ -44,7 +44,7 @@ def wait_port(port, timeout=20):
 
 
 def start(scenario, delay=0, probe="ok"):
-    free_port(18317)
+    free_port(28317)
     free_port(9911)
     time.sleep(1.0)
     for f in (MOCK_LOG, CPA_LOG):
@@ -60,11 +60,11 @@ def start(scenario, delay=0, probe="ok"):
     cpa = subprocess.Popen([CPASRV, "--config", f"{DIAG}/config.yaml", "--local-model"], cwd=DIAG,
                            stdout=open(CPA_LOG, "w"), stderr=subprocess.STDOUT,
                            start_new_session=True)
-    assert wait_port(18317), "cpa did not listen"
+    assert wait_port(28317), "cpa did not listen"
     # 等模型注册完成
     for _ in range(60):
         try:
-            req = urllib.request.Request("http://127.0.0.1:18317/v1/models",
+            req = urllib.request.Request("http://127.0.0.1:28317/v1/models",
                                          headers={"Authorization": "Bearer " + KEY})
             data = json.load(urllib.request.urlopen(req, timeout=5))
             ids = [m["id"] for m in data.get("data", [])]
@@ -89,7 +89,7 @@ if __name__ == "__main__":
     mock, cpa, ids = start(scen, delay)
     print("models:", [i for i in ids if "3.8" in i] or ids[:5])
     out = subprocess.run(["bash", "-c",
-        "curl -sS -m 90 -N -D /tmp/last-hdr.txt -X POST http://127.0.0.1:18317/v1/chat/completions "
+        "curl -sS -m 90 -N -D /tmp/last-hdr.txt -X POST http://127.0.0.1:28317/v1/chat/completions "
         "-H 'Authorization: Bearer " + KEY + "' -H 'Content-Type: application/json' "
         "-d '{\"model\":\"gemini-3.8-flash-high\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":40}'"],
         capture_output=True, text=True, timeout=120)

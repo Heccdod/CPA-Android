@@ -1,7 +1,7 @@
 config-version: 8
 server:
   host: "127.0.0.1"
-  port: 18317
+  port: 28317
 requests:
   proxy-url: ""
   streaming:

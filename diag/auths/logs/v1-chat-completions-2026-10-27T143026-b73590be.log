@@ -1,0 +1,71 @@
+=== REQUEST INFO ===
+Version: dev
+URL: /v1/chat/completions
+Method: POST
+Downstream Transport: http
+Upstream Transport: http
+Timestamp: 2026-10-27T14:29:41.239751955+08:00
+
+
+=== HEADERS ===
+Content-Type: application/json
+Content-Length: 107
+User-Agent: curl/8.5.0
+Accept: */*
+Authorization: Bearer cpa-...ocal
+
+
+=== REQUEST BODY ===
+{"model":"gemini-3.8-flash-high","stream":true,"messages":[{"role":"user","content":"hi"}],"max_tokens":40}
+
+
+=== API REQUEST 1 ===
+Timestamp: 2026-10-27T14:29:41.24238674+08:00
+Upstream URL: http://127.0.0.1:9911/v1internal:streamGenerateContent?alt=sse
+HTTP Method: POST
+Auth: provider=antigravity, auth_id=diag.json, label=diag@example.com, type=oauth
+
+Headers:
+Authorization: Bearer fake...oken
+Content-Type: application/json
+User-Agent: antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)
+
+Body:
+{"project":"diag-project","request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":40},"sessionId":"-2370320371933409096"},"model":"gemini-3.8-flash-high","userAgent":"antigravity","requestType":"agent","requestId":"agent-ef37155b-8d7d-4a2d-be02-9cee747b2c3d"}
+
+
+=== API RESPONSE 1 ===
+Timestamp: 2026-10-27T14:29:41.244259007+08:00
+
+Status: 200
+Headers:
+Content-Type: text/event-stream
+Date: Tue, 27 Oct 2026 06:29:41 GMT
+Server: BaseHTTP/0.6 Python/3.12.3
+
+Body:
+data: {"response": {"candidates": [{"content": {"role": "model", "parts": [{"text": "正文说完了"}]}, "finishReason": "MAX_TOKENS"}], "modelVersion": "gemini-3.8-flash-high", "responseId": "resp-1", "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 5, "totalTokenCount": 20, "thoughtsTokenCount": 3}}}
+
+
+=== RESPONSE ===
+Status: 200
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+Access-Control-Allow-Headers: *
+Access-Control-Expose-Headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, ETag, X-Request-Id, OpenAI-Request-Id
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+X-Cpa-Trace-Id: 20261027142941-5f20f8abe16e4305-01a17c0c-e0f7-7b12-bdb3-8522b73590be
+
+data: {"id":"resp-1","object":"chat.completion.chunk","created":0,"model":"gemini-3.8-flash-high","choices":[{"index":0,"delta":{"role":"assistant","content":"正文说完了","reasoning_content":null},"finish_reason":"max_tokens","native_finish_reason":"max_tokens"}],"usage":{"completion_tokens":8,"total_tokens":20,"prompt_tokens":12,"completion_tokens_details":{"reasoning_tokens":3}}}
+
+: keep-alive
+
+: keep-alive
+
+: keep-alive
+
+data: [DONE]
+
+

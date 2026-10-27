@@ -341,10 +341,11 @@ netlink 实现）。
   （`raw.githubusercontent.com/Heccdod/CPA-Android/main/rules/config.yaml`）→ 原子覆写
   `filesDir/config.yaml` → 引擎的文件 watcher 毫秒级热重载。同样是手动触发，不再自动跑。
 
-  > 注意这条路是**整份覆盖**：远程规则里没有 `requests.payload.override`，也没有 `models.catalog`，
-  > 同步一次就会把「显示思维链」的规则和自定义模型目录一起冲掉。同步完回设置页拨一下
-  > 「显示思维链」（或重启网关）即可让 `applyThinkingVisibility()` / `ensureCatalogKey()` 把两者补回去。
-  > 想让它们长期共存，得在 `rules/config.yaml` 里也写上——见 [rules/config.yaml](rules/config.yaml)。
+  > 注意这条路是**整份覆盖**（点之前弹的确认框写的就是这句）。`rules/config.yaml` 里**没有**
+  > `requests.payload.override`，也没有 `models.catalog`，所以同步一次会把「显示思维链」的规则和
+  > 自定义模型目录一起冲掉——额度、账号、面板都不受影响，只是思维链静默失效、模型列表退回上游那几档。
+  > 恢复：设置页把「显示思维链」关掉再打开（`applyThinkingVisibility()` 重新写入），
+  > 再「重启网关」（`ensureCatalogKey()` 把 `models.catalog` 补回）。
 - **L3 内核/整包热更**：`UpdateManager.checkForUpdates()` 读 `api.github.com/repos/Heccdod/CPA-Android/releases/latest`，
   比对 `tag_name` 与本地 `versionName`；`.so` 按 assets 的 `digest`（`sha256:...`）校验后落到
   `getDir("hotlibs")`；`.apk` 下载后经 `FileProvider` 拉起系统安装器覆盖安装。

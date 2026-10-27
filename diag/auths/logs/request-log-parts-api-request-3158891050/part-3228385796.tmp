@@ -1,0 +1,14 @@
+=== API REQUEST 1 ===
+Timestamp: 2026-10-27T14:44:19.583475722+08:00
+Upstream URL: http://127.0.0.1:9911/v1internal:streamGenerateContent?alt=sse
+HTTP Method: POST
+Auth: provider=antigravity, auth_id=diag.json, label=diag@example.com, type=oauth
+
+Headers:
+Authorization: Bearer fake...oken
+Content-Type: application/json
+User-Agent: antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)
+
+Body:
+{"project":"diag-project","request":{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":40},"sessionId":"-2370320371933409096"},"model":"gemini-3.8-flash-high","userAgent":"antigravity","requestType":"agent","requestId":"agent-7479a483-e610-405a-9eb5-8a39959868e2"}
+

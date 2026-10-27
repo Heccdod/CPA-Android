@@ -110,4 +110,9 @@ dependencies {
     implementation("androidx.webkit:webkit:1.4.0")
     implementation("com.google.android.material:material:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+    // PanelSanitizer is pure string work, so its rules are testable on the JVM without a device.
+    // That matters more than usual here: the sanitiser's failure mode is silence (it replaces
+    // nothing and still reports success), which a screenshot cannot catch reliably.
+    testImplementation("junit:junit:4.13.2")
 }
