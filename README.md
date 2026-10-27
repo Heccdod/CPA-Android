@@ -28,8 +28,10 @@ CPA-Android/
 │       └── thinking_test.go   # 思维链 payload 规则：只写可见性、只删自己那条、旧配置迁移
 ├── rules/config.yaml      # L2 远程规则下发的源文件
 ├── scripts/
+│   ├── apply-upstream-patch.sh # 应用 / rebase / 重生成 upstream-patches.diff
 │   ├── check16k.py            # ELF PT_LOAD p_align >= 16384 回归检查
 │   ├── device-smoke.sh        # 真机端到端断言
+│   ├── adbw.sh                # WSL 下经 Windows adb.exe 访问设备
 │   ├── tap.py                 # 按文本/content-desc 找 bounds 再点，不写死坐标
 │   ├── ui_text.py             # uiautomator dump 的文本抽取
 │   └── notif_expand.py        # 展开通知栏，用于核对状态栏额度正文
@@ -38,6 +40,7 @@ CPA-Android/
 │   ├── src/main/assets/models.json  # 修正后的模型目录：APK 资产，启动时复制到 filesDir，由 models.catalog 指向
 │   └── src/main/java/me/routerfor/cpa/
 │       ├── MainActivity.kt          # 首页：刷新 + 主题 + 齿轮三个图标按钮、状态卡、提供商聚合卡（含按族分组的额度）、四颗快捷按钮
+│       ├── MaxHeightScrollView.kt   # 限高可滚动容器：提供商卡内部滚动用
 │       ├── SettingsActivity.kt      # 设置：外观 / 网络 / 引擎 / 更新 / 系统 / 关于
 │       ├── PanelActivity.kt         # 全屏管理面板（返回直接回主界面）
 │       ├── Palette.kt               # 三套调色板 + ThemeManager（四态主题、系统栏上色）
@@ -69,7 +72,7 @@ CPA-Android/
 
 | 页面 | 内容 |
 | :--- | :--- |
-| 首页 `MainActivity` | 右上角三个图标按钮：刷新（全局，同时让每个账号的独立刷新按钮进入刷新态）、主题、齿轮。状态卡：运行绿点 / 服务地址（补了 `/v1` 后缀，即 `127.0.0.1:8317/v1`，客户端直接粘贴就能用）/ API 密钥点按复制 / 内核版本 + 热更新状态。AI 提供商卡：按提供商分组聚合所有账号，每组一个整组开关、每账号一个开关（走 `PATCH /v8/management/credentials/status`），账号下方是按模型族分组的额度块 + 独立刷新按钮。快捷操作四按钮同形（管理面板 / 快捷添加 / 重启网关 / 设置）。 |
+| 首页 `MainActivity` | 右上角三个图标按钮：刷新（全局，同时让每个账号的独立刷新按钮进入刷新态）、主题、齿轮。状态卡：运行绿点 / 服务地址（补了 `/v1` 后缀，即 `127.0.0.1:8317/v1`，客户端直接粘贴就能用）/ API 密钥点按复制 / 内核版本 + 热更新状态。AI 提供商卡：按提供商分组聚合所有账号，每组一个整组开关、每账号一个开关（走 `PATCH /v8/management/credentials/status`），账号下方是按模型族分组的额度块 + 独立刷新按钮。卡片最高占屏幕 40%，账号多了在卡片内滚动，「AI 提供商」标题与 `n/m` 计数固定不动（`MaxHeightScrollView`），不溢出时不拦截拖拽。快捷操作四按钮同形（管理面板 / 快捷添加 / 重启网关 / 设置）。 |
 | 设置 `SettingsActivity` | 外观：跟随系统（半太阳半月亮专属图标）/ 日间 / 黑夜 / 羊皮纸四选一（当前项打勾）。网络：上游代理（`socks5://…` 或「直连」）、允许局域网访问（经典圆形开关）。引擎：敏感词混淆、编辑 `config.yaml`（等宽字体，保存后热重载）、**显示思维链**（经典圆形开关，默认开启）。更新：**状态栏显示 5h 额度**（经典圆形开关，默认关闭）、内核热更新开关、检查更新、同步远程规则。系统：忽略电池优化、重启网关。关于：版本 / 架构 / 热更新状态。 |
 | 面板 `PanelActivity` | 全屏 `/management.html`，预置登录态直接进；供应商 OAuth 与 `localhost:51121` 回调交给 Chrome Custom Tabs，全程零粘贴。返回箭头与系统返回键都直接回主界面，不走 SPA 历史。 |
 
