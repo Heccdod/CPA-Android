@@ -57,7 +57,7 @@ func TestStartProxyRebuildsAfterSilentDeath(t *testing.T) {
 	defer func() { _ = StopProxy() }()
 
 	// Point the state at a dead address while keeping the service pointer, which is exactly the
-	// state a silently-dead engine leaves behind.
+	// state a silently-dead engine leaves behind: the pointer is set, the port answers nothing.
 	state.mu.Lock()
 	state.listenAddr = unusedAddr(t)
 	state.mu.Unlock()
@@ -67,6 +67,16 @@ func TestStartProxyRebuildsAfterSilentDeath(t *testing.T) {
 	}
 	if !IsRunning() {
 		t.Fatal("gateway not serving after the rebuild")
+	}
+	// The old loop must be gone, not merely unreferenced. Two Service.Run loops in one process
+	// collide on gin's global mode flag; that is what the race detector reported here, and it
+	// only shows up under -race, so this test asserts the outcome rather than the mechanism: a
+	// second rebuild must also succeed and leave exactly one listener.
+	if msg := StartProxy(dir); msg != "" {
+		t.Fatalf("second StartProxy: %s", msg)
+	}
+	if !IsRunning() {
+		t.Fatal("gateway not serving after a second rebuild")
 	}
 }
 

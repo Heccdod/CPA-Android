@@ -64,17 +64,28 @@ object HotSoLoader {
 
     fun hotLibDir(context: Context): File = context.getDir("hotlibs", Context.MODE_PRIVATE)
 
-    /** Newest staged .so whose bytes match the recorded SHA-256 manifest, or null. */
+    /**
+     * Newest staged .so whose bytes match the recorded SHA-256 manifest, or null.
+     *
+     * Fail closed. The manifest used to be optional (`expected.isNotEmpty() && ...`), so a
+     * missing sha256.txt meant every candidate passed and an unverified download went straight
+     * into System.load(). Only a library with a recorded digest may load now; a staged file
+     * without one is deleted rather than left to confuse the next start.
+     */
     fun verifiedHotLibrary(context: Context): File? {
         val dir = hotLibDir(context)
         if (!dir.isDirectory) return null
         val pending = File(dir, "pending.txt")
         val expected = readManifest(context)
+        if (expected.isEmpty()) {
+            Log.w(TAG, "no SHA-256 manifest; refusing to load any staged kernel")
+            return null
+        }
         val candidates = dir.listFiles { f -> f.isFile && f.name.endsWith(".so") } ?: return null
         for (file in candidates.sortedByDescending { it.lastModified() }) {
             if (pending.exists() && pending.readText().trim() != file.name) continue
-            val actual = runCatching { sha256(file) }.getOrNull() ?: continue
-            if (expected.isNotEmpty() && !expected.equals(actual, ignoreCase = true)) {
+            val actual = runCatching { sha256(file) }.getOrNull()
+            if (actual == null || !expected.equals(actual, ignoreCase = true)) {
                 Log.w(TAG, "SHA-256 mismatch for ${file.name}, skipping")
                 continue
             }

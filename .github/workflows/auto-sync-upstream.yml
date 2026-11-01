@@ -86,15 +86,20 @@ jobs:
             echo "Then regenerate: git -C upstream-cliproxy diff <upstream-sha> > upstream-patches.diff"
             exit 1
           fi
-          # The patch is only worth applying if it actually landed: assert the two things the
-          # fix is made of rather than trusting that git reported success.
+          # The patch is only worth applying if it actually landed: assert each fix is present
+          # rather than trusting that git reported success. A patch that applied "cleanly" while
+          # losing a hunk would otherwise ship a kernel without that fix.
           if grep -q 'sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")' \
               upstream-cliproxy/internal/runtime/executor/antigravity_executor_request.go; then
             echo "::error::the maxOutputTokens deletion is still present after patching."
             exit 1
           fi
           grep -q 'gemini-3.8-flash-low' upstream-cliproxy/internal/registry/models/models.json
-          echo "Patches applied and verified."
+          grep -q 'antigravityStreamGraceTimeout' \
+              upstream-cliproxy/internal/runtime/executor/antigravity_executor_stream.go
+          grep -q 'TestAntigravityStreamEndsWhenUpstreamHoldsTheSocket' \
+              upstream-cliproxy/internal/runtime/executor/antigravity_executor_stream_hold_test.go
+          echo "Patches applied and verified (max_tokens, catalog tiers, stream termination)."
 
       - name: Set up Go
         if: steps.upstream.outputs.changed == 'true'

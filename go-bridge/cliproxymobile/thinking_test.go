@@ -9,6 +9,61 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// TestFreshInstallMatchesEveryLaterStart pins first start and later starts to one rule.
+//
+// The shipped template hard-codes an includeThoughts rule (it predates the three modes), and
+// ensureDefaultConfig used to write that template and stop. A brand-new install therefore ran
+// includeThoughts while the settings screen showed 不思考, and only agreed after a restart. The
+// migration now runs on the fresh path too; this test fails if that call is ever dropped again.
+func TestFreshInstallMatchesEveryLaterStart(t *testing.T) {
+	for _, mode := range []string{ThinkingCompact, ThinkingVisible, ThinkingOff} {
+		dir := t.TempDir()
+		if msg := EnsureDefaultConfig(dir, "", false, mode); msg != "" {
+			t.Fatalf("EnsureDefaultConfig(%s): %s", mode, msg)
+		}
+		fresh, err := os.ReadFile(filepath.Join(dir, ConfigFileName))
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		// Running the upgrade path on the file it just wrote must be a no-op: if it changes
+		// anything, the two paths disagree.
+		if err := migrateExistingConfig(filepath.Join(dir, ConfigFileName), catalogPath(dir), mode); err != nil {
+			t.Fatalf("re-migrate: %v", err)
+		}
+		again, err := os.ReadFile(filepath.Join(dir, ConfigFileName))
+		if err != nil {
+			t.Fatalf("re-read: %v", err)
+		}
+		if string(fresh) != string(again) {
+			t.Fatalf("mode %s: first start and a later start disagree:\n--- fresh ---\n%s\n--- after re-migrate ---\n%s", mode, fresh, again)
+		}
+	}
+}
+
+// TestNewAPIKeyIsUnpredictable guards the LAN-sharing case: with a 0.0.0.0 bind the gateway is
+// reachable from the whole network, and a constant published in this repository would let anyone
+// on the same Wi-Fi spend the owner's quota.
+func TestNewAPIKeyIsUnpredictable(t *testing.T) {
+	seen := make(map[string]bool, 64)
+	for i := 0; i < 64; i++ {
+		key := newAPIKey()
+		if key == legacyAPIKey {
+			t.Fatal("new install fell back to the published constant")
+		}
+		if !strings.HasPrefix(key, defaultAPIKeyPrefix) {
+			t.Fatalf("key %q does not carry the expected prefix", key)
+		}
+		// prefix + 8 hex characters
+		if got := len(key) - len(defaultAPIKeyPrefix); got != 8 {
+			t.Fatalf("key %q has a %d-character suffix, want 8", key, got)
+		}
+		if seen[key] {
+			t.Fatalf("duplicate key %q in 64 draws", key)
+		}
+		seen[key] = true
+	}
+}
+
 // renderRule marshals root after applying a mode, so each test asserts on real YAML rather
 // than on node contents.
 func renderRule(t *testing.T, src, mode string) string {

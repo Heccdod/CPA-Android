@@ -4,8 +4,6 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.util.Log
 import androidx.core.content.ContextCompat
 
@@ -32,25 +30,21 @@ object NetworkWatcher {
     fun start(context: Context) {
         if (callback != null) return
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        var last: Network? = null
+        // The application context, not the service: this callback outlives individual start/stop
+        // cycles, and holding a Service reference here would keep it alive.
+        val appCtx = context.applicationContext
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                // onAvailable also fires for the first network seen after registering; restarting
-                // then would do it on every app launch, so only react to an actual change.
-                val previous = last
-                last = network
-                if (previous == null || previous == network) return
-                restartForNewNetwork(context, network)
-            }
-
-            override fun onLost(network: Network) {
-                if (last == network) last = null
+                restartForNewNetwork(appCtx, network)
             }
         }
-        runCatching { cm.registerNetworkCallback(request, cb) }
+        // registerDefaultNetworkCallback, not registerNetworkCallback. The latter fires for ANY
+        // network that satisfies the request, so a phone with Wi-Fi and cellular both up gets an
+        // onAvailable for each — plus background IMS and VPN churn — and would restart the
+        // gateway while the default route never changed. The default-network callback fires only
+        // when the route the app actually uses changes, and it does not fire on registration, so
+        // the "first callback is not a change" bookkeeping goes away with it.
+        runCatching { cm.registerDefaultNetworkCallback(cb) }
             .onSuccess { callback = cb }
             .onFailure { Log.w(TAG, "network callback registration failed: " + it.message) }
     }

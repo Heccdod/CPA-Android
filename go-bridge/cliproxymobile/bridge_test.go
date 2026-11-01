@@ -14,6 +14,7 @@ import (
 	"time"
 
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"gopkg.in/yaml.v3"
 )
 
 // TestBridgeLifecycle walks the whole contract-B matrix: cold start, port binding,
@@ -38,18 +39,21 @@ func TestBridgeLifecycle(t *testing.T) {
 		"Claude Agent SDK",
 		"system-conventions",
 		"Hermes Agent",
-		// A fresh install has to carry the thinking-visibility rule. It used to be written
-		// only when the settings screen touched the switch, so a brand-new config had no rule
-		// at all while the switch still read "on".
-		"generationConfig.thinkingConfig.includeThoughts: true",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("default config missing %q", want)
 		}
 	}
-	// ...and it must not carry an effort level, which would override the caller's choice.
-	if strings.Contains(text, "thinkingLevel") {
-		t.Fatalf("default config forces a thinking level:\n%s", text)
+	// A fresh install must land on the mode the caller asked for, not on the template's
+	// hard-coded rule. Passing ThinkingCompact has to produce the budget cap: the template still
+	// carries includeThoughts (it predates the three modes), and the migration that runs right
+	// after the write is what reconciles it. Without that, the settings screen showed 不思考
+	// while the engine ran includeThoughts until the next restart.
+	if !strings.Contains(text, "generationConfig.thinkingConfig.thinkingBudget: 0") {
+		t.Fatalf("fresh install did not apply ThinkingCompact:\n%s", text)
+	}
+	if strings.Contains(text, "includeThoughts") {
+		t.Fatalf("fresh install kept the template's includeThoughts rule:\n%s", text)
 	}
 
 	cfg, err := sdkconfig.LoadConfig(cfgPath)
@@ -80,7 +84,7 @@ func TestBridgeLifecycle(t *testing.T) {
 	}
 
 	// The engine must already answer an authenticated API call.
-	if err := getModels(addr); err != nil {
+	if err := getModels(addr, cfgPath); err != nil {
 		t.Fatalf("GET /v1/models failed: %v", err)
 	}
 
@@ -107,7 +111,7 @@ func TestBridgeLifecycle(t *testing.T) {
 	if !IsRunning() {
 		t.Fatal("engine died after a hot reload")
 	}
-	if err := getModels(addr); err != nil {
+	if err := getModels(addr, cfgPath); err != nil {
 		t.Fatalf("gateway stopped serving after hot reload: %v", err)
 	}
 
@@ -155,6 +159,26 @@ func TestUpdateQuickSettingsRestoresDefaults(t *testing.T) {
 	}
 }
 
+// apiKeyFromConfig reads access.api-keys[0] out of a written config.yaml.
+func apiKeyFromConfig(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var doc struct {
+		Access struct {
+			APIKeys []string `yaml:"api-keys"`
+		} `yaml:"access"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return "", err
+	}
+	if len(doc.Access.APIKeys) == 0 {
+		return "", fmt.Errorf("no api key in %s", path)
+	}
+	return doc.Access.APIKeys[0], nil
+}
+
 func probe(addr string) error {
 	conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
 	if err != nil {
@@ -163,12 +187,23 @@ func probe(addr string) error {
 	return conn.Close()
 }
 
-func getModels(addr string) error {
+// getModels reads the API key from the config the engine actually loaded.
+//
+// It used to be the compile-time constant. That constant no longer exists: a fresh config now
+// carries a random suffix, because with a 0.0.0.0 bind the gateway is reachable from the whole
+// LAN and a key published in this repository would let anyone on the same Wi-Fi spend the
+// owner's quota. Reading the file is also a better test — it proves the key that was written is
+// the key the engine accepts.
+func getModels(addr, configPath string) error {
+	key, errKey := apiKeyFromConfig(configPath)
+	if errKey != nil {
+		return errKey
+	}
 	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/models", nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+defaultAPIKey)
+	req.Header.Set("Authorization", "Bearer "+key)
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {

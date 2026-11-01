@@ -72,10 +72,14 @@ class MainActivity : AppCompatActivity() {
     private var knownEntries: List<Credentials.Entry> = emptyList()
 
     /** Quota results keyed by credential file name. */
-    private val quotas = LinkedHashMap<String, Quota.Result>()
+    // Written from a background thread in fetchQuota() while the main thread renders, so a plain
+    // LinkedHashMap could corrupt its buckets or throw ConcurrentModificationException when a
+    // global refresh and a per-account refresh overlap. ConcurrentHashMap keeps insertion order
+    // out — renderQuotaStates iterates the credential list, not this map, so order never mattered.
+    private val quotas = java.util.concurrent.ConcurrentHashMap<String, Quota.Result>()
 
     /** Accounts whose quota request is in flight, so their row can show a spinner state. */
-    private val quotaLoading = mutableSetOf<String>()
+    private val quotaLoading: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     /** Rebind targets, keyed by credential name, rebuilt on every inventory render. */
     private val quotaHolders = LinkedHashMap<String, QuotaHolder>()

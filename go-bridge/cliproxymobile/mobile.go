@@ -5,6 +5,8 @@ package cliproxymobile
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
@@ -50,8 +53,16 @@ const (
 	DefaultPort = 8317
 	// ManagementKey is the local management secret seeded into the panel.
 	ManagementKey = "cpa-android-local"
-	// defaultAPIKey is the local proxy key accepted by the /v1 endpoints.
-	defaultAPIKey = "cpa-android-local"
+	// defaultAPIKeyPrefix is the local proxy key accepted by the /v1 endpoints. The full key
+	// carries a random suffix, generated when the config is first written: with 0.0.0.0 bind the
+	// gateway is reachable from the whole LAN, and a constant published in this repository would
+	// let anyone on the same Wi-Fi spend the owner's quota. Loopback-only installs are unaffected
+	// either way.
+	defaultAPIKeyPrefix = "cpa-android-"
+	// legacyAPIKey is what earlier builds wrote. It is still accepted so an upgraded install does
+	// not lose the client that was already configured against it, and is replaced on the next
+	// settings write.
+	legacyAPIKey = "cpa-android-local"
 
 	loopbackHost = "127.0.0.1"
 	anyHost      = "0.0.0.0"
@@ -67,8 +78,9 @@ const (
 
 	// livenessTimeout bounds the loopback dial IsRunning uses as its health check. A refused
 	// connection fails in microseconds, so this only matters when the kernel is accepting but
-	// not answering — and the caller is often the UI thread, so it stays short.
-	livenessTimeout = 600 * time.Millisecond
+	// not answering. The caller is often the UI thread and the target is now always loopback (a
+	// local handshake completes in well under a millisecond), so 150ms is generous.
+	livenessTimeout = 150 * time.Millisecond
 )
 
 // defaultSensitiveWords ship by default. Antigravity intermittently answers with a
@@ -96,6 +108,18 @@ type runtimeState struct {
 }
 
 var state runtimeState
+
+// lifecycleMu serialises start and stop against each other.
+//
+// state.mu only guards the pointer fields; the expensive part of a start (building the engine,
+// then waiting up to readyTimeout for the port) runs with it released. Without a second lock two
+// callers — the activity, the watchdog and the network callback can all trigger a start — both
+// see state.service == nil during that window and both start an engine, and the second one wins
+// the assignment while the first keeps a goroutine and a log file alive forever.
+var lifecycleMu sync.Mutex
+
+// builds is test-only instrumentation: it counts how many engines were actually built.
+var builds int64
 var lastError string
 
 // desiredRunning is the user's intent, guarded by state.mu. It lives outside runtimeState
@@ -159,8 +183,20 @@ func IsRunning() bool {
 }
 
 // probeListen reports whether something accepts TCP connections on addr.
+//
+// A wildcard bind address is rewritten to loopback first. Dialling "0.0.0.0:8317" is not the
+// same as dialling the machine: on Android it can be routed out through a VPN or TUN interface
+// and time out, so a perfectly healthy local gateway would look dead — and this probe runs on
+// the UI thread. Loopback is the right target because the engine is in this process.
 func probeListen(addr string, timeout time.Duration) error {
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	host, port, errSplit := net.SplitHostPort(addr)
+	if errSplit != nil {
+		return errSplit
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host = loopbackHost
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
 	if err != nil {
 		return err
 	}
@@ -229,6 +265,8 @@ func startProxy(dataDir string) error {
 	if strings.TrimSpace(dataDir) == "" {
 		return fmt.Errorf("dataDir is required")
 	}
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	state.mu.Lock()
 	// A nil service means nothing is running. Do not treat a live-looking pointer as "already
 	// started" without checking: recordError clears it on failure, and the probe below catches
@@ -238,16 +276,39 @@ func startProxy(dataDir string) error {
 		state.mu.Unlock()
 		return nil
 	}
-	if state.service != nil {
-		// Stale pointer: the engine is gone but nobody noticed. Drop it so the restart below
-		// does not race an object that will never serve again.
-		log.Warnf("cpa engine died without reporting an error; restarting")
-		state.service = nil
-		state.cancel = nil
-		state.done = nil
-		state.listenAddr = ""
-	}
+	// A stale pointer means the engine is unreachable but its goroutine may still be alive —
+	// that is exactly the state this path exists to recover from. Cancelling it before dropping
+	// the pointers matters: leaving it running and starting a second engine puts two Service.Run
+	// loops in the same process, and they collide on gin's global mode flag (the race detector
+	// caught gin.SetMode in one Run racing gin.IsDebugging in the other). Wait for the old loop
+	// to exit so the new one starts from a quiet process.
+	staleCancel := state.cancel
+	staleDone := state.done
+	staleLog := state.logFile
+	hadStale := state.service != nil
+	state.service = nil
+	state.cancel = nil
+	state.done = nil
+	state.listenAddr = ""
+	state.logFile = nil
 	state.mu.Unlock()
+
+	if hadStale {
+		log.Warnf("cpa engine unreachable; shutting down the old loop before restarting")
+		if staleCancel != nil {
+			staleCancel()
+		}
+		if staleDone != nil {
+			select {
+			case <-staleDone:
+			case <-time.After(stopTimeout):
+				log.Warnf("old engine loop did not exit within %s", stopTimeout)
+			}
+		}
+		if staleLog != nil {
+			_ = staleLog.Close()
+		}
+	}
 
 	if err := ensureDir(dataDir); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
@@ -294,10 +355,20 @@ func startProxy(dataDir string) error {
 	if err := waitForListen(listen, readyTimeout); err != nil {
 		cancel()
 		<-done
+		// The start failed, so the logger this attempt attached is no longer wanted. Closing it
+		// here (rather than waiting for the next start to overwrite it) keeps the descriptor count
+		// flat across repeated failures, which is what a flapping network produces.
+		state.mu.Lock()
+		if state.logFile != nil {
+			_ = state.logFile.Close()
+			state.logFile = nil
+		}
+		state.mu.Unlock()
 		return fmt.Errorf("engine did not become ready on %s: %w", listen, err)
 	}
 
 	state.mu.Lock()
+	atomic.AddInt64(&builds, 1)
 	state.service = svc
 	state.cancel = cancel
 	state.done = done
@@ -385,6 +456,8 @@ func recordError(err error) {
 }
 
 func stopProxy() error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	state.mu.Lock()
 	svc := state.service
 	cancel := state.cancel
@@ -438,6 +511,12 @@ func attachLogger(dataDir string) {
 	path := filepath.Join(dataDir, "cpa-engine.log")
 	if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
 		state.mu.Lock()
+		// Close the previous handle before replacing it. A start that failed at waitForListen
+		// already left one open; overwriting the field without closing leaked a descriptor on
+		// every failed start.
+		if state.logFile != nil {
+			_ = state.logFile.Close()
+		}
 		state.logFile = f
 		state.mu.Unlock()
 		log.SetOutput(io.MultiWriter(f))
@@ -504,8 +583,22 @@ func renderDefaultConfig(dataDir, proxyURL string, allowLan bool) string {
 	// api-keys, secret-key, auth-dir, sensitive-words.
 	return fmt.Sprintf(defaultConfigTemplate,
 		yamlScalar(host), DefaultPort, yamlScalar(proxyURL),
-		yamlScalar(catalogPath(dataDir)), yamlScalar(defaultAPIKey),
+		yamlScalar(catalogPath(dataDir)), yamlScalar(newAPIKey()),
 		yamlScalar(ManagementKey), yamlScalar(authDir(dataDir)), strings.Join(words, "\n"))
+}
+
+// newAPIKey returns the default proxy key for a fresh install: a fixed prefix plus 8 random hex
+// characters. The prefix keeps it recognisable as this app's key; the suffix makes it useless to
+// anyone who has read the repository.
+//
+// Falls back to the legacy constant if crypto/rand is unavailable, which on Android never
+// happens; a predictable key is a smaller problem than a gateway nobody can authenticate to.
+func newAPIKey() string {
+	buf := make([]byte, 4)
+	if _, err := rand.Read(buf); err != nil {
+		return legacyAPIKey
+	}
+	return defaultAPIKeyPrefix + hex.EncodeToString(buf)
 }
 
 // catalogPath returns the model catalog written next to config.yaml.
@@ -613,7 +706,15 @@ func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool, thinkingMode s
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	return writeFileAtomic(path, []byte(renderDefaultConfig(dataDir, proxyURL, allowLan)))
+	// Write the template, then run the same migration the upgrade path uses. The template carries
+	// a hard-coded thinking rule (it predates the three modes), so a fresh install would
+	// otherwise run includeThoughts while the settings screen says 不思考 — and only agree after
+	// the first restart. Running the migration here makes first start and every later start
+	// follow one rule.
+	if err := writeFileAtomic(path, []byte(renderDefaultConfig(dataDir, proxyURL, allowLan))); err != nil {
+		return err
+	}
+	return migrateExistingConfig(path, catalogPath(dataDir), thinkingMode)
 }
 
 // migrateExistingConfig brings a config written by an older build up to date without touching

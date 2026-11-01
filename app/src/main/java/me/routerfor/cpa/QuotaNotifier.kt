@@ -18,11 +18,20 @@ import android.content.Intent
  */
 object QuotaNotifier {
 
+    // Volatile because these are written from a background quota thread and read from the service
+    // and the UI thread. Without it the reader can see a new map under an old timestamp — or a
+    // stale map indefinitely, since nothing else forces a flush.
+    @Volatile
     private var cached: String = ""
+
+    @Volatile
     private var cachedAt: Long = 0L
 
     /** Last data handed in, so a bare repaint keeps showing it instead of blanking it. */
+    @Volatile
     private var lastEntries: List<Credentials.Entry> = emptyList()
+
+    @Volatile
     private var lastResults: Map<String, Quota.Result> = emptyMap()
 
     /**
@@ -71,6 +80,9 @@ object QuotaNotifier {
     }
 
     private fun requestRepaint(context: Context) {
+        // Nothing to repaint when the user stopped the gateway: there is no notification, and
+        // startService on a service that is not running is a pointless wake-up at best.
+        if (!AppPrefs.gatewayWanted(context)) return
         val intent = Intent(context, ProxyForegroundService::class.java)
             .setAction(ProxyForegroundService.ACTION_REPAINT)
         val result = runCatching { context.startService(intent) }

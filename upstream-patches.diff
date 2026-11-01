@@ -130,7 +130,7 @@ index bdb56aa..7b5b514 100644
  		payload = applyAntigravityNativeSignatureReplayIfNeeded(modelName, payload)
  		payload = helps.FinalizePayload(ctx, payload)
 diff --git a/internal/runtime/executor/antigravity_executor_stream.go b/internal/runtime/executor/antigravity_executor_stream.go
-index bba3a96..e569898 100644
+index bba3a96..9925fd2 100644
 --- a/internal/runtime/executor/antigravity_executor_stream.go
 +++ b/internal/runtime/executor/antigravity_executor_stream.go
 @@ -9,6 +9,7 @@ import (
@@ -211,7 +211,7 @@ index bba3a96..e569898 100644
  		var param any
  		commitReplay := func() {
  			if !replayCommitted && replayAccumulator != nil && replayAccumulator.terminal && helps.ApplyPatchTranslationError(param) == nil {
-@@ -224,6 +274,24 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -224,6 +274,31 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  				replayCommitted = true
  			}
  		}
@@ -220,6 +220,13 @@ index bba3a96..e569898 100644
 +		// be in scope. Both paths need it: the terminal-frame path (normal case) and the EOF
 +		// path (upstream closed without a finish_reason, which real tool-call streams do).
 +		emitSyntheticTail := func() {
++			// Mark before emitting, not after: the flag exists so the EOF path does not send a
++			// second [DONE], and a client that disconnects mid-loop would otherwise leave it
++			// unset and earn a duplicate terminal frame.
++			if tailEmitted {
++				return
++			}
++			tailEmitted = true
 +			tail := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, []byte("[DONE]"), &param, claudeInputTokens)
 +			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
 +			// Commit upstream output before the synthetic completion reaches interceptors.
@@ -236,7 +243,7 @@ index bba3a96..e569898 100644
  		defer func() {
  			defer stopDeliverySupport()
  			if helps.ApplyPatchTranslationError(param) != nil {
-@@ -261,6 +329,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -261,6 +336,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  		}()
  		helps.InitializeApplyPatchStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, &param)
  		for scanner.Scan() {
@@ -244,7 +251,7 @@ index bba3a96..e569898 100644
  			line := scanner.Bytes()
  			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
  			if replayAccumulator != nil {
-@@ -370,6 +439,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -370,6 +446,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  			}
  			if isTerminalChunk {
  				terminalDelivered = true
@@ -258,7 +265,7 @@ index bba3a96..e569898 100644
  			}
  			if helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
  				return
-@@ -378,7 +454,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -378,7 +461,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  		if helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
  			return
  		}
@@ -273,7 +280,7 @@ index bba3a96..e569898 100644
  			streamErr = errScan
  			if errors.Is(errScan, context.Canceled) && ctx.Err() != nil {
  				if terminalDelivered {
-@@ -400,17 +482,11 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -400,17 +489,11 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  			// stream as a successful completion. A clean EOF is a normal end
  			// even without finishReason: real Antigravity tool-call streams
  			// end that way (see antigravityNoFinishReasonSSE).
