@@ -77,7 +77,7 @@ CPA-Android/
 | 页面 | 内容 |
 | :--- | :--- |
 | 首页 `MainActivity` | 右上角三个图标按钮：刷新（全局，同时让每个账号的独立刷新按钮进入刷新态）、主题、齿轮。状态卡：运行绿点 / 服务地址（补了 `/v1` 后缀，即 `127.0.0.1:8317/v1`，客户端直接粘贴就能用）/ API 密钥点按复制 / 内核版本 + 热更新状态。AI 提供商卡：按提供商分组聚合所有账号，每组一个整组开关、每账号一个开关（走 `PATCH /v8/management/credentials/status`），账号下方是按模型族分组的额度块 + 独立刷新按钮。卡片最高占屏幕 40%，账号多了在卡片内滚动，「AI 提供商」标题与 `n/m` 计数固定不动（`MaxHeightScrollView`），不溢出时不拦截拖拽。快捷操作四按钮同形（管理面板 / 快捷添加 / 重启网关 / 设置）。 |
-| 设置 `SettingsActivity` | 外观：跟随系统（半太阳半月亮专属图标）/ 日间 / 黑夜 / 羊皮纸四选一（当前项打勾）。网络：上游代理（`socks5://…` 或「直连」）、允许局域网访问（经典圆形开关）。引擎：敏感词混淆、编辑 `config.yaml`（等宽字体，保存后热重载）、**显示思维链**（经典圆形开关，默认开启）。更新：**状态栏显示 5h 额度**（经典圆形开关，默认关闭）、内核热更新开关、检查更新、同步远程规则。系统：忽略电池优化、重启网关。关于：版本 / 架构 / 热更新状态。 |
+| 设置 `SettingsActivity` | 外观：跟随系统（半太阳半月亮专属图标）/ 日间 / 黑夜 / 羊皮纸四选一（当前项打勾）。网络：上游代理（`socks5://…` 或「直连」）、允许局域网访问（经典圆形开关）。引擎：敏感词混淆、编辑 `config.yaml`（等宽字体，保存后热重载）、**思考预算**（三档单选：不思考 / 显示思维链 / 不写规则，默认不思考）。更新：**状态栏显示 5h 额度**（经典圆形开关，默认关闭）、内核热更新开关、检查更新、同步远程规则。系统：忽略电池优化、重启网关。关于：版本 / 架构 / 热更新状态。 |
 | 面板 `PanelActivity` | 全屏 `/management.html`，预置登录态直接进；供应商 OAuth 与 `localhost:51121` 回调交给 Chrome Custom Tabs，全程零粘贴。返回箭头与系统返回键都直接回主界面，不走 SPA 历史。 |
 
 全中文，无英文残留。界面不再用 M3 的默认配色与阴影，改为手写视图 + `UiKit` 统一绘制：
@@ -293,9 +293,19 @@ requests:
 
 ### 开关位置与默认值
 
-设置 → 引擎 → **「显示思维链」**，经典圆形开关，**默认开启**
-（`AppPrefs.thinkingVisible()` 读 `KEY_THINKING = "thinking-visible"`，缺省 `true`）。
-拨动后 `applyQuickSettings()` 重写 `config.yaml` 并触发热重载，不需要重启网关。
+设置 → 引擎 → **「思考预算」**，三档单选，**默认「不思考」**
+（`AppPrefs.thinkingMode()` 读 `KEY_THINKING`，缺省 `THINKING_COMPACT`）。
+选完由 `applyQuickSettings()` 重写 `config.yaml` 并触发热重载，不需要重启网关。
+
+| 档位 | 写入的规则 | 300 token 预算下的正文 |
+| :--- | :--- | ---: |
+| 不思考（默认） | `thinkingBudget: 0` | 167–208 字 |
+| 显示思维链 | `includeThoughts: true` + `thinkingLevel: low` | 195–206 字（不花思考 token） |
+| 不写规则 | 无 | 12–29 字（模型自行思考，预算被吃光） |
+
+早期版本存的是布尔值（`getBoolean`），直接 `getString` 会抛 `ClassCastException` —— 所以
+`thinkingMode()` 读 `prefs.all[KEY_THINKING]` 的原始值再按类型解释，`ProxyForegroundService.onCreate`
+里调一次 `normalizeThinkingMode()` 把旧值改写成新档位。
 
 ## 模型目录
 
@@ -430,15 +440,26 @@ R8（`isMinifyEnabled`）保持关闭：内核已经剥过，R8 只能再省约 
   `filesDir/config.yaml` → 引擎的文件 watcher 毫秒级热重载。同样是手动触发，不再自动跑。
 
   > 注意这条路是**整份覆盖**（点之前弹的确认框写的就是这句）。`rules/config.yaml` 里**没有**
-  > `requests.payload.override`，也没有 `models.catalog`，所以同步一次会把「显示思维链」的规则和
+  > `requests.payload.override`，也没有 `models.catalog`，所以同步一次会把「思考预算」的规则和
   > 自定义模型目录一起冲掉——额度、账号、面板都不受影响，只是思维链静默失效、模型列表退回上游那几档。
-  > 恢复：设置页把「显示思维链」关掉再打开（`applyThinkingVisibility()` 重新写入），
-  > 再「重启网关」（`ensureCatalogKey()` 把 `models.catalog` 补回）。
-- **L3 内核/整包热更**：`UpdateManager.checkForUpdates()` 读 `api.github.com/repos/Heccdod/CPA-Android/releases/latest`，
-  比对 `tag_name` 与本地 `versionName`；`.so` 按 assets 的 `digest`（`sha256:...`）校验后落到
-  `getDir("hotlibs")`；`.apk` 下载后经 `FileProvider` 拉起系统安装器覆盖安装。
+  > 恢复：设置页把「思考预算」切到别的档再切回来（`applyThinkingVisibility()` 重新写入），
+  > 再「重启网关」（`migrateExistingConfig()` 把 `models.catalog` 补回）。
+- **L3 整包热更**：`UpdateManager.checkAppRelease()` 读
+  `api.github.com/repos/Heccdod/CPA-Android/releases/latest`，比对 `tag_name` 与本地 `versionName`；
+  `.apk` 下载后经 `FileProvider` 拉起系统安装器覆盖安装。
+- **L3 内核热更**：`checkKernelRelease()` 走**另一条**查询 ——
+  `releases?per_page=20`，取第一个 `prerelease && tag.startsWith("upstream-")` 的 release 里的
+  `.so`，按摘要校验后落到 `getDir("hotlibs")`。
 
-> 注意 `digest` 只能证明「下载没坏」，证明不了「这是你发的」。仓库地址与小写 key 都在 `BuildConfig` 里，
+  为什么是两条：CI 用 `gh release create --prerelease` 发布内核包，而 GitHub 的 `/releases/latest`
+  **按定义排除 prerelease** —— 只用 `/latest` 的话，内核热更永远看不到任何东西。这是 2.5.0 之前的
+  实际状态：仓库里有 `upstream-*` 包，App 一个都拉不到。
+
+  摘要校验是**失败即拒绝**：先看 asset 的 `digest` 字段，为空则回退去读同 release 的
+  `SHA256SUMS.txt`；两者都没有就拒绝安装。`HotSoLoader` 同理 —— 没有 manifest 就不加载已暂存的
+  `.so`。以前缺清单时直接跳过校验并 `System.load()`。
+
+> 注意摘要只能证明「下载没坏」，证明不了「这是你发的」。仓库地址与 key 都在 `BuildConfig` 里，
 > 想换源要重新编译；真正要防的是 GitHub 账号被盗后发一个恶意 Release——所以默认关闭是这道防线的第一层。
 
 ## 默认配置里预置的防风控项
