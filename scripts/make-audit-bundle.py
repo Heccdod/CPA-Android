@@ -17,10 +17,14 @@ Usage:
 import pathlib
 import sys
 
-# Directories that hold no first-party source: VCS data, build output, IDE state, and the
-# upstream clone (a separate project reviewed on its own).
+# Directories that hold no first-party source: VCS data, build output, IDE state, the upstream
+# clone (a separate project reviewed on its own), and the diagnostic harness's run output.
+#
+# "logs" is in here because a diagnostic run writes dozens of request logs, each containing full
+# request and response bodies. They are gitignored for the same reason and are not part of what
+# a reviewer needs; diag/mock_upstream.py and diag/drive.py are, and they stay in.
 SKIP_DIRS = {".git", "upstream-cliproxy", "build", ".gradle", ".idea", "libs", "__pycache__",
-             ".dsh", "dist", "node_modules"}
+             ".dsh", "dist", "node_modules", "logs"}
 
 # Extensions that are binary or rebuilt from source.
 SKIP_EXTS = {".aar", ".apk", ".so", ".jar", ".png", ".webp", ".jpg", ".jpeg", ".gif",
