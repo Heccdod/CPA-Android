@@ -43,3 +43,9 @@ diag/config.restore.yaml
 # build output of a specific interpreter version and mean nothing to a reader of the repository.
 __pycache__/
 *.pyc
+
+# Generated review artifacts. scripts/make-audit-bundle.py produces them on demand from the
+# working tree; committing a 700 KB flattened copy of the sources would duplicate every file and
+# be stale the moment one of them changes.
+cpa_audit_bundle.txt
+cpa_upstream_patch.txt

@@ -25,6 +25,12 @@ env:
   ANDROID_BUILD_TOOLS: "34.0.0"
   ANDROID_NDK: "26.1.10909125"
   UPSTREAM_REPO: "router-for-me/CLIProxyAPI"
+  # Pinned, not @latest. gomobile and gobind are tools whose output is a binary artifact, so an
+  # upstream release can change the generated bindings or the link flags without any change on
+  # our side — the same commit would then build differently. This is the revision go.sum already
+  # pins for the bind package; keeping the CLI tools on it means the toolchain and the library
+  # cannot drift apart.
+  X_MOBILE_VERSION: "v0.0.0-20261011034528-197770444867"
 
 jobs:
   build-and-release:
@@ -132,15 +138,15 @@ jobs:
         if: steps.upstream.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
+          go install "golang.org/x/mobile/cmd/gomobile@${X_MOBILE_VERSION}"
+          go install "golang.org/x/mobile/cmd/gobind@${X_MOBILE_VERSION}"
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
           cd go-bridge
           # gomobile bind refuses to run unless golang.org/x/mobile is in the module graph, and
           # the earlier `go mod tidy` drops it precisely because nothing imports it. Add the
           # bind package back right before binding.
-          go get golang.org/x/mobile/bind@latest
+          go get "golang.org/x/mobile/bind@${X_MOBILE_VERSION}"
           # -checklinkname=0: pion/stdnet pulls github.com/wlynxg/anet, whose //go:linkname
           # hooks into net.zoneCache and x/net/internal/socket.zoneCache are rejected by the
           # Go 1.23+ linkname checker when they are linked into a c-shared library.
