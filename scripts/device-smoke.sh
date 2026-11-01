@@ -132,22 +132,34 @@ $ADB push "$CFG_TMP" /data/local/tmp/cpa-cfg.yaml >/dev/null 2>&1
 $ADB shell run-as $PKG cp /data/local/tmp/cpa-cfg.yaml files/config.yaml 2>/dev/null
 rm -f "$CFG_TMP" "$CFG_TMP.bak" "$CFG_TMP.bak2"
 
-echo "== D2 2.0 defaults =="
-# The 2.0 build ships with hot update OFF. A previous run may have toggled it, so read the pref
-# instead of assuming a clean install.
+echo "== D2 hot update defaults to OFF =="
+# This check used to assert on the leftover preference. That made it fail on any device where
+# somebody had legitimately turned hot update ON - it was measuring the previous run, not the
+# code. It now establishes its own precondition: force-stop, clear the staged kernel, force the
+# pref off, restart, and only then assert what the loader did.
+$ADB shell am force-stop $PKG >/dev/null 2>&1
+$ADB shell run-as $PKG rm -rf app_hotlibs >/dev/null 2>&1
+PREFS_TMP=$(mktemp)
+$ADB shell run-as $PKG cat shared_prefs/cpa-prefs.xml 2>/dev/null | tr -d "\r" > "$PREFS_TMP"
+sed -i.bak 's/name="hot-update-enabled" value="true"/name="hot-update-enabled" value="false"/' "$PREFS_TMP"
+$ADB push "$PREFS_TMP" /data/local/tmp/cpa-prefs.xml >/dev/null 2>&1
+$ADB shell run-as $PKG cp /data/local/tmp/cpa-prefs.xml shared_prefs/cpa-prefs.xml 2>/dev/null
+rm -f "$PREFS_TMP" "$PREFS_TMP.bak"
 RAW=$($ADB shell run-as $PKG cat shared_prefs/cpa-prefs.xml 2>/dev/null | tr -d "\r")
 HOT=$(printf %s "$RAW" | sed -n 's/.*name="hot-update-enabled" value="\([a-z]*\)".*/\1/p')
-note "hot-update-enabled=${HOT:-unset}"
+note "hot-update-enabled after reset: ${HOT:-unset}"
 case "${HOT:-false}" in
-  false) ok "hot update is OFF" ;;
-  "")    ok "hot update unset, defaults to OFF" ;;
-  *)     bad "hot update is ON; expected the default of OFF" ;;
+  false) ok "hot update reads OFF" ;;
+  *)     bad "could not reset hot-update-enabled (got ${HOT:-unset})" ;;
 esac
-STAGED=$($ADB shell run-as $PKG ls app_hotlibs 2>/dev/null | tr -d "\r" | grep -c libgojni)
-[ "${STAGED:-0}" -eq 0 ] && ok "no staged kernel while hot update is off" \
-  || bad "a staged .so survived with hot update off"
+$ADB logcat -c 2>/dev/null
+$ADB shell am start -n $PKG/.MainActivity >/dev/null 2>&1
+sleep 8
 $ADB logcat -d -s CpaHotSo:* 2>/dev/null | grep -q "hot update disabled, loaded packaged kernel" \
   && ok "loader took the packaged-kernel branch" || bad "packaged-kernel branch never logged"
+STAGED=$($ADB shell run-as $PKG ls app_hotlibs 2>/dev/null | tr -d "\r" | grep -c libgojni)
+[ "${STAGED:-0}" -eq 0 ] && ok "nothing staged while hot update is off" \
+  || bad "a staged .so survived with hot update off"
 
 # Panel: the activity is exported=false on purpose, so \`am start\` is refused by the system.
 # Drive it the way a user does - dump the home screen, tap the 管理面板 button, wait for the fetch.
