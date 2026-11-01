@@ -31,7 +31,17 @@ object AppPrefs {
      * START_STICKY, so without this the system would restart a gateway the user had
      * deliberately stopped. Defaults to true — a fresh install is expected to serve.
      */
-    fun gatewayWanted(context: Context): Boolean = get(context).getBoolean(KEY_WANTED, true)
+    fun gatewayWanted(context: Context): Boolean {
+        // Same trap as thinkingMode: getBoolean throws if the key ever held another type. This
+        // one is new, so nothing has written a non-Boolean, but the cost of being sure is a
+        // single type check and the failure mode is a crash in a service.
+        val prefs = get(context)
+        return when (val stored = if (prefs.contains(KEY_WANTED)) prefs.all[KEY_WANTED] else null) {
+            is Boolean -> stored
+            is String -> stored.equals("true", ignoreCase = true)
+            else -> true
+        }
+    }
 
     fun setGatewayWanted(context: Context, wanted: Boolean) {
         get(context).edit().putBoolean(KEY_WANTED, wanted).apply()
@@ -86,9 +96,20 @@ object AppPrefs {
     const val THINKING_OFF = "off"
 
     fun thinkingMode(context: Context): String {
-        val stored = get(context).getString(KEY_THINKING, THINKING_COMPACT) ?: THINKING_COMPACT
-        return when (stored) {
-            THINKING_COMPACT, THINKING_VISIBLE, THINKING_OFF -> stored
+        // Read the raw value and type-check it before touching it. The previous release stored a
+        // Boolean under this key, and SharedPreferences.getString throws ClassCastException on a
+        // Boolean instead of returning the default — which crashed the foreground service on the
+        // first start after upgrading. Nothing in the API warns about this, so the value is
+        // fetched with getAll() and interpreted by type.
+        val prefs = get(context)
+        val stored: Any? = if (prefs.contains(KEY_THINKING)) prefs.all[KEY_THINKING] else null
+        val text = when (stored) {
+            is String -> stored
+            is Boolean -> if (stored) THINKING_VISIBLE else THINKING_OFF
+            else -> return THINKING_COMPACT
+        }
+        return when (text) {
+            THINKING_COMPACT, THINKING_VISIBLE, THINKING_OFF -> text
             "true" -> THINKING_VISIBLE
             "false" -> THINKING_OFF
             else -> THINKING_COMPACT
@@ -97,6 +118,22 @@ object AppPrefs {
 
     fun setThinkingMode(context: Context, mode: String) {
         get(context).edit().putString(KEY_THINKING, mode).apply()
+    }
+
+    /**
+     * Writes the mode in its normalised form when the stored value has another type.
+     *
+     * Without it an upgraded install keeps the legacy Boolean in place, and every read pays the
+     * conversion — but more importantly the old value would be reinterpreted if the mapping ever
+     * changed. Called once from the service on start.
+     */
+    fun normalizeThinkingMode(context: Context) {
+        val mode = thinkingMode(context)
+        val prefs = get(context)
+        val stored = if (prefs.contains(KEY_THINKING)) prefs.all[KEY_THINKING] else null
+        if (stored !is String || stored != mode) {
+            setThinkingMode(context, mode)
+        }
     }
 
     /**

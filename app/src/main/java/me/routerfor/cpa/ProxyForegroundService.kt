@@ -69,6 +69,10 @@ class ProxyForegroundService : Service() {
         super.onCreate()
         HotSoLoader.loadEngine(applicationContext)
         createChannel()
+        // Rewrites the legacy Boolean stored under KEY_THINKING into one of the three mode
+        // strings. Doing it here means the migration happens once, on the path that always runs
+        // first, rather than on every read.
+        AppPrefs.normalizeThinkingMode(this)
         // Tell the engine what the user wants before anything reads its status. START_STICKY
         // means this service can be recreated by the system long after a stop, and the engine
         // would otherwise report "starting" for a gateway nobody asked to run.

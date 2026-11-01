@@ -62,6 +62,15 @@ class MainActivity : AppCompatActivity() {
     /** Set once the inventory has been read against a live gateway. */
     private var accountsLoaded = false
 
+    /**
+     * The inventory last rendered successfully.
+     *
+     * Kept so a failed read (a stopped gateway, a request that lost a race with shutdown) cannot
+     * blank the provider card — an empty result is indistinguishable from "user deleted every
+     * account" at that point, and showing "尚未登录任何账号" was read as data loss.
+     */
+    private var knownEntries: List<Credentials.Entry> = emptyList()
+
     /** Quota results keyed by credential file name. */
     private val quotas = LinkedHashMap<String, Quota.Result>()
 
@@ -94,7 +103,10 @@ class MainActivity : AppCompatActivity() {
         // Reading the inventory before the gateway answers returns an empty list, which renders
         // as "no accounts logged in". The first read happens in refresh() once it is up; every
         // later resume reads again to pick up accounts added from the panel.
-        if (accountsLoaded) loadAccounts()
+        //
+        // Only while it is actually serving: a stopped gateway answers nothing, and reloading
+        // there replaced the list with "尚未登录任何账号" — which read as "my accounts are gone".
+        if (accountsLoaded && WebBridgeCompat.isRunning()) loadAccounts()
     }
 
     /** "跟随系统" has to react to a live OS switch, not only at launch. */
@@ -339,7 +351,14 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 accountsLoading = false
                 accountsLoaded = true
-                renderAccounts(entries)
+                // An empty answer while accounts are already on screen means the read failed (the
+                // gateway stopped mid-flight, or answered before it was ready), not that the user
+                // removed every account. Keeping the previous list avoids the "accounts vanished"
+                // report; a genuine removal still lands because it comes with a non-empty list.
+                if (entries.isNotEmpty() || knownEntries.isEmpty()) {
+                    knownEntries = entries
+                    renderAccounts(entries)
+                }
                 val stale = if (forceQuota) entries else entries.filter { !quotas.containsKey(it.name) }
                 if (stale.isNotEmpty()) fetchQuota(stale)
             }
