@@ -38,3 +38,8 @@ diag/auths/logs/
 # A scratch copy of the device's config.yaml, used to restore it after a diagnostic run edited
 # it. Regenerated on demand; never a source of truth.
 diag/config.restore.yaml
+
+# Python bytecode from the helper scripts. Four .pyc files were committed by accident; they are
+# build output of a specific interpreter version and mean nothing to a reader of the repository.
+__pycache__/
+*.pyc

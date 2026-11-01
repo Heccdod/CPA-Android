@@ -4,7 +4,11 @@
 经 `gomobile` 打进前台服务，在本机 `127.0.0.1:8317` 暴露 OpenAI / Anthropic / Gemini 兼容的流式 API。
 
 配套文档：[CHANGELOG.md](CHANGELOG.md)（版本变更）、[UPSTREAM_ISSUES.md](UPSTREAM_ISSUES.md)
-（上游三个问题的根因与补丁，补丁本体是 [upstream-patches.diff](upstream-patches.diff)）。
+（上游三个问题的根因与补丁，补丁本体是 [upstream-patches.diff](upstream-patches.diff)）、
+[diag/REPORT.md](diag/REPORT.md)（SillyTavern 流式协议的逐项实测）。
+
+**只想读代码？** 做完下面「构建」的第 0 步，`go-bridge/` 就能 `go build` / `go test`；
+Android 侧（`app/src/main/java/me/routerfor/cpa/`）是纯 Kotlin，不依赖 AAR 也能读。
 
 ## 终态交付契约与验证方式
 
@@ -329,16 +333,23 @@ CI 产出的内核就会静默丢掉这些修复，本地包和 CI 包行为不�
 
 ## 构建
 
-```bash
-# 0) 上游源码 + 补丁
-git clone --depth 1 https://github.com/router-for-me/CLIProxyAPI.git upstream-cliproxy
-scripts/apply-upstream-patch.sh
+> **先做第 0 步。** `upstream-cliproxy/` 和 `app/libs/cliproxy.aar` 都不在仓库里（前者是上游源码，
+> 后者是 39 MB 的编译产物，都由 CI 或本脚本生成）。而 `go-bridge/go.mod` 有一行
+> `replace github.com/router-for-me/CLIProxyAPI/v8 => ../upstream-cliproxy`，所以**没做第 0 步时
+> `go test`/`go build` 会直接失败**，报错指向一个不存在的目录。
 
-# 1) Go 桥接层（需要 Go >= 上游 go.mod 声明的版本）
+```bash
+# 0) 上游源码 + 本地补丁（必须先做）
+git clone --depth 1 https://github.com/router-for-me/CLIProxyAPI.git upstream-cliproxy
+scripts/apply-upstream-patch.sh          # 幂等；打不上会明确报错
+
+# 1) Go 桥接层。需要 Go >= go-bridge/go.mod 里声明的版本（当前 1.26.10）
 cd go-bridge
 go install golang.org/x/mobile/cmd/gomobile@latest
 go install golang.org/x/mobile/cmd/gobind@latest
-export ANDROID_HOME=/opt/android-sdk ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125
+# 下面是本项目的路径，换成你自己的 SDK；NDK 版本要和你装的一致
+export ANDROID_HOME=/opt/android-sdk
+export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125
 gomobile init
 go test -v ./cliproxymobile
 gomobile bind -target=android/arm64 -androidapi 28 -javapkg=me.routerfor.cliproxy \
@@ -347,9 +358,12 @@ gomobile bind -target=android/arm64 -androidapi 28 -javapkg=me.routerfor.cliprox
 
 # 2) APK
 cd ..
-printf "sdk.dir=$ANDROID_HOME\n" > local.properties
+printf "sdk.dir=$ANDROID_HOME\n" > local.properties   # 同样按自己的路径改
 ./gradlew assembleDebug
 ```
+
+只想读代码、不想构建的话，做完第 0 步就能 `cd go-bridge && go build ./...` 通过；Android 侧
+（`app/src/main/java/me/routerfor/cpa/`）是纯 Kotlin，不依赖 AAR 也能读。
 
 ### 为什么 `-ldflags=-checklinkname=0`
 
