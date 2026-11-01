@@ -216,13 +216,23 @@ class UpdateManager(private val context: Context) {
         }.onFailure { notes.append("内核检查失败：${it.message}\n") }
     }
 
-    /** (tag, soUrl, digest) for the newest release that carries a kernel asset. */
+    /**
+     * (tag, soUrl, digest) for the newest release that carries a kernel asset.
+     *
+     * "Newest" is decided here by comparing publish times, not by trusting the order of the API
+     * response. That order is not publication order: on the live repository the first entry was a
+     * kernel from three days earlier while the newest one sat fourth, so taking the first match
+     * picked a stale kernel — and a merely-older kernel still installs fine, so nothing would
+     * have reported it.
+     */
     private fun newestKernelRelease(repo: String): Triple<String, String, String>? {
         val json = httpGet(
             "https://api.github.com/repos/$repo/releases?per_page=20",
             accept = "application/vnd.github+json"
         )
         val releases = JSONArray(json)
+        var best: Triple<String, String, String>? = null
+        var bestAt = ""
         for (i in 0 until releases.length()) {
             val release = releases.getJSONObject(i)
             // Only the automatic upstream syncs carry a bare kernel; hand-cut releases ship the
@@ -230,6 +240,11 @@ class UpdateManager(private val context: Context) {
             if (!release.optBoolean("prerelease", false)) continue
             val tag = release.optString("tag_name")
             if (!tag.startsWith("upstream-")) continue
+            val publishedAt = release.optString("published_at")
+            // Compare timestamps so the freshest kernel wins regardless of response order. A
+            // release without a timestamp cannot be compared, so it only counts when nothing
+            // else has matched yet.
+            if (best != null && (publishedAt.isEmpty() || publishedAt < bestAt)) continue
             val assets = release.optJSONArray("assets") ?: continue
             for (j in 0 until assets.length()) {
                 val asset = assets.getJSONObject(j)
@@ -237,15 +252,17 @@ class UpdateManager(private val context: Context) {
                 if (name.contains("libgojni", ignoreCase = true) &&
                     name.endsWith(".so", ignoreCase = true)
                 ) {
-                    return Triple(
+                    best = Triple(
                         tag,
                         asset.optString("browser_download_url"),
                         asset.optString("digest")
                     )
+                    bestAt = publishedAt
+                    break
                 }
             }
         }
-        return null
+        return best
     }
 
     /**

@@ -35,9 +35,15 @@ class ProxyForegroundService : Service() {
      * That is the other half of the "connection drops until I restart it" report — the restart
      * worked because it was the only code path that rebuilt the engine.
      *
-     * The check is the engine's own live probe, so a healthy gateway costs one loopback connect
-     * every 20 seconds. Two consecutive failures are required before restarting, so a single
-     * slow probe cannot knock over a working gateway mid-request.
+     * The check is the engine's own live probe, so a healthy gateway costs a few loopback connects
+     * every 20 seconds.
+     *
+     * Three attempts per round, because the probe's own timeout is 150ms — deliberately short,
+     * since the UI calls the same code on the main thread. On a device that has just woken up, or
+     * one whose CPU is throttled by the scheduler, a single connect can lose that race while the
+     * engine is perfectly healthy: a real log line showed "miss 1" while the gateway answered 200
+     * in 18ms. Two consecutive *rounds* of three failures are required before restarting, so a
+     * transient stall never knocks over a working gateway.
      */
     private val watchdog = object : Runnable {
         private var misses = 0
@@ -47,12 +53,11 @@ class ProxyForegroundService : Service() {
                 handler.removeCallbacks(this)
                 return
             }
-            val alive = WebBridgeCompat.isRunning()
-            if (alive) {
+            if (engineAnswers()) {
                 misses = 0
             } else {
                 misses++
-                Log.w(TAG, "watchdog: engine not answering (miss $misses)")
+                Log.w(TAG, "watchdog: engine not answering (round $misses)")
                 if (misses >= WATCHDOG_MISSES) {
                     misses = 0
                     Log.w(TAG, "watchdog: restarting the gateway")
@@ -60,6 +65,19 @@ class ProxyForegroundService : Service() {
                 }
             }
             handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+        }
+
+        /** True when any of a few quick probes gets through. */
+        private fun engineAnswers(): Boolean {
+            repeat(WATCHDOG_PROBES) { attempt ->
+                if (WebBridgeCompat.isRunning()) return true
+                if (attempt < WATCHDOG_PROBES - 1) {
+                    // Back off a little: if the first probe lost a race with a waking CPU, the
+                    // next one a moment later usually wins.
+                    Thread.sleep(WATCHDOG_PROBE_BACKOFF_MS)
+                }
+            }
+            return false
         }
     }
 
@@ -279,5 +297,7 @@ class ProxyForegroundService : Service() {
         private const val WAKE_LOCK_TIMEOUT_MS = 12L * 60L * 60L * 1000L
         private const val WATCHDOG_INTERVAL_MS = 20_000L
         private const val WATCHDOG_MISSES = 2
+        private const val WATCHDOG_PROBES = 3
+        private const val WATCHDOG_PROBE_BACKOFF_MS = 120L
     }
 }
