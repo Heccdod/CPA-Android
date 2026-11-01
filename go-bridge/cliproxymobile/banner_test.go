@@ -24,7 +24,7 @@ func TestMigrateExistingConfigKeepsOneBanner(t *testing.T) {
 	// Migrate repeatedly: the first call adds models.catalog, which is what used to append a
 	// second copy, and any later call must stay a no-op.
 	for i := 0; i < 4; i++ {
-		if err := migrateExistingConfig(cfg, filepath.Join(dir, modelsFileName)); err != nil {
+		if err := migrateExistingConfig(cfg, filepath.Join(dir, modelsFileName), ""); err != nil {
 			t.Fatalf("migrate %d: %v", i, err)
 		}
 	}
@@ -88,7 +88,7 @@ func TestMigrateRestoresMissingConfigVersion(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte(original), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := migrateExistingConfig(cfg, catalog); err != nil {
+	if err := migrateExistingConfig(cfg, catalog, ""); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	raw, err := os.ReadFile(cfg)
@@ -120,7 +120,7 @@ func TestMigrateRepairsAlreadyRepeatedBanner(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte(original), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := migrateExistingConfig(cfg, catalog); err != nil {
+	if err := migrateExistingConfig(cfg, catalog, ""); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	raw, err := os.ReadFile(cfg)

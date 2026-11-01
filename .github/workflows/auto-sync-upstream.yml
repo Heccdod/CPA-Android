@@ -146,9 +146,13 @@ jobs:
           # Go 1.23+ linkname checker when they are linked into a c-shared library.
           # max-page-size=16384: Android 17 refuses to load a .so whose PT_LOAD segments are
           # only 4 KB aligned; the default arm64 link emits 4 KB.
+          # -s -w: without them the kernel ships its own DWARF tables — 13.5 MB of .debug_info
+          # and 8.8 MB of .debug_loclists — that nothing on the phone reads. Stripping takes the
+          # .so from 94.8 MB to 59.5 MB (32.5 MB to 18.5 MB packed), which is the largest size
+          # win available here.
           gomobile bind -target=android/arm64 -androidapi 28 \
             -javapkg=me.routerfor.cliproxy \
-            -ldflags="-checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+            -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
             -o ../app/libs/cliproxy.aar ./cliproxymobile
           ls -l ../app/libs/cliproxy.aar
 

@@ -307,6 +307,14 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, ui.dp(10), 0, 0)
         }
         startStopButton = ui.button(getString(R.string.action_restart)) { toggleGateway() }
+        startStopButton.setOnLongClickListener {
+            if (WebBridgeCompat.isRunning()) {
+                confirmStopGateway()
+                true
+            } else {
+                false
+            }
+        }
         row2.addView(startStopButton, ui.rowWeight())
         row2.addView(ui.gap(ui.dp(10)))
         row2.addView(ui.button(getString(R.string.action_settings)) { openSettings() }, ui.rowWeight())
@@ -742,19 +750,27 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- state
 
     private fun refresh(animate: Boolean = false) {
-        val running = WebBridgeCompat.isRunning()
+        // One call, one state. Reading liveness and the error message separately let a repaint
+        // straddle a stop and show a state that never existed; the engine answers under a single
+        // lock after a live probe, and it knows whether the user asked for the gateway to run.
+        val status = WebBridgeCompat.status()
+        val running = status == GatewayStatus.RUNNING
         val error = WebBridgeCompat.lastError()
         val address = WebBridgeCompat.listenAddress()
 
-        statusText.text = when {
-            running -> getString(R.string.state_running)
-            !error.isNullOrEmpty() -> getString(R.string.state_error)
+        statusText.text = when (status) {
+            GatewayStatus.RUNNING -> getString(R.string.state_running)
+            GatewayStatus.ERROR -> getString(R.string.state_error)
+            // Deliberately stopped is not "starting": that collapse is what made the screen
+            // claim the gateway was coming up forever after a stop from the notification.
+            GatewayStatus.STOPPED -> getString(R.string.state_stopped)
             else -> getString(R.string.state_starting)
         }
         statusDot.background?.setTint(
-            when {
-                running -> ui.colors.ok
-                !error.isNullOrEmpty() -> ui.colors.err
+            when (status) {
+                GatewayStatus.RUNNING -> ui.colors.ok
+                GatewayStatus.ERROR -> ui.colors.err
+                GatewayStatus.STOPPED -> ui.colors.textTertiary
                 else -> ui.colors.warn
             }
         )
@@ -768,19 +784,30 @@ class MainActivity : AppCompatActivity() {
             val hot = if (AppPrefs.hotUpdateEnabled(this)) getString(R.string.hot_on) else getString(R.string.hot_off)
             "内核 " + BuildConfig.VERSION_NAME + " · 热更新" + hot
         }
-        startStopButton.text = if (running) getString(R.string.action_restart) else getString(R.string.action_start)
+        // Three-way, not two: "running" offers 重启 because that is what a stalled gateway
+        // needs, and everything else offers 启动 — including STOPPED, which previously offered
+        // 启动 while the label above it said 正在启动.
+        startStopButton.text = if (running) {
+            getString(R.string.action_restart)
+        } else {
+            getString(R.string.action_start)
+        }
 
         // Repaint only: the quota snapshot is owned by fetchQuota(), and passing nothing here
         // keeps whatever it last collected instead of blanking the expanded notification.
 
         // The inventory is read as soon as the gateway answers, and again on any later retry
-        // that finds it up after it was down.
+        // that finds it up after it was down. A stopped gateway keeps whatever account list is
+        // already on screen — wiping it made the provider card vanish on stop, which read as
+        // "my accounts are gone".
         if (running && !accountsLoaded) loadAccounts()
 
         if (animate) playEntrance()
         firstPaint = false
 
-        if (!running && retryCount < MAX_RETRY) {
+        // Only keep polling while a start is genuinely in flight. Retrying against STOPPED
+        // burned all 30 attempts in 21 seconds and then sat on a wrong label.
+        if (status == GatewayStatus.STARTING && retryCount < MAX_RETRY) {
             retryCount++
             statusCard.postDelayed({ refresh() }, 700L)
         }
@@ -799,7 +826,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Asks the service to start the gateway — unless the user stopped it last time.
+     *
+     * START_STICKY brings the service back after the process is killed, and onCreate used to
+     * call startGateway() unconditionally, so a deliberate stop lasted only until the system
+     * decided to recreate the service. The persisted intent decides instead.
+     */
     private fun startGateway() {
+        if (!AppPrefs.gatewayWanted(this)) return
         ContextCompat.startForegroundService(
             this,
             Intent(this, ProxyForegroundService::class.java).setAction(ProxyForegroundService.ACTION_START)
@@ -807,12 +842,25 @@ class MainActivity : AppCompatActivity() {
         statusCard.postDelayed({ refresh() }, 900L)
     }
 
+    /**
+     * Start or restart from the home screen.
+     *
+     * Long-press is the stop: a plain tap on a running gateway should restart it (the common
+     * recovery action), but until now stopping was reachable only from the notification, so a
+     * user who swiped the notification away had no way back. The long-press asks first, because
+     * stopping a gateway a client is mid-conversation with is not something to do by accident.
+     */
     private fun toggleGateway() {
         val action = if (WebBridgeCompat.isRunning()) {
             ProxyForegroundService.ACTION_RESTART
         } else {
             ProxyForegroundService.ACTION_START
         }
+        // A manual tap is an explicit request, so it also revives a gateway the user had
+        // stopped: the intent is recorded here rather than left to the service so that the
+        // status the screen reads next is already correct.
+        AppPrefs.setGatewayWanted(this, true)
+        WebBridgeCompat.setDesiredRunning(true)
         ContextCompat.startForegroundService(
             this,
             Intent(this, ProxyForegroundService::class.java).setAction(action)
@@ -820,6 +868,27 @@ class MainActivity : AppCompatActivity() {
         toast(if (action == ProxyForegroundService.ACTION_RESTART) "正在重启网关" else "正在启动网关")
         retryCount = 0
         statusCard.postDelayed({ refresh(animate = true) }, 1200L)
+    }
+
+    /** Long-press on the start/stop button: stop the gateway on purpose. */
+    private fun confirmStopGateway() {
+        MaterialAlertDialogBuilder(ui.dialogContext())
+            .setTitle(R.string.stop_confirm_title)
+            .setMessage(R.string.stop_confirm_body)
+            .setNegativeButton("取消", null)
+            .setPositiveButton(R.string.action_stop) { _, _ ->
+                AppPrefs.setGatewayWanted(this, false)
+                WebBridgeCompat.setDesiredRunning(false)
+                ContextCompat.startForegroundService(
+                    this,
+                    Intent(this, ProxyForegroundService::class.java)
+                        .setAction(ProxyForegroundService.ACTION_STOP)
+                )
+                toast(getString(R.string.toast_stopping))
+                retryCount = 0
+                statusCard.postDelayed({ refresh(animate = true) }, 900L)
+            }
+            .show()
     }
 
     private fun openPanel() {

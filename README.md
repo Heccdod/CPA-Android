@@ -342,7 +342,7 @@ export ANDROID_HOME=/opt/android-sdk ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.109
 gomobile init
 go test -v ./cliproxymobile
 gomobile bind -target=android/arm64 -androidapi 28 -javapkg=me.routerfor.cliproxy \
-  -ldflags="-checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+  -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
   -o ../app/libs/cliproxy.aar ./cliproxymobile
 
 # 2) APK
@@ -358,6 +358,30 @@ printf "sdk.dir=$ANDROID_HOME\n" > local.properties
 的 linkname 校验器会拒绝该引用（`link: github.com/wlynxg/anet: invalid reference to net.zoneCache`），
 只有编 `c-shared` 时才暴露。关闭该校验只影响这条 linkname，不改变运行语义（`anet` 在 Android 上走自己的
 netlink 实现）。
+
+### 为什么 `-ldflags` 里还有 `-s -w`
+
+`gomobile bind` 默认**不剥符号**，内核 `.so` 里带着完整的 DWARF 调试表。实测这份内核：
+
+| 节 | 大小 |
+| :--- | ---: |
+| `.debug_info` | 13.5 MB |
+| `.debug_loclists` | 8.8 MB |
+| `.debug_rnglists` | 1.9 MB |
+| 合计（含其他 debug 节） | **约 35 MB** |
+
+手机上没有任何东西读它们。加 `-s -w` 之后：
+
+| | `.so` 原始 | 压缩后 |
+| :--- | ---: | ---: |
+| 不加 | 94.76 MB | 32.47 MB |
+| 加 `-s -w` | **59.47 MB** | **18.55 MB** |
+
+16 KB 页对齐不受影响（四个 PT_LOAD 仍全 `0x4000`），`scripts/check16k.py` 会盯着这一点。
+于是 release APK 34.4 → **23.2 MB**（debug 变体的对齐填充见下文，别拿它衡量体积）。
+
+R8（`isMinifyEnabled`）保持关闭：内核已经剥过，R8 只能再省约 0.5 MB，却会重命名自己的类并留下反射风险，
+不值得。
 
 ## 运行
 
@@ -494,7 +518,7 @@ I CpaWeb: dom "root=2 body=1581"  ← 仪表盘渲染完成
 ```bash
 gomobile bind -target=android/arm64 -androidapi 28 \
   -javapkg=me.routerfor.cliproxy \
-  -ldflags="-checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
+  -ldflags="-s -w -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384" \
   -o ../app/libs/cliproxy.aar ./cliproxymobile
 ```
 
@@ -546,10 +570,19 @@ callback forwarder for antigravity listening on 0.0.0.0:51121。
 ./gradlew assembleDebug -PwithEmulatorAbi=true
 ```
 
-`abiFilters` 默认只有 `arm64-v8a`，所以真机包只带一份 `libgojni.so`（未压缩约 93 MB）。
-APK 文件本身约 70 MB，比 37 MB 的压缩内容更大，原因不是打了两遍：SO 未压缩存放且要做
-16 KB 对齐，zipalign 在它后面留了约 32 MB 的填充空洞。`unzip -lv` 能看到这条空洞
-（`assets/models.json` 的偏移量比前一条记录结束处大出一大截）。
+`abiFilters` 默认只有 `arm64-v8a`，所以真机包只带一份 `libgojni.so`（剥符号后未压缩 59.5 MB）。
+
+两个变体的体积差别很大，**别用 debug 包判断体积**：
+
+| 变体 | 文件 | 压缩内容 | 对齐填充 | 原始 `.so` |
+| :--- | ---: | ---: | ---: | ---: |
+| release | **23.2 MB** | 23.1 MB | 0 | 59.5 MB |
+| debug | 46.0 MB | 25.7 MB | **20.1 MB** | 59.5 MB |
+
+填充来自 AGP 的 `zipAlignDebug`：debug 变体把 `.so` 以 stored（不压缩）方式存放并留出对齐空间，
+release 变体则压缩后紧跟下一条记录。所以「文件比内容大 20 MB」不是打了两遍，而是一段
+全零的空洞 —— `unzip -lv` 里 `assets/models.json` 的偏移量比前一条记录的结束位置大出一大截。
+真要装到手机上，用 release 包。
 
 ## 真机实测
 

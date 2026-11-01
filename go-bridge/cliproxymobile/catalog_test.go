@@ -28,7 +28,7 @@ func TestEnsureCatalogKeyPreservesConfig(t *testing.T) {
 	}
 
 	catalog := filepath.Join(dir, modelsFileName)
-	if err := migrateExistingConfig(cfg, catalog); err != nil {
+	if err := migrateExistingConfig(cfg, catalog, ""); err != nil {
 		t.Fatalf("migrateExistingConfig: %v", err)
 	}
 
@@ -61,11 +61,11 @@ func TestEnsureCatalogKeyIdempotent(t *testing.T) {
 	}
 	catalog := filepath.Join(dir, modelsFileName)
 
-	if err := migrateExistingConfig(cfg, catalog); err != nil {
+	if err := migrateExistingConfig(cfg, catalog, ""); err != nil {
 		t.Fatalf("first patch: %v", err)
 	}
 	first, _ := os.ReadFile(cfg)
-	if err := migrateExistingConfig(cfg, catalog); err != nil {
+	if err := migrateExistingConfig(cfg, catalog, ""); err != nil {
 		t.Fatalf("second patch: %v", err)
 	}
 	second, _ := os.ReadFile(cfg)

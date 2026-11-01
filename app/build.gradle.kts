@@ -18,8 +18,8 @@ android {
         // Personal-use build: the API 28 compatibility mode keeps cleartext loopback HTTP
         // and System.load() of a .so from the private hot-update dir working.
         targetSdk = 28
-        versionCode = 6
-        versionName = "2.4.0"
+        versionCode = 7
+        versionName = "2.5.0"
         // Shipped update channel: the app reads releases/latest from this repository only.
         buildConfigField("String", "UPDATE_REPO", "\"Heccdod/CPA-Android\"")
         buildConfigField("String", "RULES_URL", "\"https://raw.githubusercontent.com/Heccdod/CPA-Android/main/rules/config.yaml\"")
@@ -58,6 +58,10 @@ android {
 
     buildTypes {
         release {
+            // Minification stays off on purpose. Measured: with the kernel .so already stripped
+            // (20.1 MB of a 20.8 MB APK), R8 only removes about 0.5 MB — while it renames the
+            // app's own classes and can break reflection the compiler cannot see. Not worth the
+            // risk for 2% when the same effort went into the .so, which was 30 MB of the file.
             isMinifyEnabled = false
             signingConfig = if (releaseKeystore.exists()) {
                 signingConfigs.getByName("release")

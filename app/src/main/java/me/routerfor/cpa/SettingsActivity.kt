@@ -229,6 +229,61 @@ class SettingsActivity : AppCompatActivity() {
         return card
     }
 
+    /**
+     * A card whose value is chosen from a fixed list: tapping the row opens a single-choice
+     * dialog and the current option is shown underneath the title.
+     *
+     * Used instead of a switch when the honest answer is not yes/no. The theme picker builds its
+     * rows inline because each option needs an icon; this one is for plain text options.
+     */
+    private fun buildChoiceCard(
+        title: String,
+        summary: String,
+        options: List<Pair<String, String>>,
+        current: String,
+        onPick: (String) -> Unit
+    ): View {
+        val card = ui.card(bottomMargin = 6)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(ui.dp(18), ui.dp(14), ui.dp(18), ui.dp(14))
+            setOnClickListener {
+                val labels = options.map { it.second }.toTypedArray()
+                val index = options.indexOfFirst { it.first == current }.coerceAtLeast(0)
+                MaterialAlertDialogBuilder(ui.dialogContext())
+                    .setTitle(title)
+                    .setSingleChoiceItems(labels, index) { dialog, which ->
+                        dialog.dismiss()
+                        onPick(options[which].first)
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+        }
+        val labels = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        labels.addView(TextView(this).apply {
+            text = title
+            textSize = 15f
+            setTextColor(ui.colors.textPrimary)
+            includeFontPadding = false
+        })
+        labels.addView(TextView(this).apply {
+            text = summary
+            textSize = 12f
+            setTextColor(ui.colors.textSecondary)
+            setPadding(0, ui.dp(4), 0, 0)
+        })
+        row.addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(TextView(this).apply {
+            text = "›"
+            textSize = 18f
+            setTextColor(ui.colors.textTertiary)
+        })
+        card.addView(row)
+        return card
+    }
+
     private fun buildLanCard(): View =
         buildSwtichCard(
             getString(R.string.settings_lan),
@@ -266,21 +321,28 @@ class SettingsActivity : AppCompatActivity() {
         }
 
     /**
-     * Makes the upstream include the model's reasoning in the response.
+     * How much of the token budget the model may spend thinking before it answers.
      *
-     * Implemented by rewriting the requests.payload.override rule, so the behavior is visible
-     * in config.yaml and survives an upstream sync. On by default; every request pays for the
-     * thought tokens while it is on.
+     * Three options rather than an on/off switch, because the measured behaviour does not split
+     * that way: visible reasoning only appears at medium effort and above, and those settings
+     * consume the whole budget of a short-token client. The dialog spells out the numbers so the
+     * choice is not a guess.
      */
-    private fun buildThinkingCard(): View =
-        buildSwtichCard(
+    private fun buildThinkingCard(): View {
+        return buildChoiceCard(
             getString(R.string.settings_thinking),
-            getString(R.string.settings_thinking_desc),
-            AppPrefs.thinkingVisible(this)
-        ) { on ->
-            AppPrefs.setThinkingVisible(this, on)
+            AppPrefs.thinkingSummary(this),
+            listOf(
+                AppPrefs.THINKING_COMPACT to getString(R.string.settings_thinking_compact),
+                AppPrefs.THINKING_VISIBLE to getString(R.string.settings_thinking_visible),
+                AppPrefs.THINKING_OFF to getString(R.string.settings_thinking_off)
+            ),
+            AppPrefs.thinkingMode(this)
+        ) { mode ->
+            AppPrefs.setThinkingMode(this, mode)
             applyQuickSettings()
         }
+    }
 
     private fun buildHotUpdateCard(): View {
         val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -428,7 +490,12 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun editConfig() {
         val configFile = File(filesDir, "config.yaml")
-        WebBridgeCompat.ensureDefaultConfig(filesDir.absolutePath, AppPrefs.proxyUrl(this), AppPrefs.allowLan(this))
+        WebBridgeCompat.ensureDefaultConfig(
+            filesDir.absolutePath,
+            AppPrefs.proxyUrl(this),
+            AppPrefs.allowLan(this),
+            AppPrefs.thinkingMode(this)
+        )
         val editor = EditText(this).apply {
             setText(if (configFile.exists()) configFile.readText() else "")
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -451,7 +518,8 @@ class SettingsActivity : AppCompatActivity() {
                 WebBridgeCompat.ensureDefaultConfig(
                     filesDir.absolutePath,
                     AppPrefs.proxyUrl(this),
-                    AppPrefs.allowLan(this)
+                    AppPrefs.allowLan(this),
+                    AppPrefs.thinkingMode(this)
                 )
                 toast("已恢复默认配置")
                 render()
@@ -466,7 +534,7 @@ class SettingsActivity : AppCompatActivity() {
             AppPrefs.proxyUrl(this),
             AppPrefs.allowLan(this),
             AppPrefs.sensitiveWords(this),
-            AppPrefs.thinkingVisible(this)
+            AppPrefs.thinkingMode(this)
         )
         if (err.isEmpty()) {
             toast("已保存，引擎正在热重载")

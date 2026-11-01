@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -20,7 +22,46 @@ import java.io.File
  */
 class ProxyForegroundService : Service() {
 
+    /** The service runs on the main looper, so the watchdog can repaint without a new thread. */
+    private val handler = Handler(Looper.getMainLooper())
+
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * Watches the engine while the user wants it running.
+     *
+     * The engine can die without anything noticing: its goroutine records the error and exits,
+     * the port stops answering, and the app keeps showing 运行中 because nothing ever asks again.
+     * That is the other half of the "connection drops until I restart it" report — the restart
+     * worked because it was the only code path that rebuilt the engine.
+     *
+     * The check is the engine's own live probe, so a healthy gateway costs one loopback connect
+     * every 20 seconds. Two consecutive failures are required before restarting, so a single
+     * slow probe cannot knock over a working gateway mid-request.
+     */
+    private val watchdog = object : Runnable {
+        private var misses = 0
+
+        override fun run() {
+            if (!AppPrefs.gatewayWanted(this@ProxyForegroundService)) {
+                handler.removeCallbacks(this)
+                return
+            }
+            val alive = WebBridgeCompat.isRunning()
+            if (alive) {
+                misses = 0
+            } else {
+                misses++
+                Log.w(TAG, "watchdog: engine not answering (miss $misses)")
+                if (misses >= WATCHDOG_MISSES) {
+                    misses = 0
+                    Log.w(TAG, "watchdog: restarting the gateway")
+                    startGateway(restart = true)
+                }
+            }
+            handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -28,6 +69,12 @@ class ProxyForegroundService : Service() {
         super.onCreate()
         HotSoLoader.loadEngine(applicationContext)
         createChannel()
+        // Tell the engine what the user wants before anything reads its status. START_STICKY
+        // means this service can be recreated by the system long after a stop, and the engine
+        // would otherwise report "starting" for a gateway nobody asked to run.
+        WebBridgeCompat.setDesiredRunning(AppPrefs.gatewayWanted(this))
+        NetworkWatcher.start(this)
+        handler.postDelayed(watchdog, WATCHDOG_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -39,15 +86,24 @@ class ProxyForegroundService : Service() {
                 return START_STICKY
             }
             ACTION_STOP -> {
+                // Record the intent before tearing anything down: the home screen reads it to
+                // distinguish "stopped on purpose" from "still starting", and it has to be in
+                // place before the engine disappears.
+                AppPrefs.setGatewayWanted(this, false)
+                WebBridgeCompat.setDesiredRunning(false)
                 stopGateway()
                 stopForegroundCompat()
                 stopSelf()
                 return START_NOT_STICKY
             }
             ACTION_RESTART -> {
+                AppPrefs.setGatewayWanted(this, true)
+                WebBridgeCompat.setDesiredRunning(true)
                 startGateway(restart = true)
             }
             else -> {
+                AppPrefs.setGatewayWanted(this, true)
+                WebBridgeCompat.setDesiredRunning(true)
                 startGateway(restart = false)
             }
         }
@@ -55,6 +111,8 @@ class ProxyForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        NetworkWatcher.stop(this)
         releaseWakeLock()
         super.onDestroy()
     }
@@ -85,8 +143,15 @@ class ProxyForegroundService : Service() {
         // copy it out first: config.yaml points models.catalog at this path. It is overwritten
         // every start because it carries no user state — an app update must refresh it.
         installModelsCatalog(File(dataDir))
-        // Seed filesDir/config.yaml + filesDir/auths before the engine reads them.
-        val ensureError = WebBridgeCompat.ensureDefaultConfig(dataDir, "", false)
+        // Seed filesDir/config.yaml + filesDir/auths before the engine reads them. The thinking
+        // mode has to be the user's current choice: the Go side rewrites the payload rule to
+        // match, so passing a default here would silently undo the setting on every start.
+        val ensureError = WebBridgeCompat.ensureDefaultConfig(
+            dataDir,
+            AppPrefs.proxyUrl(this),
+            AppPrefs.allowLan(this),
+            AppPrefs.thinkingMode(this)
+        )
         if (ensureError.isNotEmpty()) {
             Log.w(TAG, "ensureDefaultConfig: $ensureError")
         }
@@ -208,5 +273,7 @@ class ProxyForegroundService : Service() {
         private const val MODELS_FILE = "models.json"
         private const val WAKE_LOCK_TAG = "me.routerfor.cpa:gateway"
         private const val WAKE_LOCK_TIMEOUT_MS = 12L * 60L * 60L * 1000L
+        private const val WATCHDOG_INTERVAL_MS = 20_000L
+        private const val WATCHDOG_MISSES = 2
     }
 }

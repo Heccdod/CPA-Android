@@ -129,3 +129,283 @@ index bdb56aa..7b5b514 100644
  
  		payload = applyAntigravityNativeSignatureReplayIfNeeded(modelName, payload)
  		payload = helps.FinalizePayload(ctx, payload)
+diff --git a/internal/runtime/executor/antigravity_executor_stream.go b/internal/runtime/executor/antigravity_executor_stream.go
+index bba3a96..e569898 100644
+--- a/internal/runtime/executor/antigravity_executor_stream.go
++++ b/internal/runtime/executor/antigravity_executor_stream.go
+@@ -9,6 +9,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+@@ -22,6 +23,20 @@ import (
+ 	"github.com/tidwall/sjson"
+ )
+ 
++// antigravityStreamIdleTimeout is how long a streaming response may go without a single byte
++// before the connection is treated as dead.
++//
++// Chosen to sit above the engine's own keep-alive interval (15s default) with plenty of room: a
++// thinking model can legitimately pause, and the keep-alive comments themselves count as data.
++const antigravityStreamIdleTimeout = 90 * time.Second
++
++// antigravityStreamGraceTimeout is how long to keep reading after a terminal frame.
++//
++// Long enough for the usage/signature frames that split-terminal streams send afterwards (the
++// upstream's accounting lives there), short enough that a client is never left waiting on a
++// socket the model is finished with.
++const antigravityStreamGraceTimeout = 2 * time.Second
++
+ // ExecuteStream performs a streaming request to the Antigravity API.
+ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+ 	if opts.Alt == "responses/compact" {
+@@ -209,6 +224,40 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+ 				log.Errorf("antigravity executor: close response line error: %v", errClose)
+ 			}
+ 		}()
++		// Idle watchdog. The streaming HTTP client is built with timeout=0 — a stream may
++		// legitimately run for minutes — so nothing else stops a connection that goes quiet
++		// without closing. On a phone that is the normal shape of a network change: the socket
++		// stays "open", the 15s keep-alive comments keep it looking healthy, and the request
++		// never ends. Closing the body makes the scanner return, which turns a silent hang
++		// into an error the client can act on.
++		idle := time.AfterFunc(antigravityStreamIdleTimeout, func() {
++			log.Warnf("antigravity executor: no data for %s, closing the upstream stream", antigravityStreamIdleTimeout)
++			_ = resp.Body.Close()
++		})
++		defer idle.Stop()
++		// Grace timer. A terminal frame does not always come last: the upstream may still send
++		// a usage or signature block in a following frame, and those carry the token accounting.
++		// Breaking on finish_reason would drop them (the split-usage tests catch exactly that),
++		// so instead the connection is closed a short moment later — long enough for the tail
++		// frames, short enough that a client is not left waiting on a socket the model is done
++		// with.
++		var graceArmed atomic.Bool
++		var graceClosed atomic.Bool
++		var graceTimer *time.Timer
++		armGrace := func() {
++			if graceArmed.Swap(true) {
++				return
++			}
++			graceTimer = time.AfterFunc(antigravityStreamGraceTimeout, func() {
++				graceClosed.Store(true)
++				_ = resp.Body.Close()
++			})
++		}
++		defer func() {
++			if graceTimer != nil {
++				graceTimer.Stop()
++			}
++		}()
+ 		scanner := bufio.NewScanner(resp.Body)
+ 		scanner.Buffer(nil, streamScannerBuffer)
+ 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
+@@ -217,6 +266,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+ 		var pendingJSON []byte
+ 		var replayCommitted bool
+ 		var terminalDelivered bool
++		var tailEmitted bool
+ 		var param any
+ 		commitReplay := func() {
+ 			if !replayCommitted && replayAccumulator != nil && replayAccumulator.terminal && helps.ApplyPatchTranslationError(param) == nil {
+@@ -224,6 +274,24 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+ 				replayCommitted = true
+ 			}
+ 		}
++		// emitSyntheticTail translates [DONE] and forwards it. Declared after commitReplay
++		// because Go evaluates the closure body at call time but the identifier must already
++		// be in scope. Both paths need it: the terminal-frame path (normal case) and the EOF
++		// path (upstream closed without a finish_reason, which real tool-call streams do).
++		emitSyntheticTail := func() {
++			tail := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, []byte("[DONE]"), &param, claudeInputTokens)
++			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
++			// Commit upstream output before the synthetic completion reaches interceptors.
++			// Commit itself rejects partial streams without an upstream terminal.
++			commitReplay()
++			for i := range tail {
++				select {
++				case out <- cliproxyexecutor.StreamChunk{Payload: tail[i]}:
++				case <-ctx.Done():
++					return
++				}
++			}
++		}
+ 		defer func() {
+ 			defer stopDeliverySupport()
+ 			if helps.ApplyPatchTranslationError(param) != nil {
+@@ -261,6 +329,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+ 		}()
+ 		helps.InitializeApplyPatchStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, &param)
+ 		for scanner.Scan() {
++			idle.Reset(antigravityStreamIdleTimeout)
+ 			line := scanner.Bytes()
+ 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+ 			if replayAccumulator != nil {
+@@ -370,6 +439,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+ 			}
+ 			if isTerminalChunk {
+ 				terminalDelivered = true
++				// The model is done, but the socket usually is not: Antigravity routinely
++				// leaves the connection open after its terminal frame, and an OpenAI-compatible
++				// client ends a stream on [DONE] rather than on finish_reason. Waiting for EOF
++				// is what left SillyTavern sitting on "generating" forever — the 15s keep-alive
++				// comments kept the connection looking alive. Arm the grace timer so the tail
++				// frames still arrive and the stream then ends on its own.
++				armGrace()
+ 			}
+ 			if helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
+ 				return
+@@ -378,7 +454,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+ 		if helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
+ 			return
+ 		}
+-		if errScan := scanner.Err(); errScan != nil {
++		errScan := scanner.Err()
++		// The grace timer closes the body on purpose once the model has finished. That makes
++		// the scanner report a read error on a stream that actually completed, and treating it
++		// as a failure would turn every normal reply into an error the client has to recover
++		// from. A terminal frame plus our own close is a clean end.
++		closedOnPurpose := errScan != nil && terminalDelivered && graceClosed.Load()
++		if errScan != nil && !closedOnPurpose {
+ 			streamErr = errScan
+ 			if errors.Is(errScan, context.Canceled) && ctx.Err() != nil {
+ 				if terminalDelivered {
+@@ -400,17 +482,11 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+ 			// stream as a successful completion. A clean EOF is a normal end
+ 			// even without finishReason: real Antigravity tool-call streams
+ 			// end that way (see antigravityNoFinishReasonSSE).
+-			tail := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, []byte("[DONE]"), &param, claudeInputTokens)
+-			helps.RecordApplyPatchStreamFailure(ctx, param, reporter, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage})
+-			// Commit upstream output before EOF-generated completion reaches interceptors.
+-			// Commit itself rejects partial streams without an upstream terminal.
+-			commitReplay()
+-			for i := range tail {
+-				select {
+-				case out <- cliproxyexecutor.StreamChunk{Payload: tail[i]}:
+-				case <-ctx.Done():
+-					return
+-				}
++			//
++			// When a terminal frame was already handled, this loop already emitted the tail
++			// and broke out; nothing is left to do.
++			if !tailEmitted {
++				emitSyntheticTail()
+ 			}
+ 			terminalDelivered = true
+ 		}
+diff --git a/internal/runtime/executor/antigravity_executor_stream_hold_test.go b/internal/runtime/executor/antigravity_executor_stream_hold_test.go
+new file mode 100644
+index 0000000..02f740c
+--- /dev/null
++++ b/internal/runtime/executor/antigravity_executor_stream_hold_test.go
+@@ -0,0 +1,107 @@
++package executor
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
++	"github.com/tidwall/gjson"
++)
++
++// TestAntigravityStreamEndsWhenUpstreamHoldsTheSocket covers the shape that left
++// SillyTavern on "generating" forever: the model finishes, the terminal frame arrives, and the
++// upstream then keeps the connection open, emitting only keep-alive comments.
++//
++// An OpenAI-compatible client ends a stream on [DONE] and ignores finish_reason (SillyTavern
++// looks for nothing else), so waiting for EOF meant waiting for a socket the model was finished
++// with — until a TCP timeout, or indefinitely while the keep-alive comments kept it healthy.
++func TestAntigravityStreamEndsWhenUpstreamHoldsTheSocket(t *testing.T) {
++	release := make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":7,\"totalTokenCount\":12},\"modelVersion\":\"gemini-3.7-flash\",\"responseId\":\"resp-hold\"}}\n\n")
++		if flusher, ok := w.(http.Flusher); ok {
++			flusher.Flush()
++		}
++		// Hold the connection open, exactly like a real upstream that does not close after its
++		// terminal frame. Keep-alives keep it looking alive to anything watching bytes.
++		for {
++			select {
++			case <-r.Context().Done():
++				return
++			case <-release:
++				return
++			case <-time.After(50 * time.Millisecond):
++				_, _ = io.WriteString(w, ": keep-alive\n\n")
++				if flusher, ok := w.(http.Flusher); ok {
++					flusher.Flush()
++				}
++			}
++		}
++	}))
++	defer server.Close()
++	defer close(release)
++
++	executor := NewAntigravityExecutor(&config.Config{
++		Antigravity:  config.AntigravityConfig{},
++		RequestRetry: 1,
++	})
++	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
++		Metadata: map[string]any{
++			"access_token": "token-123",
++			"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
++			"project_id":   "project-1",
++		},
++		Attributes: map[string]string{"base_url": server.URL},
++	}, cliproxyexecutor.Request{
++		Model:   "gemini-3.7-flash",
++		Payload: []byte(`{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"hello"}],"stream":true}`),
++	}, cliproxyexecutor.Options{
++		SourceFormat:   sdktranslator.FormatOpenAI,
++		ResponseFormat: sdktranslator.FormatOpenAI,
++		Stream:         true,
++	})
++	if errExecute != nil {
++		t.Fatalf("ExecuteStream() error = %v", errExecute)
++	}
++
++	// The whole point: this must return on its own. Before the grace timer the channel stayed
++	// open for as long as the upstream held the socket, so reading it blocked forever.
++	deadline := time.After(antigravityStreamGraceTimeout + 8*time.Second)
++	var (
++		sawExit   bool
++		sawFinish bool
++	)
++	for !sawExit {
++		select {
++		case chunk, ok := <-result.Chunks:
++			if !ok {
++				sawExit = true
++				break
++			}
++			if chunk.Err != nil {
++				t.Fatalf("unexpected stream error: %v", chunk.Err)
++			}
++			if gjson.GetBytes(chunk.Payload, "choices.0.finish_reason").String() != "" {
++				sawFinish = true
++				// The terminal frame must carry the accounting even though the connection was
++				// still open when it arrived.
++				if got := gjson.GetBytes(chunk.Payload, "usage.total_tokens").Int(); got != 12 {
++					t.Fatalf("terminal total_tokens = %d, want 12", got)
++				}
++			}
++		case <-deadline:
++			t.Fatal("stream never ended while the upstream held the socket open")
++		}
++	}
++	if !sawFinish {
++		t.Fatal("no terminal chunk before the stream ended")
++	}
++}

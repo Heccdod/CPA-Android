@@ -24,6 +24,9 @@
     <string name="action_add_provider">添加账号</string>
     <string name="action_start">启动</string>
     <string name="action_copied">已复制</string>
+    <string name="stop_confirm_title">停止网关？</string>
+    <string name="stop_confirm_body">正在使用这个网关的客户端会立即断开，直到你再次启动。长按只是为了确认这不是误触。</string>
+    <string name="toast_stopping">正在停止网关</string>
     <string name="action_settings">设置</string>
 
     <string name="section_quick">快捷操作</string>
@@ -77,6 +80,8 @@
     <string name="settings_status_quota">状态栏显示 5h 额度</string>
     <string name="settings_status_quota_desc">下拉展开网关通知，按账号与模型族显示 5 小时限额和重置时间</string>
     <string name="action_ok">好</string>
-    <string name="settings_thinking">显示思维链</string>
-    <string name="settings_thinking_desc">让上游返回模型的思考过程，客户端才能显示。开启后每次请求都会产生思考 token</string>
+    <string name="settings_thinking">思考预算</string>
+    <string name="settings_thinking_compact">不思考（默认）· 正文最长</string>
+    <string name="settings_thinking_visible">显示思维链 · 需要约 1000 以上预算</string>
+    <string name="settings_thinking_off">不写规则 · 让模型自己决定</string>
 </resources>

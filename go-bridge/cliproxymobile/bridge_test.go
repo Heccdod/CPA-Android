@@ -21,7 +21,7 @@ import (
 func TestBridgeLifecycle(t *testing.T) {
 	dir := t.TempDir()
 
-	if msg := EnsureDefaultConfig(dir, "", false); msg != "" {
+	if msg := EnsureDefaultConfig(dir, "", false, ThinkingCompact); msg != "" {
 		t.Fatalf("EnsureDefaultConfig failed: %s", msg)
 	}
 	cfgPath := filepath.Join(dir, ConfigFileName)
@@ -85,7 +85,7 @@ func TestBridgeLifecycle(t *testing.T) {
 	}
 
 	// Hot reload: rewrite the config in place exactly like the Android L2 channel.
-	if msg := UpdateQuickSettings(dir, "socks5://127.0.0.1:7890", false, "alpha,beta,Codex", true); msg != "" {
+	if msg := UpdateQuickSettings(dir, "socks5://127.0.0.1:7890", false, "alpha,beta,Codex", ThinkingCompact); msg != "" {
 		t.Fatalf("UpdateQuickSettings failed: %s", msg)
 	}
 	updated, err := os.ReadFile(cfgPath)
@@ -133,10 +133,10 @@ func TestBridgeLifecycle(t *testing.T) {
 // TestUpdateQuickSettingsRestoresDefaults verifies the empty CSV fallback.
 func TestUpdateQuickSettingsRestoresDefaults(t *testing.T) {
 	dir := t.TempDir()
-	if msg := EnsureDefaultConfig(dir, "", true); msg != "" {
+	if msg := EnsureDefaultConfig(dir, "", true, ThinkingCompact); msg != "" {
 		t.Fatalf("EnsureDefaultConfig failed: %s", msg)
 	}
-	if msg := UpdateQuickSettings(dir, "", true, "", true); msg != "" {
+	if msg := UpdateQuickSettings(dir, "", true, "", ThinkingVisible); msg != "" {
 		t.Fatalf("UpdateQuickSettings failed: %s", msg)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, ConfigFileName))
@@ -187,7 +187,7 @@ func getModels(addr string) error {
 // localhost:51121 redirect the Go kernel catches itself (zero copy/paste).
 func TestManagementPanelAndOauthUrl(t *testing.T) {
 	dir := t.TempDir()
-	if msg := EnsureDefaultConfig(dir, "", false); msg != "" {
+	if msg := EnsureDefaultConfig(dir, "", false, ThinkingCompact); msg != "" {
 		t.Fatalf("EnsureDefaultConfig failed: %s", msg)
 	}
 	if msg := StartProxy(dir); msg != "" {
@@ -252,7 +252,7 @@ func getWithKey(t *testing.T, url, key string) (int, string) {
 // (session leaves "pending" and reports the token-exchange failure instead of hanging).
 func TestOAuthCallbackCaptureLoop(t *testing.T) {
 	dir := t.TempDir()
-	if msg := EnsureDefaultConfig(dir, "", false); msg != "" {
+	if msg := EnsureDefaultConfig(dir, "", false, ThinkingCompact); msg != "" {
 		t.Fatalf("EnsureDefaultConfig failed: %s", msg)
 	}
 	if msg := StartProxy(dir); msg != "" {

@@ -5,6 +5,7 @@ package cliproxymobile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,13 +28,19 @@ const (
 	AuthDirName = "auths"
 	// thinkingParamPath is the payload key that makes the upstream return thoughts.
 	thinkingParamPath = "generationConfig.thinkingConfig.includeThoughts"
-	// thinkingLevelPath used to be written alongside includeThoughts. Measured A/B on the
-	// current upstream (same prompt, max_tokens 3000, gemini-3.8-flash-high): includeThoughts
-	// alone produced 3257 reasoning chars for 853 completion tokens, while adding
-	// thinkingLevel:high produced 2486 chars for 1241 tokens — strictly worse, because forcing
-	// effort high overrides the level the caller asked for and burns budget on easy prompts.
-	// It is now only written when the user explicitly picks a level.
-	thinkingLevelPath = "generationConfig.thinkingConfig.thinkingLevel"
+	// thinkingLevelPath and thinkingBudgetPath are the effort knobs. Either one switches the
+	// model's thinking from "whatever it feels like" to a fixed amount, and that is the only
+	// lever that makes a short-token client work: measured on gemini-3.8-flash-high with the
+	// same prompt at max_tokens=300, an unconstrained model spent 340-394 chars of thinking and
+	// left 12-29 characters of reply (finish_reason max_tokens), while thinkingBudget:0
+	// produced 167-208 characters of reply and no thinking at all. Visibility alone does not
+	// help — thinking still happens and still eats the budget.
+	thinkingLevelPath  = "generationConfig.thinkingConfig.thinkingLevel"
+	thinkingBudgetPath = "generationConfig.thinkingConfig.thinkingBudget"
+	// thinkingLevelLow is the level used by the "compact" mode. low measured 195-206 reply
+	// chars at max_tokens=300 — the best of the constrained settings — and at a generous
+	// budget it is cheap too (121 chars of reply at 1500, no thinking tokens spent).
+	thinkingLevelLow = "low"
 	// modelsFileName is the corrected model catalog the host copies into filesDir.
 	modelsFileName = "models.json"
 	// configVersion is the schema version the config file declares. ValidateV8Config keys off
@@ -57,6 +64,11 @@ const (
 	readyTimeout  = 10 * time.Second
 	probeInterval = 50 * time.Millisecond
 	stopTimeout   = 10 * time.Second
+
+	// livenessTimeout bounds the loopback dial IsRunning uses as its health check. A refused
+	// connection fails in microseconds, so this only matters when the kernel is accepting but
+	// not answering — and the caller is often the UI thread, so it stays short.
+	livenessTimeout = 600 * time.Millisecond
 )
 
 // defaultSensitiveWords ship by default. Antigravity intermittently answers with a
@@ -86,18 +98,26 @@ type runtimeState struct {
 var state runtimeState
 var lastError string
 
+// desiredRunning is the user's intent, guarded by state.mu. It lives outside runtimeState
+// because it survives a stop/start cycle and is read by Status even when service is nil.
+var desiredRunning bool
+
 // StartProxy boots the embedded CLIProxyAPI engine.
 // dataDir is Android  context.filesDir.absolutePath.
 // It returns "" on success and a readable error description otherwise.
 func StartProxy(dataDir string) string {
+	// Record the intent before starting: if the start then fails, Status must say "error"
+	// rather than "stopped", because the user asked for it to run.
+	SetDesiredRunning(true)
 	if err := startProxy(dataDir); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
-// StopProxy gracefully stops the running gateway.
+// StopProxy gracefully stops the running gateway and records that it was deliberate.
 func StopProxy() string {
+	SetDesiredRunning(false)
 	if err := stopProxy(); err != nil {
 		return err.Error()
 	}
@@ -106,6 +126,9 @@ func StopProxy() string {
 
 // RestartProxy stops the gateway and starts it again against dataDir.
 func RestartProxy(dataDir string) string {
+	// A restart is a request to be running: clear the stopped state first so a failure
+	// surfaces as "error" instead of being masked by the previous intent.
+	SetDesiredRunning(true)
 	if err := stopProxy(); err != nil {
 		return err.Error()
 	}
@@ -116,11 +139,32 @@ func RestartProxy(dataDir string) string {
 	return ""
 }
 
-// IsRunning reports whether the HTTP gateway is currently serving.
+// IsRunning reports whether the HTTP gateway is actually serving requests.
+//
+// This used to be "state.service != nil", which stayed true after the engine died in the
+// background — recordError only logged the failure — so the home screen kept saying 运行中
+// while nothing was listening on 127.0.0.1:8317. That is exactly the "connection drops and I
+// have to restart the gateway" report. A loopback dial is authoritative, and it costs nothing
+// in the common failure case because a refused connection returns immediately; the timeout
+// only bounds a pathological one.
 func IsRunning() bool {
 	state.mu.Lock()
-	defer state.mu.Unlock()
-	return state.service != nil
+	svc := state.service
+	addr := state.listenAddr
+	state.mu.Unlock()
+	if svc == nil || addr == "" {
+		return false
+	}
+	return probeListen(addr, livenessTimeout) == nil
+}
+
+// probeListen reports whether something accepts TCP connections on addr.
+func probeListen(addr string, timeout time.Duration) error {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 // GetListenAddress returns the effective host:port the gateway binds to.
@@ -145,11 +189,14 @@ func GetLastError() string {
 	return lastError
 }
 
-// EnsureDefaultConfig writes the hardened default config.yaml when it is missing.
+// EnsureDefaultConfig writes the hardened default config.yaml when it is missing and brings an
+// existing one up to date.
 // proxyURL seeds requests.proxy-url ("" keeps a direct connection).
 // allowLan binds 0.0.0.0 instead of 127.0.0.1.
-func EnsureDefaultConfig(dataDir string, proxyURL string, allowLan bool) string {
-	if err := ensureDefaultConfig(dataDir, proxyURL, allowLan); err != nil {
+// thinkingMode is one of the Thinking* constants; "" leaves whatever rule the file already has,
+// which is what the engine's own startup path wants (only the Android host knows the setting).
+func EnsureDefaultConfig(dataDir string, proxyURL string, allowLan bool, thinkingMode string) string {
+	if err := ensureDefaultConfig(dataDir, proxyURL, allowLan, thinkingMode); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -158,8 +205,8 @@ func EnsureDefaultConfig(dataDir string, proxyURL string, allowLan bool) string 
 // UpdateQuickSettings rewrites proxy-url, the bind host, the sensitive-word list and the
 // reasoning-visibility rule. The atomic rename triggers the engine file watcher (L2 hot reload).
 // sensitiveWordsCSV is comma separated; an empty value restores the defaults.
-func UpdateQuickSettings(dataDir string, proxyURL string, allowLan bool, sensitiveWordsCSV string, thinkingVisible bool) string {
-	if err := updateQuickSettings(dataDir, proxyURL, allowLan, sensitiveWordsCSV, thinkingVisible); err != nil {
+func UpdateQuickSettings(dataDir string, proxyURL string, allowLan bool, sensitiveWordsCSV string, thinkingMode string) string {
+	if err := updateQuickSettings(dataDir, proxyURL, allowLan, sensitiveWordsCSV, thinkingMode); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -183,11 +230,24 @@ func startProxy(dataDir string) error {
 		return fmt.Errorf("dataDir is required")
 	}
 	state.mu.Lock()
-	already := state.service != nil
-	state.mu.Unlock()
+	// A nil service means nothing is running. Do not treat a live-looking pointer as "already
+	// started" without checking: recordError clears it on failure, and the probe below catches
+	// the case where the engine died without going through recordError at all.
+	already := state.service != nil && probeListen(state.listenAddr, livenessTimeout) == nil
 	if already {
+		state.mu.Unlock()
 		return nil
 	}
+	if state.service != nil {
+		// Stale pointer: the engine is gone but nobody noticed. Drop it so the restart below
+		// does not race an object that will never serve again.
+		log.Warnf("cpa engine died without reporting an error; restarting")
+		state.service = nil
+		state.cancel = nil
+		state.done = nil
+		state.listenAddr = ""
+	}
+	state.mu.Unlock()
 
 	if err := ensureDir(dataDir); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
@@ -195,7 +255,7 @@ func startProxy(dataDir string) error {
 	if err := ensureDir(authDir(dataDir)); err != nil {
 		return fmt.Errorf("create auth dir: %w", err)
 	}
-	if err := ensureDefaultConfig(dataDir, "", false); err != nil {
+	if err := ensureDefaultConfig(dataDir, "", false, ""); err != nil {
 		return err
 	}
 
@@ -248,9 +308,78 @@ func startProxy(dataDir string) error {
 	return nil
 }
 
+// Gateway states reported by Status.
+const (
+	// StatusRunning means the engine is up and the port answers.
+	StatusRunning = "running"
+	// StatusStarting means the user wants it up but it is not serving (yet, or again).
+	StatusStarting = "starting"
+	// StatusStopped means the user asked for it to stop and it is down.
+	StatusStopped = "stopped"
+	// StatusError means it was asked to run, is down, and failed with an error.
+	StatusError = "error"
+)
+
+// SetDesiredRunning records whether the user wants the gateway up.
+//
+// The Android host calls this in the same breath as start/stop. Keeping the intent inside the
+// engine means Status() can answer "stopped" versus "starting" without the UI guessing from a
+// pair of booleans — which is what produced "正在启动" after every deliberate stop.
+func SetDesiredRunning(want bool) {
+	state.mu.Lock()
+	desiredRunning = want
+	state.mu.Unlock()
+}
+
+// GetDesiredRunning reports the recorded intent.
+func GetDesiredRunning() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return desiredRunning
+}
+
+// Status returns one of the Status* constants, combining intent, liveness and last error.
+//
+// A single call rather than three getters: the UI repaints on a timer, and reading intent,
+// liveness and error separately let them disagree mid-repaint.
+func Status() string {
+	want := GetDesiredRunning()
+	if IsRunning() {
+		return StatusRunning
+	}
+	if !want {
+		return StatusStopped
+	}
+	if strings.TrimSpace(GetLastError()) != "" {
+		return StatusError
+	}
+	return StatusStarting
+}
+
+// recordError notes an engine failure and marks the engine as gone.
+//
+// Clearing service matters as much as the message: the previous version left it set, so a
+// dead engine still looked alive to StartProxy (which returns early when service != nil, so
+// the user's "restart" could be a no-op) and to IsRunning. desiredRunning is left untouched —
+// the user still wants the gateway up, the engine just failed, and that distinction is what
+// lets the UI offer "启动" instead of claiming it already is.
 func recordError(err error) {
 	state.mu.Lock()
+	// A deliberate stop cancels the context, and the engine's Run() returns "context canceled"
+	// for it. That is the normal path out, not a failure — recording it made a stopped gateway
+	// report 异常 with the message "context canceled" the moment the goroutine finished.
+	if !desiredRunning && errors.Is(err, context.Canceled) {
+		state.service = nil
+		state.cancel = nil
+		state.done = nil
+		state.mu.Unlock()
+		log.Infof("cpa engine stopped on request")
+		return
+	}
 	lastError = err.Error()
+	state.service = nil
+	state.cancel = nil
+	state.done = nil
 	state.mu.Unlock()
 	log.Errorf("cpa engine stopped: %v", err)
 }
@@ -272,6 +401,10 @@ func stopProxy() error {
 		if logFile != nil {
 			_ = logFile.Close()
 		}
+		// A stop with nothing running is a success, and it must not leave a stale error behind:
+		// the previous version kept whatever the last failure wrote, so Status() reported
+		// "error" for a gateway that was simply stopped.
+		clearLastError()
 		return nil
 	}
 
@@ -287,7 +420,18 @@ func stopProxy() error {
 	if logFile != nil {
 		_ = logFile.Close()
 	}
+	// The engine exiting because we cancelled it is not a failure. Without this the goroutine's
+	// recordError would race a normal stop and leave "context canceled" in lastError, which the
+	// UI then shows as 异常 right after a deliberate 停止.
+	clearLastError()
 	return nil
+}
+
+// clearLastError forgets the previous failure.
+func clearLastError() {
+	state.mu.Lock()
+	lastError = ""
+	state.mu.Unlock()
 }
 
 func attachLogger(dataDir string) {
@@ -446,7 +590,7 @@ observability:
     logging-to-file: false
 `
 
-func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool) error {
+func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool, thinkingMode string) error {
 	if strings.TrimSpace(dataDir) == "" {
 		return fmt.Errorf("dataDir is required")
 	}
@@ -465,7 +609,7 @@ func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool) error {
 		// no models.catalog, and possibly the thinking level this app used to hard-code.
 		// Patch those keys in place and leave everything else the user may have tuned
 		// (proxy, api-keys, sensitive words) exactly as it is.
-		return migrateExistingConfig(path, catalogPath(dataDir))
+		return migrateExistingConfig(path, catalogPath(dataDir), thinkingMode)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -480,7 +624,7 @@ func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool) error {
 // which overrides whatever effort the caller asks for. Rewriting the whole file would discard
 // the user's proxy, api-keys and sensitive-word edits, so only those paths are touched, and the
 // file is only rewritten when something actually changed.
-func migrateExistingConfig(configPath, catalog string) error {
+func migrateExistingConfig(configPath, catalog, thinkingMode string) error {
 	raw, errRead := os.ReadFile(configPath)
 	if errRead != nil {
 		return errRead
@@ -495,22 +639,32 @@ func migrateExistingConfig(configPath, catalog string) error {
 	// without it.
 	versionChanged := lookupPath(&root, []string{"config-version"}) != configVersion
 	catalogChanged := lookupPath(&root, []string{"models", "catalog"}) != catalog
-	levelChanged := stripForcedThinkingLevel(&root, []string{"requests", "payload", "override"})
+	// Keep the payload rule in step with the mode the user picked in the app. Passing "" means
+	// the caller does not own that setting (the engine's own startup path), so the file is left
+	// alone; passing a mode rewrites our rule to match. This also removes the effort an earlier
+	// build hard-coded, so an upgraded install does not keep truncating small budgets.
+	thinkingChanged := false
+	doc := &root
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = doc.Content[0]
+	}
+	if thinkingMode != "" && doc.Kind == yaml.MappingNode {
+		before, _ := yaml.Marshal(&root)
+		applyThinkingVisibility(doc, thinkingMode)
+		after, _ := yaml.Marshal(&root)
+		thinkingChanged = string(before) != string(after)
+	}
 	// A file that already carries a repeated banner needs a rewrite even when the keys above
 	// are fine: the earlier build appended the banner on every migration, so installs updated
 	// several times are sitting on several copies with nothing else to fix.
 	bannerRepeated := hasRepeatedHeadComments(raw)
-	if !versionChanged && !catalogChanged && !levelChanged && !bannerRepeated {
+	if !versionChanged && !catalogChanged && !thinkingChanged && !bannerRepeated {
 		return nil
 	}
 	// setPath works on a mapping node. Unmarshalling produces a DocumentNode wrapping it, and
 	// handing the document straight to setPath makes it see "not a map" and replace the whole
 	// tree with an empty one — that wiped a live config down to a single key, so the engine
 	// then started on ":0" because server.host and server.port were gone.
-	doc := &root
-	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
-		doc = doc.Content[0]
-	}
 	if doc.Kind != yaml.MappingNode {
 		return fmt.Errorf("config root is not a YAML mapping")
 	}
@@ -676,7 +830,7 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmpName, path)
 }
 
-func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWordsCSV string, thinkingVisible bool) error {
+func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWordsCSV string, thinkingMode string) error {
 	if strings.TrimSpace(dataDir) == "" {
 		return fmt.Errorf("dataDir is required")
 	}
@@ -685,7 +839,7 @@ func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWords
 		if !os.IsNotExist(err) {
 			return err
 		}
-		if err := ensureDefaultConfig(dataDir, proxyURL, allowLan); err != nil {
+		if err := ensureDefaultConfig(dataDir, proxyURL, allowLan, thinkingMode); err != nil {
 			return err
 		}
 	}
@@ -719,7 +873,7 @@ func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWords
 	}
 	setPath(root, []string{"oauth", "providers", "antigravity", "sensitive-words"}, seq)
 
-	applyThinkingVisibility(root, thinkingVisible)
+	applyThinkingVisibility(root, thinkingMode)
 
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
@@ -728,41 +882,74 @@ func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWords
 	return writeFileAtomic(path, out)
 }
 
-// applyThinkingVisibility turns the reasoning-visibility payload rule on or off.
+// Thinking modes. The switch is three-way rather than on/off because the measured behaviour
+// does not split that way: visible reasoning exists only at medium effort and above, and those
+// are exactly the settings that ruin a short-token budget.
+const (
+	// ThinkingCompact spends nothing on thinking. At max_tokens=300 (SillyTavern's default)
+	// this returns 167-208 characters of reply with no truncation.
+	ThinkingCompact = "compact"
+	// ThinkingVisible asks for the chain of thought. Measured at max_tokens=300: 12-19
+	// characters of reply and finish_reason max_tokens — it needs a budget of about 1000 or
+	// more to be useful, which the settings screen says next to the option.
+	ThinkingVisible = "visible"
+	// ThinkingOff writes no rule. The model still thinks on its own (340-394 chars measured),
+	// it just does not send it back — so a small budget is still consumed.
+	ThinkingOff = "off"
+)
+
+// normalizeThinkingMode maps a stored or historical value onto one of the three modes.
 //
-// Showing the chain of thought costs thought tokens on every request, so it is a user choice
-// rather than something baked into the build. Implemented as a requests.payload.override rule
-// so the behaviour is visible in config.yaml and survives an upstream sync.
+// The previous build stored a boolean ("true" showed the chain of thought), so "true" has to
+// keep meaning "visible" instead of silently falling back to the default and turning the
+// user's choice off after an upgrade.
+func normalizeThinkingMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case ThinkingVisible, "true", "on", "1":
+		return ThinkingVisible
+	case ThinkingOff, "false", "0":
+		return ThinkingOff
+	default:
+		return ThinkingCompact
+	}
+}
+
+// applyThinkingVisibility writes the payload rule for the requested thinking mode.
 //
-// includeThoughts is written alone. An earlier build also forced thinkingLevel: high on the
-// theory that visibility without effort gets dropped; measured A/B on the current upstream shows
-// the opposite — the pair costs more tokens and returns less reasoning, and hard-coding "high"
-// silently overrides whatever effort the caller requested. A caller that wants a specific level
-// still gets it, because nothing here overwrites generationConfig.thinkingConfig.thinkingLevel.
-func applyThinkingVisibility(root *yaml.Node, visible bool) {
+// Implemented as a requests.payload.override rule so the behaviour is visible in config.yaml
+// and survives an upstream sync. Whatever the mode, only the rule this function owns is
+// replaced: a user's own override entries are left untouched.
+func applyThinkingVisibility(root *yaml.Node, mode string) {
 	path := []string{"requests", "payload", "override"}
-	if !visible {
-		// Drop only the rule this function owns; leave any user rule alone.
-		removeThinkingRule(root, path)
+	// Always drop our own rule first, then re-add the one this mode needs. Rewriting in place
+	// rather than appending keeps config.yaml from growing a rule per mode change.
+	removeThinkingRule(root, path)
+
+	resolved := normalizeThinkingMode(mode)
+	params := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	switch resolved {
+	case ThinkingVisible:
+		params.Content = append(params.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingParamPath},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingLevelPath},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingLevelLow},
+		)
+	case ThinkingCompact:
+		params.Content = append(params.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingBudgetPath},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: "0"},
+		)
+	default:
 		return
 	}
-	if hasThinkingRule(root, path) {
-		// Configs written by an earlier build also carried thinkingLevel: high. Strip it so an
-		// upgrade does not keep overriding the caller's effort — otherwise the fixed behaviour
-		// only reaches freshly generated configs and existing installs stay on the old behaviour.
-		stripForcedThinkingLevel(root, path)
-		return
-	}
+
 	rule := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 	models := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", Content: []*yaml.Node{
 		{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
 			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "name"},
 			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "*"},
 		}},
-	}}
-	params := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
-		{Kind: yaml.ScalarNode, Tag: "!!str", Value: thinkingParamPath},
-		{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
 	}}
 	setPath(rule, []string{"models"}, models)
 	setPath(rule, []string{"params"}, params)
@@ -775,59 +962,63 @@ func applyThinkingVisibility(root *yaml.Node, visible bool) {
 	seq.Content = append(seq.Content, rule)
 }
 
-// hasThinkingRule reports whether one of the override rules already sets includeThoughts.
+// managedThinkingParams are the payload keys this app is allowed to write or remove. Anything
+// else in a rule means the user built that rule, not us.
+var managedThinkingParams = map[string]bool{
+	thinkingParamPath:  true,
+	thinkingLevelPath:  true,
+	thinkingBudgetPath: true,
+}
+
+// ownThinkingRule reports whether an override entry is the one this app manages.
+//
+// Ownership is deliberately strict, because "remove our rule before writing the new one" would
+// otherwise delete a user's hand-written override: the entry must match every model (the
+// wildcard we always write) and its params may contain nothing but our own keys.
+func ownThinkingRule(rule *yaml.Node) bool {
+	if rule.Kind != yaml.MappingNode {
+		return false
+	}
+	models := lookupNode(rule, []string{"models"})
+	if models == nil || models.Kind != yaml.SequenceNode || len(models.Content) != 1 {
+		return false
+	}
+	only := models.Content[0]
+	if only.Kind != yaml.MappingNode {
+		return false
+	}
+	if name := lookupNode(only, []string{"name"}); name == nil || name.Value != "*" {
+		return false
+	}
+	params := lookupNode(rule, []string{"params"})
+	if params == nil || params.Kind != yaml.MappingNode || len(params.Content) == 0 {
+		return false
+	}
+	for i := 0; i+1 < len(params.Content); i += 2 {
+		// The keys are literal dotted paths ("generationConfig.thinkingConfig.includeThoughts"),
+		// not a nested tree, so each one is a single scalar.
+		if !managedThinkingParams[params.Content[i].Value] {
+			return false
+		}
+	}
+	return true
+}
+
+// hasThinkingRule reports whether the managed thinking rule is already present.
 func hasThinkingRule(root *yaml.Node, path []string) bool {
 	seq := lookupNode(root, path)
 	if seq == nil || seq.Kind != yaml.SequenceNode {
 		return false
 	}
 	for _, rule := range seq.Content {
-		if rule.Kind != yaml.MappingNode {
-			continue
-		}
-		if params := lookupNode(rule, []string{"params"}); params != nil {
-			// The param key is a literal dotted path ("generationConfig.thinkingConfig.
-			// includeThoughts"), not a nested tree, so it has to be matched as one scalar.
-			if lookupNode(params, []string{thinkingParamPath}) != nil {
-				return true
-			}
+		if ownThinkingRule(rule) {
+			return true
 		}
 	}
 	return false
 }
 
-// stripForcedThinkingLevel removes the thinkingLevel our earlier builds hard-coded, leaving
-// the visibility flag and any level the user set themselves.
-//
-// Only a rule that carries includeThoughts is touched: a user's own scale rule that sets just a
-// level is not ours to edit.
-func stripForcedThinkingLevel(root *yaml.Node, path []string) bool {
-	seq := lookupNode(root, path)
-	if seq == nil || seq.Kind != yaml.SequenceNode {
-		return false
-	}
-	changed := false
-	for _, rule := range seq.Content {
-		if rule.Kind != yaml.MappingNode {
-			continue
-		}
-		params := lookupNode(rule, []string{"params"})
-		if params == nil {
-			continue
-		}
-		if lookupNode(params, []string{thinkingParamPath}) == nil {
-			continue
-		}
-		if lookupNode(params, []string{thinkingLevelPath}) == nil {
-			continue
-		}
-		removePath(params, []string{thinkingLevelPath})
-		changed = true
-	}
-	return changed
-}
-
-// removeThinkingRule deletes just the rule that sets includeThoughts.
+// removeThinkingRule deletes just the rule this app manages, leaving every user entry in place.
 func removeThinkingRule(root *yaml.Node, path []string) {
 	seq := lookupNode(root, path)
 	if seq == nil || seq.Kind != yaml.SequenceNode {
@@ -835,13 +1026,7 @@ func removeThinkingRule(root *yaml.Node, path []string) {
 	}
 	kept := seq.Content[:0]
 	for _, rule := range seq.Content {
-		owned := false
-		if rule.Kind == yaml.MappingNode {
-			if params := lookupNode(rule, []string{"params"}); params != nil {
-				owned = lookupNode(params, []string{thinkingParamPath}) != nil
-			}
-		}
-		if !owned {
+		if !ownThinkingRule(rule) {
 			kept = append(kept, rule)
 		}
 	}
