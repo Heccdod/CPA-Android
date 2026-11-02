@@ -28,7 +28,12 @@ dist/
 # Screenshots taken while checking a change against the phone. They are working notes, not
 # documentation: the README explains behaviour in prose, and a PNG of one build's pixels goes
 # stale the moment the next build changes a margin.
+#
+# Anchored at the repository root so docs/screens/*.png stays tracked: those are the images the
+# README actually embeds, and a bare "*.png" would have silently stopped tracking them the next
+# time one was added.
 /*.png
+diag/*.png
 
 # The diagnostic harness keeps mock_upstream.py, drive.py, run.sh and its fixture credential
 # under version control; the request logs its runs produce do not. A single run writes dozens of
