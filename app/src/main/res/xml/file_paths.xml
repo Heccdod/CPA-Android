@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Only the directory UpdateManager actually hands to the installer. The earlier config also
+  exposed the whole cache directory and a "shared/" directory nothing ever writes to; an
+  authority is only as safe as the smallest set of paths behind it.
+-->
 <paths>
     <files-path name="updates" path="updates/" />
-    <files-path name="shared" path="shared/" />
-    <cache-path name="cache" path="." />
 </paths>

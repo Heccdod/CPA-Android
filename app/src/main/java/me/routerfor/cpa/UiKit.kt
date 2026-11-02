@@ -6,6 +6,8 @@ import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -216,11 +218,29 @@ class UiKit(private val context: Context, val colors: Palette.Colors) {
             // the view stays roughly 46x33 while the track itself is 34x21.
             val pad = (6 * resources.displayMetrics.density).toInt()
             setPadding(pad, pad, pad, pad)
-            setOnClickListener {
-                isChecked = !isChecked
-                onCheckedChange?.invoke(isChecked)
-                invalidate()
+            // TalkBack sees a bare View: no role, no state, nothing to announce when the value
+            // changes. A Switch reports "开关 / 已开启"; this says the same, from the class name
+            // plus a live checked state.
+            accessibilityDelegate = object : View.AccessibilityDelegate() {
+                override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
+                    super.onInitializeAccessibilityNodeInfo(host, info)
+                    info.className = "android.widget.Switch"
+                    info.isCheckable = true
+                    info.isChecked = isChecked
+                    info.isClickable = true
+                }
             }
+            setOnClickListener { toggle(fromUser = true) }
+        }
+
+        /** Flips the switch; [fromUser] is false when the screen is restoring a saved value. */
+        fun toggle(fromUser: Boolean) {
+            isChecked = !isChecked
+            // A gesture that changes state has to announce the new one, or a screen-reader user
+            // gets silence after every tap.
+            if (fromUser) sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_CLICKED)
+            onCheckedChange?.invoke(isChecked)
+            invalidate()
         }
 
         override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {

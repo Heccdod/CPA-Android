@@ -509,6 +509,76 @@ python3 scripts/check16k.py app/libs/cliproxy.aar app/build/outputs/apk/debug/ap
 
 CI 里已在 bind 后与 assemble 后各加一道 `scripts/check16k.py`，防止上游同步把这条退化掉。
 
+### 6. 热重载从来没生效过：`os.Rename` 换掉了被 watch 的 inode（真机实测）
+
+**症状**：改上游代理、改敏感词、保存自定义提供商，界面提示「已保存，引擎正在热重载」，但引擎行为不变；
+重启网关才生效。
+
+**定位**：设备上改一次设置，数引擎日志里的 `config file changed`——**58 → 58**，一次都没有。
+把写入方式单独做对照实验（同进程、同 `config.yaml`）：
+
+```
+3 次 in-place 写入 → 3 次 config file changed
+3 次 os.Rename 覆盖 → 0 次 config file changed
+```
+
+**根因**：`writeFileAtomic` 用 `os.CreateTemp` + `os.Rename` 落盘。rename 本身原子，但它**换掉了 inode**，
+而引擎的 fsnotify watch 绑在 inode 上（`internal/watcher/events.go:30` 的 `w.watcher.Add(w.configPath)`）。
+watch 跟着旧 inode 一起消失，之后所有写入都看不见。代码注释「the atomic rename triggers the engine file watcher」
+从来没成立过。
+
+**修复**：`writeFileAtomic` 改成原地截断重写（`O_WRONLY|O_CREATE|O_TRUNC` + 单次 Write + Sync），保住 inode。
+代价是失去「要么全写要么不写」，所以先落一个 `config.yaml.lastgood` 再动主文件，写完删掉备份；
+启动时 `recoverConfigFromBackup` 看到残留备份就还原。
+
+判据是**备份文件在不在**，不是「主文件能不能解析」：半截 YAML 仍是合法 YAML（缺的是尾巴），
+解析成功区分不出好文件和写了一半的文件。第一版按解析结果判断，`TestWriteIsRecoverableAfterAnInterruptedWrite`
+直接失败——截断文件解析通过了，恢复没触发。
+
+**测试**：`go-bridge/cliproxymobile/reload_test.go`。`TestConfigWritesReachTheEngine` 连写三次并要求日志真的出现三次
+reload。两个连带细节：
+
+- 必须等引擎自己的 `file watcher started` 行再写。`StartProxy` 在端口就绪、模型列表非空时就返回了，
+  那时 watcher 的 goroutine 还没 `Add()` 完，写进去的事件照样丢——旧代码在这里也会「看起来通过」。
+- 每次写的内容必须不同。watcher 会用 SHA-256 比对，内容没变就 skip（`config file content unchanged`），
+  重复写同样的词测到的是去重逻辑，不是文件句柄。
+
+**真机验证**：加第二个自定义提供商后 `58 → 59`，引擎日志 `+2 OpenAI-compat`，`/v1/models` 立刻多出
+`kimi-k2 (kimi-probe)`，全程没重启网关。
+
+### 7. 管理密钥被注入到任意网页（面板 WebView）
+
+**症状**：没有任何外部表现，纯粹是数据外泄的口子。
+
+**机制**：`PanelWebView.PanelClient.onPageFinished` 先调 `seedSession(view)`，再判断 `isPanelUrl(url)`。
+`seedSession` 把 `WebBridgeCompat.managementKey()` 写进该页面的 `localStorage`，而
+`shouldOverrideUrlLoading` 对非 provider、非回调的 http(s) 链接返回 `false`——WebView 就地导航过去。
+面板里任何一个外链被点一下，目标页加载完成即收到管理密钥，脚本读走就拿到了整个管理面
+（改配置、读凭据、换 key）。
+
+**修复**（`PanelWebView.kt`）：
+
+- `onPageFinished` 先判 `isPanelUrl`，不是面板文档就直接 return，不再写 localStorage；
+- `shouldOverrideUrlLoading` 只放行面板自己的 URL，其余 http(s) 一律 `openCustomTab` 并返回 `true`，
+  站外页面根本不进这个持有密钥的 WebView；
+- provider 域名从 `host.contains(...)` 改成 `host == it || host.endsWith("." + it)`——
+  `claude.ai.evil.com` 不再是 claude.ai。
+
+顺带补上 `PanelActivity` 的 `onDestroy`（原来没有）：`removeCallbacks` + `destroy()`。
+它的「网关还没起来就 600 ms 后重试」没有次数上限也没有取消，退出后仍在跑，每轮还在主线程拨一次 loopback。
+
+### 8. 单线程池把状态卡和额度请求排在一起
+
+**症状**：点刷新后状态卡停在「正在启动」，点重启也没反应，几十秒后才跳变。
+
+**机制**：`MainActivity.io` 是 `newSingleThreadExecutor`，`refresh()` 的状态探测和
+`fetchQuota()` 的逐账号请求（每个 12 s 预算）排在同一条线程。五个账号就是队列里先排一分钟；
+`STARTING` 的 30 次重试 tick 全堆在队尾。`SettingsActivity` 同样：打开「通知栏显示额度」后
+再改代理，`updateQuickSettings` 要等额度全部跑完才执行，中间没有任何反馈。
+
+**修复**：两边各加一个 `quotaIo` 单线程池（`bgQuota`/`bgQuota`），额度走它，其余仍走 `io`；
+`onDestroy` 两个都 `shutdownNow()`。
+
 ## 设备侧验证（scripts/device-smoke.sh）
 
 ```

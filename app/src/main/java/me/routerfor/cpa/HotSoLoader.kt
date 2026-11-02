@@ -20,6 +20,8 @@ object HotSoLoader {
 
     private const val TAG = "CpaHotSo"
     private const val MANAGED_LIB = "gojni"
+    private const val PACKAGED = "packaged"
+    private const val LOADED = "loaded.txt"
 
     @Volatile
     private var loaded = false
@@ -31,6 +33,7 @@ object HotSoLoader {
         if (!enabled) {
             clearStaged(context)
             System.loadLibrary(MANAGED_LIB)
+            recordLoaded(context, PACKAGED)
             Log.i(TAG, "hot update disabled, loaded packaged kernel libgojni.so")
             loaded = true
             return
@@ -39,6 +42,7 @@ object HotSoLoader {
         if (hot != null) {
             try {
                 System.load(hot.absolutePath)
+                recordLoaded(context, hot.name)
                 Log.i(TAG, "loaded hot-updated kernel ${hot.name}")
                 loaded = true
                 return
@@ -48,8 +52,44 @@ object HotSoLoader {
             }
         }
         System.loadLibrary(MANAGED_LIB)
+        recordLoaded(context, PACKAGED)
         Log.i(TAG, "loaded packaged kernel libgojni.so")
         loaded = true
+    }
+
+    /**
+     * Notes which kernel this process actually mapped.
+     *
+     * A staged .so does nothing on its own: System.load() resolves a name once per process and
+     * `loaded` latches in Application.onCreate, so a freshly downloaded kernel is inert until the
+     * process is replaced. Without this record the UI could only say "有已下载内核", which reads as
+     * "already running it" and sent people looking for a restart that cannot possibly help.
+     */
+    private fun recordLoaded(context: Context, name: String) {
+        runCatching { File(hotLibDir(context), LOADED).writeText(name) }
+    }
+
+    /** The kernel mapped by this process, or "" when [loadEngine] has not run. */
+    fun loadedKernel(context: Context): String {
+        val file = File(hotLibDir(context), LOADED)
+        if (!file.isFile) return ""
+        return runCatching { file.readText().trim() }.getOrDefault("")
+    }
+
+    /**
+     * True when a newer kernel is staged and only a process restart can pick it up.
+     *
+     * Compares the pending name against the one that was actually loaded, so the state clears
+     * itself after the restart instead of nagging forever.
+     */
+    fun restartPending(context: Context): Boolean {
+        if (!AppPrefs.hotUpdateEnabled(context)) return false
+        val pending = File(hotLibDir(context), "pending.txt")
+        if (!pending.isFile) return false
+        val name = runCatching { pending.readText().trim() }.getOrDefault("")
+        if (name.isEmpty()) return false
+        if (!File(hotLibDir(context), name).isFile) return false
+        return name != loadedKernel(context)
     }
 
     /** Drops staged kernels; called when the switch is turned off and on every cold start with it off. */

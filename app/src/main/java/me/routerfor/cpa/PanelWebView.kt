@@ -74,7 +74,7 @@ class PanelWebView @JvmOverloads constructor(
         }
     }
 
-    fun panelUrl(): String = "http://127.0.0.1:$DEFAULT_PORT${PanelDocument.PANEL_PATH}"
+    fun panelUrl(): String = GatewayPort.base() + PanelDocument.PANEL_PATH
 
     /** Loads the panel if it is not shown yet; returns false when the engine is not up. */
     fun loadIfNeeded(force: Boolean = false): Boolean {
@@ -103,6 +103,12 @@ class PanelWebView @JvmOverloads constructor(
             if (isLoopback(uri) && uri.path == PanelDocument.PANEL_PATH) {
                 val stream = PanelDocument.intercepted(uri.toString(), palette())
                 if (stream != null) return WebResourceResponse("text/html", "utf-8", stream)
+                // The rewrite is a synchronous loopback fetch. When the engine has accepted the
+                // socket but stopped answering (the half-dead state the 150 ms probe exists for)
+                // it can block this request thread for the whole 8 s + 20 s timeout budget, and
+                // onPageFinished then never fires — awaitMount never starts and the screen spins
+                // forever with no callback. Report it instead of falling through silently.
+                onPanelProblem?.invoke("管理面板没有响应，请在主界面重启网关后重试")
             }
             return super.shouldInterceptRequest(view, request)
         }
@@ -119,11 +125,13 @@ class PanelWebView @JvmOverloads constructor(
 
         override fun onPageFinished(view: WebView, url: String) {
             super.onPageFinished(view, url)
+            // Seed only for the panel's own document. This used to run before the check, which
+            // meant every page the WebView was navigated to — a help link, a provider's docs, an
+            // ad — received localStorage.managementKey on load. The management secret unlocks
+            // config writes and credential reads, so leaking it to one third-party origin hands
+            // over the whole gateway.
+            if (!isPanelUrl(url)) return
             seedSession(view)
-            if (!isPanelUrl(url)) {
-                onPanelReady?.invoke()
-                return
-            }
             awaitMount(view, 0)
         }
     }
@@ -175,24 +183,37 @@ class PanelWebView @JvmOverloads constructor(
             val u = Uri.parse(it)
             val port = if (u.port > 0) ":${u.port}" else ""
             "${u.scheme}://${u.host}$port"
-        } ?: "http://127.0.0.1:$DEFAULT_PORT"
+        } ?: GatewayPort.base()
         view.evaluateJavascript(PanelJs.seedScript(host, WebBridgeCompat.managementKey()), null)
         view.evaluateJavascript(PanelTheme.script(paletteMode()), null)
     }
 
-    /** Provider OAuth and its loopback callback go to a Custom Tab. */
+    /**
+     * Decides what a tap inside the panel may reach.
+     *
+     * Provider OAuth pages and the loopback callback go to a Custom Tab. Everything else that is
+     * not the panel itself is handed to the system browser instead of being loaded in place: the
+     * WebView holds the management secret in localStorage and the panel document is injected with
+     * the app's own scripts, so a third-party page must never share this context. Returning
+     * false for those URLs — which is what this did — navigated the WebView to the link.
+     */
     private fun intercept(uri: Uri): Boolean {
         val host = uri.host ?: return false
         val scheme = uri.scheme ?: ""
         if (scheme != "http" && scheme != "https") return false
-        val providerAuth = PROVIDER_HOSTS.any { host.contains(it) }
+        // Host comparison, not substring: "claude.ai.evil.com" must not match claude.ai.
+        val providerAuth = PROVIDER_HOSTS.any { host == it || host.endsWith("." + it) }
         val callback = isLoopback(uri) &&
             (uri.port == OAUTH_CALLBACK_PORT || uri.path?.contains("oauth-callback") == true)
         if (providerAuth || callback) {
             openCustomTab(uri)
             return true
         }
-        return false
+        if (isLoopback(uri) && uri.path == PanelDocument.PANEL_PATH) return false
+        // Any other destination leaves the app. doUpdateVisitedHistory would keep the panel's own
+        // URL in view.url, but the navigation itself must not happen here.
+        openCustomTab(uri)
+        return true
     }
 
     private fun openCustomTab(uri: Uri) {
@@ -200,13 +221,20 @@ class PanelWebView @JvmOverloads constructor(
         try {
             intent.launchUrl(context, uri)
         } catch (e: ActivityNotFoundException) {
-            context.startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            // The fallback needs the same guard: a device with no browser at all throws here as
+            // well, and that path used to be unguarded — a panel tap on such a device crashed.
+            try {
+                context.startActivity(
+                    Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (second: ActivityNotFoundException) {
+                Log.w(TAG, "no browser to open " + uri.host)
+            }
         }
     }
 
     companion object {
         private const val TAG = "CpaWeb"
-        private const val DEFAULT_PORT = 8317
         private const val OAUTH_CALLBACK_PORT = 51121
         private const val POLL_MS = 250L
         private const val MAX_POLLS = 60

@@ -47,24 +47,46 @@ class ProxyForegroundService : Service() {
      */
     private val watchdog = object : Runnable {
         private var misses = 0
+        /** Guards against stacking probes when one round takes longer than the interval. */
+        private var probing = false
 
         override fun run() {
             if (!AppPrefs.gatewayWanted(this@ProxyForegroundService)) {
                 handler.removeCallbacks(this)
                 return
             }
-            if (engineAnswers()) {
-                misses = 0
-            } else {
-                misses++
-                Log.w(TAG, "watchdog: engine not answering (round $misses)")
-                if (misses >= WATCHDOG_MISSES) {
-                    misses = 0
-                    Log.w(TAG, "watchdog: restarting the gateway")
-                    startGateway(restart = true)
-                }
+            if (probing) {
+                // A previous round has not finished; do not queue another one behind it.
+                handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+                return
             }
-            handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+            probing = true
+            // The probe sleeps between attempts, and this used to run on the main looper: every
+            // 20 seconds the UI thread was blocked for up to ~390ms (150ms dial timeout × 3 plus
+            // two 120ms back-offs). On a scrolled list that reads as periodic stutter. The probe
+            // is a loopback connect; it belongs on a worker like every other network call.
+            Thread {
+                val answers = engineAnswers()
+                handler.post {
+                    probing = false
+                    if (!AppPrefs.gatewayWanted(this@ProxyForegroundService)) {
+                        handler.removeCallbacks(this)
+                        return@post
+                    }
+                    if (answers) {
+                        misses = 0
+                    } else {
+                        misses++
+                        Log.w(TAG, "watchdog: engine not answering (round $misses)")
+                        if (misses >= WATCHDOG_MISSES) {
+                            misses = 0
+                            Log.w(TAG, "watchdog: restarting the gateway")
+                            startGateway(restart = true)
+                        }
+                    }
+                    handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+                }
+            }.start()
         }
 
         /** True when any of a few quick probes gets through. */
@@ -74,7 +96,12 @@ class ProxyForegroundService : Service() {
                 if (attempt < WATCHDOG_PROBES - 1) {
                     // Back off a little: if the first probe lost a race with a waking CPU, the
                     // next one a moment later usually wins.
-                    Thread.sleep(WATCHDOG_PROBE_BACKOFF_MS)
+                    try {
+                        Thread.sleep(WATCHDOG_PROBE_BACKOFF_MS)
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return false
+                    }
                 }
             }
             return false
@@ -161,29 +188,41 @@ class ProxyForegroundService : Service() {
 
     private fun startGateway(restart: Boolean) {
         val dataDir = dataDir()
-        // The corrected model catalog ships as an APK asset (Go cannot read packed assets), so
-        // copy it out first: config.yaml points models.catalog at this path. It is overwritten
-        // every start because it carries no user state — an app update must refresh it.
-        installModelsCatalog(File(dataDir))
-        // Seed filesDir/config.yaml + filesDir/auths before the engine reads them. The thinking
-        // mode has to be the user's current choice: the Go side rewrites the payload rule to
-        // match, so passing a default here would silently undo the setting on every start.
-        val ensureError = WebBridgeCompat.ensureDefaultConfig(
-            dataDir,
-            AppPrefs.proxyUrl(this),
-            AppPrefs.allowLan(this),
-            AppPrefs.thinkingMode(this)
-        )
-        if (ensureError.isNotEmpty()) {
-            Log.w(TAG, "ensureDefaultConfig: $ensureError")
-        }
-        File(dataDir, "auths").mkdirs()
 
+        // Foreground first, everything else after. The 5-second window between
+        // startForegroundService() and startForeground() is the one deadline the platform
+        // enforces with an ANR, and the work below (YAML parse + two fsyncs in
+        // ensureDefaultConfig) is file I/O on the main thread — exactly the kind of stall that
+        // ate into it on a slow device.
         acquireWakeLock()
         startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.notif_starting)))
 
         Thread {
+            // The corrected model catalog ships as an APK asset (Go cannot read packed assets),
+            // so copy it out first: config.yaml points models.catalog at this path. It is
+            // overwritten every start because it carries no user state — an app update must
+            // refresh it.
+            installModelsCatalog(File(dataDir))
+            // Seed filesDir/config.yaml + filesDir/auths before the engine reads them. The
+            // thinking mode has to be the user's current choice: the Go side rewrites the payload
+            // rule to match, so passing a default here would silently undo the setting on every
+            // start.
+            val ensureError = WebBridgeCompat.ensureDefaultConfig(
+                dataDir,
+                AppPrefs.proxyUrl(this),
+                AppPrefs.allowLan(this),
+                AppPrefs.thinkingMode(this)
+            )
+            if (ensureError.isNotEmpty()) {
+                Log.w(TAG, "ensureDefaultConfig: $ensureError")
+            }
+            File(dataDir, "auths").mkdirs()
+            // The engine can have been put on another port; the notification and every client
+            // URL read this.
+            GatewayPort.refresh(this)
+
             val result = if (restart) WebBridgeCompat.restartProxy(dataDir) else WebBridgeCompat.startProxy(dataDir)
+            GatewayPort.note(WebBridgeCompat.listenAddress())
             val running = WebBridgeCompat.isRunning()
             val text = when {
                 running -> getString(R.string.notif_listening, WebBridgeCompat.listenAddress())

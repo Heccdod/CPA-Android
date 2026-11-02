@@ -17,11 +17,10 @@ import java.net.URL
  */
 object OauthLauncher {
 
-    private const val BASE = "http://127.0.0.1:8317"
-
     /** Returns the authorization URL, or null when the gateway is not serving or has no OAuth. */
     fun requestAuthUrl(provider: String = "antigravity"): String? = runCatching {
-        val endpoint = BASE + "/v8/management/oauth/auth-url?provider=" + provider + "&is_webui=1"
+        val endpoint = GatewayPort.base() +
+            "/v8/management/oauth/auth-url?provider=" + provider + "&is_webui=1"
         val conn = URL(endpoint).openConnection() as HttpURLConnection
         conn.connectTimeout = 10000
         conn.readTimeout = 25000

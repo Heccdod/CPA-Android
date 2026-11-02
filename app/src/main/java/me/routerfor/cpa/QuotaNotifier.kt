@@ -108,16 +108,23 @@ object QuotaNotifier {
             val body = when {
                 result.error != null -> result.error
                 result.unsupported || !result.hasData -> "额度不可用"
-                // Only the 5-hour window: the notification is a glance, and the weekly
-                // budget changes slowly enough that the app is the right place to read it.
+                // One window per block: the notification is a glance, and the weekly budget
+                // changes slowly enough that the app is the right place to read it.
+                //
+                // "5-hour first, else the longest one that exists" rather than "5-hour only".
+                // Quota now identifies windows by their declared length, so a Pro account has no
+                // 5-hour row at all; the old lookup returned null for every family and left the
+                // account header standing with nothing under it.
                 else -> Quota.byFamily(result.windows)
                     .mapNotNull { (family, windows) ->
-                        val five = windows.firstOrNull { it.label.contains("5 小时") } ?: return@mapNotNull null
+                        val shown = windows.firstOrNull { it.label.contains("5 小时") }
+                            ?: windows.lastOrNull { it.usedPercent != null }
+                            ?: return@mapNotNull null
                         buildString {
                             if (family.isNotEmpty()) append(family).append(" · ")
-                            append("5h 额度 ")
-                            five.usedPercent?.let { append((100.0 - it).toInt()).append("%") }
-                            five.resetLabel?.let { append(" ").append(it).append(" 重置") }
+                            append(labelFor(shown.label)).append(" ")
+                            shown.usedPercent?.let { append((100.0 - it).toInt()).append("%") }
+                            shown.resetLabel?.let { append(" ").append(it).append(" 重置") }
                         }
                     }
                     .joinToString("\n")
@@ -131,6 +138,19 @@ object QuotaNotifier {
         // The clock is read here rather than from cachedAt: publish() builds the body before it
         // stores the timestamp, so reading the field produced a permanent "更新于 —".
         return lines.joinToString("\n") + "\n更新于 " + clock(System.currentTimeMillis())
+    }
+
+    /**
+     * Short label for a window, for a space that fits about 40 characters per line.
+     *
+     * The full labels are "5 小时额度" / "每周额度"; the notification says "5h" / "周" because it
+     * is read at a glance and the account name already eats the left half of the line.
+     */
+    private fun labelFor(label: String): String = when {
+        label.contains("5 小时") -> "5h 额度"
+        label.contains("每周") -> "周额度"
+        label.contains("每月") -> "月额度"
+        else -> label
     }
 
     private fun clock(millis: Long): String {

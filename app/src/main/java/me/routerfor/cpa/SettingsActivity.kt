@@ -19,6 +19,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
@@ -28,6 +29,9 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 设置页：首页只留状态，配置全在这里。外观、网络、引擎、更新、系统。
@@ -43,12 +47,111 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var ui: UiKit
     private lateinit var body: LinearLayout
 
+    /**
+     * Every Go call and file read this screen makes runs here.
+     *
+     * ensureDefaultConfig() parses config.yaml inside Go and writes it back with two fsyncs,
+     * providerSummary() reads and unmarshals the same file, and the quota pull is a chain of
+     * HTTP requests — all of it used to run on the main thread, which is what made the settings
+     * screen freeze for a beat on every save.
+     */
+    private val io = Executors.newSingleThreadExecutor()
+
+    /**
+     * Quota pulls get their own thread.
+     *
+     * One full pull is a 12 s budget per enabled account; sharing [io] with it delayed every
+     * settings write behind the whole queue.
+     */
+    private val quotaIo = Executors.newSingleThreadExecutor()
+
+    /** Set while a background task owns a dialog or a row, so a second tap cannot stack one. */
+    private val summaryLoading = AtomicBoolean(false)
+    private val quotaPulling = AtomicBoolean(false)
+    private val configLoading = AtomicBoolean(false)
+
+    /** The providers row's subtitle, filled in when the background read comes back. */
+    private var providerSummaryText: TextView? = null
+
+    /** Last value the Go read produced, so the row has something to show while it refreshes. */
+    private var providerSummaryCache: String? = null
+
+    /** The client-key row's subtitle, filled in by the same kind of background read. */
+    private var clientKeyText: TextView? = null
+
+    /** Last client-key verdict, so the row is not blank between the bind and the read. */
+    private var clientKeySummaryCache: String? = null
+
+    /** True while a rotation is in flight, so a second tap cannot start another one. */
+    private val rotating = AtomicBoolean(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ui = UiKit(this, ThemeManager.colors(this))
         ThemeManager.applySystemBars(this, ThemeManager.colors(this))
         setContentView(buildUi())
         render()
+    }
+
+    override fun onDestroy() {
+        io.shutdownNow()
+        quotaIo.shutdownNow()
+        super.onDestroy()
+    }
+
+    /**
+     * Runs [block] on [io] unless the screen is gone.
+     *
+     * shutdownNow() rejects anything submitted afterwards; a rejected execute on the way out
+     * would otherwise crash from a callback that no longer matters.
+     */
+    private fun bg(block: () -> Unit): Boolean {
+        if (!alive()) return false
+        return try {
+            io.execute(block)
+            true
+        } catch (e: RejectedExecutionException) {
+            // The executor was closed between the check above and this call.
+            false
+        }
+    }
+
+    /** Runs [block] on [quotaIo]; same shutdown guard as [bg]. */
+    private fun bgQuota(block: () -> Unit): Boolean {
+        if (!alive()) return false
+        return try {
+            quotaIo.execute(block)
+            true
+        } catch (e: RejectedExecutionException) {
+            false
+        }
+    }
+
+    /** True while the Activity can still host a dialog or a view update. */
+    private fun alive(): Boolean = !isFinishing && !isDestroyed
+
+    /**
+     * Shows a dialog the answer of a background task built.
+     *
+     * Two guards, not one: the isFinishing check covers the ordinary "user pressed back while
+     * the request was in flight", and the catch covers the window between that check and show()
+     * where the window token can still be revoked — BadTokenException is a race by nature.
+     */
+    private fun showDialogSafely(build: (MaterialAlertDialogBuilder) -> AlertDialog.Builder) {
+        if (!alive()) return
+        try {
+            // The lambda returns the builder it finished configuring (every call site ends on
+            // setPositiveButton/setNegativeButton), and the .show() happens here — after the
+            // isFinishing check — so a dialog can never be shown on a dead window token.
+            //
+            // The declared type is AlertDialog.Builder rather than AlertDialog: the button
+            // setters are declared on AlertDialog.Builder, and only some of them are overridden
+            // with a covariant return in MaterialAlertDialogBuilder. Builder accepts both, so the
+            // helper does not depend on which override the library version happens to ship.
+            build(MaterialAlertDialogBuilder(ui.dialogContext())).show()
+        } catch (e: android.view.WindowManager.BadTokenException) {
+            android.util.Log.w("CpaSettings", "dialog dropped: activity window is gone")
+        }
     }
 
     override fun onBackPressed() {
@@ -59,6 +162,12 @@ class SettingsActivity : AppCompatActivity() {
 
     companion object {
         const val RESULT_THEME_CHANGED = RESULT_FIRST_USER
+
+        /**
+         * The key every install before v2.7 seeded, and the one this repository publishes.
+         * Kept here only to recognise it; the Go side owns the replacement.
+         */
+        private const val LEGACY_CLIENT_KEY = "cpa-android-local"
     }
 
     private fun buildUi(): View {
@@ -107,6 +216,16 @@ class SettingsActivity : AppCompatActivity() {
 
         body.addView(ui.sectionTitle(getString(R.string.settings_engine)))
         body.addView(card(listOf(
+            Entry(
+                getString(R.string.settings_providers_entry),
+                providerSummaryCache ?: getString(R.string.settings_providers_desc),
+                onBind = { providerSummaryText = it }
+            ) { startActivity(Intent(this, ProvidersActivity::class.java)) },
+            Entry(
+                getString(R.string.settings_rotate_key),
+                clientKeySummaryCache ?: getString(R.string.settings_rotate_key_ok),
+                onBind = { clientKeyText = it }
+            ) { confirmRotateKey() },
             Entry(getString(R.string.settings_words), summarize(AppPrefs.sensitiveWords(this))) {
                 editWords()
             },
@@ -136,6 +255,92 @@ class SettingsActivity : AppCompatActivity() {
             Entry(getString(R.string.settings_abi), Build.SUPPORTED_ABIS.firstOrNull() ?: "—") {},
             Entry(getString(R.string.settings_hot_state), describeHotState()) {}
         ), showChevron = false))
+
+        // The provider row and the key row are the only values that need a file read, so they
+        // are filled in after the screen is on display instead of holding render() up for a YAML
+        // parse. The fields were re-bound by Entry.onBind while the cards above were built, so
+        // they point at the rows that are actually attached.
+        refreshProviderSummary()
+        refreshClientKeySummary()
+    }
+
+    /** Rereads the custom-provider summary in the background; one in flight at a time. */
+    private fun refreshProviderSummary() {
+        if (!summaryLoading.compareAndSet(false, true)) return
+        val submitted = bg {
+            val summary = providerSummary()
+            runOnUiThread {
+                summaryLoading.set(false)
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                providerSummaryCache = summary
+                providerSummaryText?.text = summary
+            }
+        }
+        if (!submitted) summaryLoading.set(false)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // The custom providers are edited on another screen; returning here has to show what
+        // that screen wrote, and it must not do it by reading config.yaml on the main thread.
+        if (providerSummaryText != null) refreshProviderSummary()
+        if (clientKeyText != null) refreshClientKeySummary()
+    }
+
+    /**
+     * Reads access.api-keys and says whether it is still the value every old install carries.
+     *
+     * Nothing migrates on its own: the random key is only generated when config.yaml does not
+     * exist, and no settings write ever touches that list. An upgrade from v2.0 therefore keeps
+     * "cpa-android-local" — a string published in the repository — forever, which is only
+     * harmless while the gateway binds loopback. This row is the one place the user can see it
+     * and fix it, so it is filled in off the main thread like every other file read here.
+     */
+    private fun refreshClientKeySummary() {
+        val submitted = bg {
+            val key = WebBridgeCompat.clientApiKey(filesDir.absolutePath)
+            val legacy = key.isEmpty() || key == LEGACY_CLIENT_KEY
+            runOnUiThread {
+                if (!alive()) return@runOnUiThread
+                clientKeySummaryCache = if (legacy) {
+                    getString(R.string.settings_rotate_key_desc)
+                } else {
+                    key
+                }
+                clientKeyText?.text = clientKeySummaryCache
+            }
+        }
+        if (!submitted) clientKeyText?.text = clientKeySummaryCache
+    }
+
+    /** Generates a new key after confirming: every configured client has to be updated. */
+    private fun confirmRotateKey() {
+        showDialogSafely { builder ->
+            builder
+                .setTitle(R.string.rotate_key_title)
+                .setMessage(R.string.rotate_key_body)
+                .setNegativeButton("取消", null)
+                .setPositiveButton(R.string.settings_rotate_key) { _, _ -> rotateClientKey() }
+        }
+    }
+
+    private fun rotateClientKey() {
+        if (!rotating.compareAndSet(false, true)) return
+        val submitted = bg {
+            val error = WebBridgeCompat.rotateClientApiKey(filesDir.absolutePath)
+            val key = if (error.isEmpty()) WebBridgeCompat.clientApiKey(filesDir.absolutePath) else ""
+            runOnUiThread {
+                rotating.set(false)
+                if (!alive()) return@runOnUiThread
+                if (error.isNotEmpty()) {
+                    toast(getString(R.string.rotate_key_failed, error))
+                } else {
+                    toast(getString(R.string.rotate_key_done, key.ifEmpty { "—" }))
+                }
+                render()
+            }
+        }
+        if (!submitted) rotating.set(false)
     }
 
     // ---------------------------------------------------------------- appearance
@@ -305,20 +510,43 @@ class SettingsActivity : AppCompatActivity() {
             AppPrefs.statusBarQuota(this)
         ) { on ->
             AppPrefs.setStatusBarQuota(this, on)
-            if (on) {
-                Thread {
-                    val entries = Credentials.list()
-                    val results = LinkedHashMap<String, Quota.Result>()
-                    for (entry in entries) {
-                        if (entry.disabled) continue
-                        results[entry.name] = Quota.fetch(entry)
-                    }
-                    runOnUiThread { QuotaNotifier.publish(this, entries, results) }
-                }.start()
-            } else {
-                QuotaNotifier.clear(this)
+            if (on) pullQuotaForNotification() else QuotaNotifier.clear(this)
+        }
+
+    /**
+     * Collects every enabled account's quota for the notification body.
+     *
+     * Rate-limited by [quotaPulling] — flipping the switch off and on again used to start a
+     * second full pull while the first was still running, and the two then raced to write
+     * QuotaNotifier's cached snapshot. The pull is skipped entirely when the gateway is not
+     * serving: every request would fail, and the result would overwrite a good snapshot with
+     * error lines.
+     */
+    private fun pullQuotaForNotification() {
+        if (!quotaPulling.compareAndSet(false, true)) return
+        // On quotaIo, not io. A full pull is one 12 s budget per enabled account, and sharing
+        // the single settings thread with it meant a proxy/word/thinking change saved after it
+        // sat in the queue for minutes with no feedback — users tapped again, thinking it failed.
+        val submitted = bgQuota {
+            val entries = Credentials.list()
+            val results = LinkedHashMap<String, Quota.Result>()
+            val serving = WebBridgeCompat.isRunning()
+            for (entry in entries) {
+                if (entry.disabled) continue
+                results[entry.name] = if (serving) {
+                    Quota.fetch(entry)
+                } else {
+                    Quota.Result(error = "网关未运行")
+                }
+            }
+            runOnUiThread {
+                quotaPulling.set(false)
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                QuotaNotifier.publish(this, entries, results)
             }
         }
+        if (!submitted) quotaPulling.set(false)
+    }
 
     /**
      * How much of the token budget the model may spend thinking before it answers.
@@ -408,7 +636,19 @@ class SettingsActivity : AppCompatActivity() {
 
     // ---------------------------------------------------------------- list rows
 
-    private class Entry(val title: String, val subtitle: String, val onClick: () -> Unit)
+    /**
+     * One row in a settings card.
+     *
+     * [onBind] hands the subtitle TextView back to the caller so a value that has to be read
+     * off the main thread (providerSummary reads config.yaml through Go) can be filled in when
+     * it arrives instead of blocking render().
+     */
+    private class Entry(
+        val title: String,
+        val subtitle: String,
+        val onBind: ((TextView) -> Unit)? = null,
+        val onClick: () -> Unit
+    )
 
     private fun card(entries: List<Entry>, showChevron: Boolean = true): MaterialCardView {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -431,6 +671,7 @@ class SettingsActivity : AppCompatActivity() {
                 textSize = 12f
                 setTextColor(ui.colors.textSecondary)
                 setPadding(0, ui.dp(3), 0, 0)
+                entry.onBind?.invoke(this)
             })
             row.addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             if (showChevron) {
@@ -457,16 +698,17 @@ class SettingsActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_TEXT
             setSingleLine()
         }
-        MaterialAlertDialogBuilder(ui.dialogContext())
-            .setTitle(R.string.settings_proxy)
-            .setView(wrap(input))
-            .setPositiveButton("保存") { _, _ ->
-                val proxy = input.text.toString().trim()
-                AppPrefs.get(this).edit().putString(AppPrefs.KEY_PROXY, proxy).apply()
-                applyQuickSettings()
-            }
-            .setNegativeButton("取消", null)
-            .show()
+        showDialogSafely { builder ->
+            builder
+                .setTitle(R.string.settings_proxy)
+                .setView(wrap(input))
+                .setPositiveButton("保存") { _, _ ->
+                    val proxy = input.text.toString().trim()
+                    AppPrefs.get(this).edit().putString(AppPrefs.KEY_PROXY, proxy).apply()
+                    applyQuickSettings()
+                }
+                .setNegativeButton("取消", null)
+        }
     }
 
     private fun editWords() {
@@ -476,28 +718,47 @@ class SettingsActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
             minLines = 3
         }
-        MaterialAlertDialogBuilder(ui.dialogContext())
-            .setTitle(R.string.settings_words)
-            .setView(wrap(input))
-            .setPositiveButton("保存") { _, _ ->
-                val words = input.text.toString().trim()
-                AppPrefs.get(this).edit().putString(AppPrefs.KEY_WORDS, words).apply()
-                applyQuickSettings()
-            }
-            .setNegativeButton("取消", null)
-            .show()
+        showDialogSafely { builder ->
+            builder
+                .setTitle(R.string.settings_words)
+                .setView(wrap(input))
+                .setPositiveButton("保存") { _, _ ->
+                    val words = input.text.toString().trim()
+                    AppPrefs.get(this).edit().putString(AppPrefs.KEY_WORDS, words).apply()
+                    applyQuickSettings()
+                }
+                .setNegativeButton("取消", null)
+        }
     }
 
+    /**
+     * The raw config.yaml editor.
+     *
+     * Nothing here may touch the file on the main thread. ensureDefaultConfig() parses the YAML
+     * and writes it back with two fsyncs, and the editor's body is the whole document — reading
+     * it on the same thread blocked the dialog from opening for as long as the disk took. The
+     * dialog is therefore only built once the text is in hand.
+     */
     private fun editConfig() {
-        val configFile = File(filesDir, "config.yaml")
-        WebBridgeCompat.ensureDefaultConfig(
-            filesDir.absolutePath,
-            AppPrefs.proxyUrl(this),
-            AppPrefs.allowLan(this),
-            AppPrefs.thinkingMode(this)
-        )
+        if (!configLoading.compareAndSet(false, true)) return
+        val proxyUrl = AppPrefs.proxyUrl(this)
+        val allowLan = AppPrefs.allowLan(this)
+        val thinking = AppPrefs.thinkingMode(this)
+        val submitted = bg {
+            WebBridgeCompat.ensureDefaultConfig(filesDir.absolutePath, proxyUrl, allowLan, thinking)
+            val text = runCatching { File(filesDir, "config.yaml").readText() }.getOrDefault("")
+            runOnUiThread {
+                configLoading.set(false)
+                if (!alive()) return@runOnUiThread
+                showConfigEditor(text)
+            }
+        }
+        if (!submitted) configLoading.set(false)
+    }
+
+    private fun showConfigEditor(text: String) {
         val editor = EditText(this).apply {
-            setText(if (configFile.exists()) configFile.readText() else "")
+            setText(text)
             setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
             gravity = Gravity.TOP or Gravity.START
             minLines = 14
@@ -505,43 +766,96 @@ class SettingsActivity : AppCompatActivity() {
             typeface = Typeface.MONOSPACE
         }
         val scroll = ScrollView(this).apply { addView(editor) }
-        MaterialAlertDialogBuilder(ui.dialogContext())
-            .setTitle("config.yaml")
-            .setView(wrap(scroll, height = ui.dp(420)))
-            .setPositiveButton("保存并重载") { _, _ ->
-                runCatching { configFile.writeText(editor.text.toString()) }
-                    .onSuccess { toast("已保存，引擎正在热重载") }
-                    .onFailure { toast("写入失败：" + it.message) }
+        try {
+            MaterialAlertDialogBuilder(ui.dialogContext())
+                .setTitle("config.yaml")
+                .setView(wrap(scroll, height = ui.dp(420)))
+                .setPositiveButton("保存并重载") { _, _ -> saveConfig(editor.text.toString()) }
+                .setNeutralButton("恢复默认") { _, _ -> resetConfig() }
+                .setNegativeButton("取消", null)
+                .show()
+        } catch (e: android.view.WindowManager.BadTokenException) {
+            android.util.Log.w("CpaSettings", "config editor dropped: window is gone")
+        }
+    }
+
+    /**
+     * Writes the edited document from a worker thread.
+     *
+     * Not File.writeText, and not a Kotlin copy of the Go writer either. Go's writeFileAtomic is
+     * the one implementation that validates the YAML, stages the *previous* bytes as .lastgood,
+     * truncates the watched inode in place and holds configMu against the other writers. A local
+     * reimplementation had already got the backup semantics wrong once (it staged the new bytes,
+     * so a crash mid-write "recovered" into a half-written file). Calling across the bridge means
+     * there is only ever one opinion about what a safe write looks like.
+     */
+    private fun saveConfig(raw: String) {
+        val dataDir = filesDir.absolutePath
+        bg {
+            val error = WebBridgeCompat.setConfigText(dataDir, raw)
+            runOnUiThread {
+                if (!alive()) return@runOnUiThread
+                if (error.isEmpty()) toast("已保存，引擎正在热重载") else toast("保存失败：" + error)
             }
-            .setNeutralButton("恢复默认") { _, _ ->
-                runCatching { configFile.delete() }
+        }
+    }
+
+    private fun resetConfig() {
+        bg {
+            // delete() answers whether it worked. runCatching{}.map{""} threw that answer away,
+            // so a delete that failed still reported "已恢复默认配置" while nothing had changed.
+            val error = runCatching {
+                val file = File(filesDir, "config.yaml")
+                if (file.exists() && !file.delete()) {
+                    "无法删除 config.yaml（文件被占用），配置没有重置"
+                } else {
+                    ""
+                }
+            }.getOrElse { it.message ?: it.javaClass.simpleName }
+            val ensure = if (error.isEmpty()) {
                 WebBridgeCompat.ensureDefaultConfig(
                     filesDir.absolutePath,
                     AppPrefs.proxyUrl(this),
                     AppPrefs.allowLan(this),
                     AppPrefs.thinkingMode(this)
                 )
-                toast("已恢复默认配置")
+            } else {
+                error
+            }
+            runOnUiThread {
+                if (!alive()) return@runOnUiThread
+                if (ensure.isEmpty()) toast("已恢复默认配置") else toast("恢复失败：" + ensure)
                 render()
             }
-            .setNegativeButton("取消", null)
-            .show()
+        }
     }
 
+    /**
+     * Pushes the preference-backed settings into config.yaml.
+     *
+     * updateQuickSettings() is a full parse-marshal-write cycle inside Go with two fsyncs; run
+     * from a switch callback on the main thread it stalled the UI on every toggle. The toasts
+     * and the re-render happen on the answer, and a second change while one is in flight waits
+     * its turn on the same single-threaded executor rather than interleaving two writers.
+     */
     private fun applyQuickSettings() {
-        val err = WebBridgeCompat.updateQuickSettings(
-            filesDir.absolutePath,
-            AppPrefs.proxyUrl(this),
-            AppPrefs.allowLan(this),
-            AppPrefs.sensitiveWords(this),
-            AppPrefs.thinkingMode(this)
-        )
-        if (err.isEmpty()) {
-            toast("已保存，引擎正在热重载")
-        } else {
-            toast("保存失败：" + err)
+        val dataDir = filesDir.absolutePath
+        val proxyUrl = AppPrefs.proxyUrl(this)
+        val allowLan = AppPrefs.allowLan(this)
+        val words = AppPrefs.sensitiveWords(this)
+        val thinking = AppPrefs.thinkingMode(this)
+        bg {
+            val err = WebBridgeCompat.updateQuickSettings(dataDir, proxyUrl, allowLan, words, thinking)
+            runOnUiThread {
+                if (!alive()) return@runOnUiThread
+                if (err.isEmpty()) {
+                    toast("已保存，引擎正在热重载")
+                } else {
+                    toast("保存失败：" + err)
+                }
+                render()
+            }
         }
-        render()
     }
 
     private fun restartGateway() {
@@ -554,36 +868,47 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun checkUpdates() {
         toast("正在检查更新…")
+        // The answer arrives from UpdateManager's worker thread, long after the user may have
+        // left this screen; building the dialog without the guard threw BadTokenException.
         UpdateManager(this).checkForUpdates { message ->
             runOnUiThread {
-                MaterialAlertDialogBuilder(ui.dialogContext())
-                    .setTitle(R.string.settings_check_update)
-                    .setMessage(message)
-                    .setPositiveButton("好", null)
-                    .show()
+                showDialogSafely { builder ->
+                    builder
+                        .setTitle(R.string.settings_check_update)
+                        .setMessage(message)
+                        .setPositiveButton("好", null)
+                }
             }
         }
     }
 
     private fun syncRules() {
         if (!AppPrefs.ruleSyncEnabled(this)) {
-            MaterialAlertDialogBuilder(ui.dialogContext())
-                .setTitle(R.string.settings_sync_rules)
-                .setMessage("远程规则会直接覆盖本地 config.yaml（包括 API 密钥与监听地址）。确认拉取？")
-                .setPositiveButton("拉取") { _, _ ->
-                    AppPrefs.setRuleSyncEnabled(this, true)
-                    runRuleSync()
-                }
-                .setNegativeButton("取消", null)
-                .show()
+            showDialogSafely { builder ->
+                builder
+                    .setTitle(R.string.settings_sync_rules)
+                    .setMessage("远程规则只会改动模型规则、敏感词、重试与日志设置；监听地址、API 密钥、管理密钥与登录凭据都保持本地不变。确认拉取？")
+                    .setPositiveButton("拉取") { _, _ ->
+                        AppPrefs.setRuleSyncEnabled(this, true)
+                        runRuleSync()
+                    }
+                    .setNegativeButton("取消", null)
+            }
         } else {
             runRuleSync()
         }
     }
 
+    /**
+     * Applies a fetched rule pack through UpdateManager, which hands the text to the Go side
+     * ([WebBridgeCompat.applyRulePack]) instead of rewriting config.yaml here: the Go path owns
+     * the whitelist of keys a remote file may touch and the in-place write the engine's watcher
+     * needs, and a Kotlin write raced the watcher with a half-written document.
+     */
     private fun runRuleSync() {
         UpdateManager(this).syncRules { ok, message ->
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 toast(message)
                 if (ok) render()
             }
@@ -605,18 +930,46 @@ class SettingsActivity : AppCompatActivity() {
                 Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + packageName))
             )
         } catch (e: ActivityNotFoundException) {
-            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            // Some OEM builds strip the direct request screen; the general list always exists,
+            // and if it does not either, the row is informational rather than a crash.
+            runCatching {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            }.onFailure { toast("这个系统没有电池优化设置入口") }
         }
     }
 
+    /**
+     * What is running, not what has been downloaded.
+     *
+     * A staged library does nothing until the process restarts — System.load() resolves a name
+     * once per process and HotSoLoader latches in Application.onCreate — so "有已下载内核" made
+     * people press 重启网关, which cannot work. Splitting loaded from pending says both which
+     * kernel is in use and whether a restart would change it.
+     */
     private fun describeHotState(): String {
         val enabled = AppPrefs.hotUpdateEnabled(this)
-        val staged = HotSoLoader.hasStaged(this)
+        val loaded = HotSoLoader.loadedKernel(this)
         return when {
             !enabled -> getString(R.string.hot_off)
-            staged -> "已开启 · 有已下载内核"
-            else -> getString(R.string.hot_on)
+            HotSoLoader.restartPending(this) -> "已开启 · 有新内核，需完全退出 App 后生效"
+            loaded.isEmpty() || loaded == "packaged" -> "已开启 · 当前用内置内核"
+            else -> "已开启 · 当前运行 " + loaded
         }
+    }
+
+    /**
+     * One line for the custom-provider row.
+     *
+     * Read from the bridge rather than from preferences: the list lives in config.yaml, which the
+     * user can also edit by hand, so the summary has to reflect the file rather than a cached copy
+     * of what this screen last wrote.
+     */
+    private fun providerSummary(): String {
+        val result = CustomProviders.load(filesDir.absolutePath)
+        if (result.error != null) return "读取失败：" + result.error
+        if (result.providers.isEmpty()) return getString(R.string.settings_providers_desc)
+        val models = result.providers.sumOf { it.models.size }
+        return result.providers.size.toString() + " 个提供商 · " + models + " 个模型"
     }
 
     private fun summarize(words: String): String {

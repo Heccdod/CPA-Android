@@ -26,8 +26,6 @@ object Credentials {
         val providerLabel: String get() = Provider.labelOf(provider)
     }
 
-    private const val BASE = "http://127.0.0.1:8317"
-
     fun list(): List<Entry> = runCatching {
         val body = request("GET", "/v8/management/credentials", null) ?: return emptyList()
         val files = JSONObject(body).optJSONArray("files") ?: return emptyList()
@@ -60,7 +58,9 @@ object Credentials {
         }
 
     private fun request(method: String, path: String, body: String?): String? {
-        val conn = URL(BASE + path).openConnection() as HttpURLConnection
+        // GatewayPort, not a constant: server.port is user-editable, and a window in which the
+        // engine listens elsewhere looks exactly like a dead gateway from here.
+        val conn = URL(GatewayPort.base() + path).openConnection() as HttpURLConnection
         conn.requestMethod = method
         conn.connectTimeout = 5000
         conn.readTimeout = 10000

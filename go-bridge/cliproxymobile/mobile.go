@@ -8,10 +8,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,9 +63,16 @@ const (
 	// let anyone on the same Wi-Fi spend the owner's quota. Loopback-only installs are unaffected
 	// either way.
 	defaultAPIKeyPrefix = "cpa-android-"
-	// legacyAPIKey is what earlier builds wrote. It is still accepted so an upgraded install does
-	// not lose the client that was already configured against it, and is replaced on the next
-	// settings write.
+	// legacyAPIKey is the fixed key earlier builds wrote into access.api-keys. It is a literal in
+	// this repository, so every install that still carries it is reachable by anyone who reads the
+	// source — which matters the moment server.host is 0.0.0.0.
+	//
+	// Upgrades are NOT converted automatically. Nothing in the settings path ever wrote
+	// access.api-keys (an earlier comment here claimed it did; that was wrong), so an installed
+	// base that upgraded from those builds still has this value in its config file. The constant
+	// survives only as [newAPIKey]'s fallback when crypto/rand is unavailable, and as the value
+	// [RotateClientAPIKey] looks for; it is still ACCEPTED by the engine until the user rotates,
+	// because rejecting it would silently lock out every client already configured against it.
 	legacyAPIKey = "cpa-android-local"
 
 	loopbackHost = "127.0.0.1"
@@ -103,9 +113,10 @@ type runtimeState struct {
 	service    *cliproxy.Service
 	cancel     context.CancelFunc
 	done       chan struct{}
-	dataDir    string
 	listenAddr string
 	logFile    *os.File
+	// generation identifies whose engine is currently installed; see recordError.
+	generation uint64
 }
 
 var state runtimeState
@@ -118,6 +129,18 @@ var state runtimeState
 // see state.service == nil during that window and both start an engine, and the second one wins
 // the assignment while the first keeps a goroutine and a log file alive forever.
 var lifecycleMu sync.Mutex
+
+// configMu serialises the read-modify-write cycles that edit config.yaml.
+//
+// Every writer here reads the file, edits the YAML tree, marshals it and writes it back. Two of
+// those interleaved lose one edit outright — measured: a provider saved from the settings screen
+// disappeared on the very next settings write, because that write had read the file before the
+// provider was added and then wrote its own tree back over it. The lock has to cover the whole
+// cycle, not just the write, or the loss comes straight back.
+var configMu sync.Mutex
+
+// generationCounter hands out the ids that tell one engine apart from the next.
+var generationCounter uint64
 
 // builds is test-only instrumentation: it counts how many engines were actually built.
 var builds int64
@@ -157,7 +180,11 @@ func RestartProxy(dataDir string) string {
 	if err := stopProxy(); err != nil {
 		return err.Error()
 	}
-	time.Sleep(150 * time.Millisecond)
+	// No settle sleep here. It used to wait 150ms "to let the port free up", but stopProxy
+	// already waits for the old engine's Run to return (it blocks on the done channel), so the
+	// listener is closed by the time we get here. The sleep was pure downtime: every restart
+	// kept 127.0.0.1:8317 refusing connections for an extra 150ms, which is exactly the window a
+	// client opening the app lands in.
 	if err := startProxy(dataDir); err != nil {
 		return err.Error()
 	}
@@ -219,6 +246,137 @@ func GetListenAddress() string {
 // present to the bundled control panel.
 func GetManagementKey() string { return ManagementKey }
 
+// ClientAPIKey returns the key a client (SillyTavern, a chat app) has to send to /v1.
+//
+// It is NOT GetManagementKey(): that one unlocks the bundled control panel, this one is the
+// access.api-keys entry the gateway accepts as a bearer token. The settings screen showed the
+// management key, so every client the user configured got 401 and the gateway looked broken.
+// Returns "" when the config or the key is missing, so the host can tell "not configured yet"
+// from "here is the key".
+func ClientAPIKey(dataDir string) string {
+	if strings.TrimSpace(dataDir) == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(configPath(dataDir))
+	if err != nil {
+		return ""
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return ""
+	}
+	keys := lookupNode(docRoot(&doc), []string{"access", "api-keys"})
+	if keys == nil || keys.Kind != yaml.SequenceNode {
+		return ""
+	}
+	for _, item := range keys.Content {
+		if item.Kind == yaml.ScalarNode {
+			if v := strings.TrimSpace(item.Value); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// RotateClientAPIKey replaces the repository-published key in access.api-keys with a fresh
+// random one.
+//
+// Older builds seeded access.api-keys with the constant "cpa-android-local", which is in this
+// repository: on an install that binds 0.0.0.0 that single string is the entire door. Upgrades
+// keep it, because nothing in the settings path ever rewrote that list — the comment claiming it
+// did was wrong. This is the explicit migration the host can offer ("更换密钥"), and it is also
+// what the app calls on a LAN bind if it wants the gate to be a real one.
+//
+// It rewrites every entry that still equals the legacy literal, leaves user-chosen keys alone, and
+// adds a generated key when the list ends up empty (an install with no access.api-keys accepts
+// nothing, so "rotate" would otherwise mean "leave it broken"). Returns "" on success — including
+// the no-op case, where the file is not touched at all — and a readable error otherwise.
+func RotateClientAPIKey(dataDir string) string {
+	if err := rotateClientAPIKey(dataDir); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func rotateClientAPIKey(dataDir string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("dataDir is required")
+	}
+	configMu.Lock()
+	defer configMu.Unlock()
+	path := configPath(dataDir)
+	recoverConfigFromBackup(path)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("先启动一次网关，让 config.yaml 生成：%w", err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("解析 config.yaml 失败：%w", err)
+	}
+	root := docRoot(&doc)
+	if root == nil || root.Kind != yaml.MappingNode {
+		return fmt.Errorf("config.yaml 根节点不是映射（实际是 %s），没有写入", kindName(root))
+	}
+
+	seq := lookupNode(root, []string{"access", "api-keys"})
+	seq = unwrapAlias(seq)
+	replaced := 0
+	var next []*yaml.Node
+	if seq != nil && seq.Kind == yaml.SequenceNode {
+		for _, item := range seq.Content {
+			value := item
+			if value != nil && value.Kind == yaml.AliasNode && value.Alias != nil {
+				value = value.Alias
+			}
+			if value != nil && value.Kind == yaml.ScalarNode && strings.TrimSpace(value.Value) == legacyAPIKey {
+				// Replace the value, keep position and style: a key's line number is what the
+				// panel and the user's own notes refer to.
+				next = append(next, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: newAPIKey()})
+				replaced++
+				continue
+			}
+			next = append(next, item)
+		}
+	}
+	if replaced == 0 && seq != nil && seq.Kind == yaml.SequenceNode && len(seq.Content) > 0 {
+		// Nothing was legacy: the file already carries keys the user chose. Do not touch it —
+		// a rotation that rewrote a working key would break every client the user configured.
+		return nil
+	}
+	if replaced > 0 {
+		seq.Content = next
+	}
+	if seq == nil || seq.Kind != yaml.SequenceNode || len(seq.Content) == 0 {
+		keys := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		keys.Content = append(keys.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: newAPIKey()})
+		if err := setPath(root, []string{"access", "api-keys"}, keys); err != nil {
+			return err
+		}
+	} else if replaced > 0 {
+		// The engine's watcher reloads on the write, and the engine re-bcrypts while loading, so
+		// the tree is written back through the normal path rather than patched in place.
+		if err := setPath(root, []string{"access", "api-keys"}, seq); err != nil {
+			return err
+		}
+	}
+
+	out, errMarshal := yaml.Marshal(&doc)
+	if errMarshal != nil {
+		return errMarshal
+	}
+	return writeFileAtomic(path, out)
+}
+
+// unwrapAlias follows an alias one level, so "access: *a" is treated like the mapping it names.
+func unwrapAlias(node *yaml.Node) *yaml.Node {
+	if node != nil && node.Kind == yaml.AliasNode && node.Alias != nil {
+		return node.Alias
+	}
+	return node
+}
+
 // GetLastError returns the last startup failure recorded by the engine, if any.
 func GetLastError() string {
 	state.mu.Lock()
@@ -240,7 +398,8 @@ func EnsureDefaultConfig(dataDir string, proxyURL string, allowLan bool, thinkin
 }
 
 // UpdateQuickSettings rewrites proxy-url, the bind host, the sensitive-word list and the
-// reasoning-visibility rule. The atomic rename triggers the engine file watcher (L2 hot reload).
+// reasoning-visibility rule, and the engine picks the file up through its watcher (L2 hot reload).
+// The write has to be in place for that to happen at all — see writeFileAtomic.
 // sensitiveWordsCSV is comma separated; an empty value restores the defaults.
 func UpdateQuickSettings(dataDir string, proxyURL string, allowLan bool, sensitiveWordsCSV string, thinkingMode string) string {
 	if err := updateQuickSettings(dataDir, proxyURL, allowLan, sensitiveWordsCSV, thinkingMode); err != nil {
@@ -268,15 +427,66 @@ func startProxy(dataDir string) error {
 	}
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
-	state.mu.Lock()
-	// A nil service means nothing is running. Do not treat a live-looking pointer as "already
-	// started" without checking: recordError clears it on failure, and the probe below catches
-	// the case where the engine died without going through recordError at all.
-	already := state.service != nil && probeListen(state.listenAddr, livenessTimeout) == nil
-	if already {
-		state.mu.Unlock()
-		return nil
+	gen, err := startProxyLocked(dataDir)
+	if err != nil {
+		// Every failure is recorded against the generation this attempt owns, so Status() says
+		// 异常 with the reason instead of sitting on "正在启动" with an empty lastError.
+		recordError(gen, err)
+		return err
 	}
+	return nil
+}
+
+// probeEngineSnapshot reads the installed engine under state.mu and dials it OUTSIDE the lock.
+//
+// Splitting the two is the point: livenessTimeout is 150ms, and the UI thread calls Status() and
+// IsRunning() on a repaint timer, so holding state.mu across the dial froze the status bar for the
+// whole timeout on every start and every restart. Nothing here writes; the caller re-checks the id
+// and the pointer under the lock before trusting the answer (see startProxyLocked).
+func probeEngineSnapshot() (svc *cliproxy.Service, gen uint64, live bool) {
+	state.mu.Lock()
+	svc = state.service
+	addr := state.listenAddr
+	gen = state.generation
+	state.mu.Unlock()
+	if svc == nil {
+		return svc, gen, false
+	}
+	return svc, gen, probeListen(addr, livenessTimeout) == nil
+}
+
+// startProxyLocked runs the whole start and returns the generation it created.
+func startProxyLocked(dataDir string) (uint64, error) {
+	// Snapshot under the lock, dial outside it. livenessTimeout is 150ms and the UI thread calls
+	// Status()/IsRunning() on a repaint timer; holding state.mu across the dial blocked every one
+	// of those callers for the whole timeout, so a start could freeze the status bar. Nothing is
+	// written here — the pointer is read, the probe runs unlocked, and the result is checked
+	// against the same generation below.
+	//
+	// A nil service means nothing is running. Do not treat a live-looking pointer as "already
+	// started" without checking: recordError clears it on failure, and the probe catches the
+	// case where the engine died without going through recordError at all.
+	probeSvc, probeGen, live := probeEngineSnapshot()
+
+	state.mu.Lock()
+	// TOCTOU guard. The probe ran unlocked, so the engine it measured may have been retired in
+	// the meantime — recordError clears the pointer without bumping the generation, and a stop
+	// (which cannot race here, lifecycleMu is held, but is checked anyway) bumps it. Only the
+	// exact pair that was probed counts as "already running"; anything else means this call has
+	// to build, and it must not return 0 for an engine that is already gone.
+	if live && state.service == probeSvc && state.generation == probeGen {
+		state.mu.Unlock()
+		// No new generation: the engine that is running stays the current one, so its own
+		// goroutine still owns the state it is reporting on.
+		return 0, nil
+	}
+	// The id is taken only once this call has decided to build, and before the goroutine below
+	// exists. Bumping it for a no-op start would orphan the live engine: its failures would be
+	// dropped as "stale" and the UI would never learn the gateway died.
+	//
+	// Incremented inline, NOT through nextGeneration(): state.mu is already held here, and a
+	// helper that locks it again deadlocks the whole bridge on the first start.
+	gen := bumpGenerationLocked()
 	// A stale pointer means the engine is unreachable but its goroutine may still be alive —
 	// that is exactly the state this path exists to recover from. Cancelling it before dropping
 	// the pointers matters: leaving it running and starting a second engine puts two Service.Run
@@ -306,28 +516,30 @@ func startProxy(dataDir string) error {
 				log.Warnf("old engine loop did not exit within %s", stopTimeout)
 			}
 		}
+		// Detach before closing, or the next log line writes into a closed descriptor.
+		detachLogger()
 		if staleLog != nil {
 			_ = staleLog.Close()
 		}
 	}
 
 	if err := ensureDir(dataDir); err != nil {
-		return fmt.Errorf("create data dir: %w", err)
+		return gen, fmt.Errorf("create data dir: %w", err)
 	}
 	if err := ensureDir(authDir(dataDir)); err != nil {
-		return fmt.Errorf("create auth dir: %w", err)
+		return gen, fmt.Errorf("create auth dir: %w", err)
 	}
 	if err := ensureDefaultConfig(dataDir, "", false, ""); err != nil {
-		return err
+		return gen, err
 	}
 
 	path := configPath(dataDir)
 	cfg, err := sdkconfig.LoadConfig(path)
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return gen, fmt.Errorf("load config: %w", err)
 	}
 	if cfg == nil {
-		return fmt.Errorf("load config: empty result")
+		return gen, fmt.Errorf("load config: empty result")
 	}
 	cfg.AuthDir = authDir(dataDir)
 
@@ -339,7 +551,7 @@ func startProxy(dataDir string) error {
 		WithLocalManagementPassword(ManagementKey).
 		Build()
 	if err != nil {
-		return fmt.Errorf("build engine: %w", err)
+		return gen, fmt.Errorf("build engine: %w", err)
 	}
 
 	attachLogger(dataDir)
@@ -349,23 +561,28 @@ func startProxy(dataDir string) error {
 	go func() {
 		defer close(done)
 		if errRun := svc.Run(ctx); errRun != nil && !strings.Contains(errRun.Error(), "context canceled") {
-			recordError(errRun)
+			recordError(gen, errRun)
 		}
 	}()
 
-	if err := waitForListen(listen, readyTimeout); err != nil {
+	if err := waitForReady(listen, readyTimeout, readinessProbe{
+		apiKey:  firstAPIKey(cfg.APIKeys),
+		authDir: cfg.AuthDir,
+	}); err != nil {
 		cancel()
-		<-done
+		// Bounded, for the same reason stopProxy bounds it: Run normally returns as soon as its
+		// context is cancelled, but a blocked shutdown must not leave the exported StartProxy
+		// hanging forever — gomobile calls it from the Kotlin side and the app would freeze.
+		select {
+		case <-done:
+		case <-time.After(stopTimeout):
+			log.Warnf("engine loop did not exit within %s after a failed start", stopTimeout)
+		}
 		// The start failed, so the logger this attempt attached is no longer wanted. Closing it
 		// here (rather than waiting for the next start to overwrite it) keeps the descriptor count
 		// flat across repeated failures, which is what a flapping network produces.
-		state.mu.Lock()
-		if state.logFile != nil {
-			_ = state.logFile.Close()
-			state.logFile = nil
-		}
-		state.mu.Unlock()
-		return fmt.Errorf("engine did not become ready on %s: %w", listen, err)
+		detachLogger()
+		return gen, fmt.Errorf("engine did not become ready on %s: %w", listen, err)
 	}
 
 	state.mu.Lock()
@@ -373,11 +590,11 @@ func startProxy(dataDir string) error {
 	state.service = svc
 	state.cancel = cancel
 	state.done = done
-	state.dataDir = dataDir
 	state.listenAddr = listen
+	state.generation = gen
 	lastError = ""
 	state.mu.Unlock()
-	return nil
+	return gen, nil
 }
 
 // Gateway states reported by Status.
@@ -435,8 +652,18 @@ func Status() string {
 // the user's "restart" could be a no-op) and to IsRunning. desiredRunning is left untouched —
 // the user still wants the gateway up, the engine just failed, and that distinction is what
 // lets the UI offer "启动" instead of claiming it already is.
-func recordError(err error) {
+func recordError(gen uint64, err error) {
 	state.mu.Lock()
+	// Only the generation that is actually installed may touch the state. startProxy waits for
+	// the previous loop to exit, but that wait is bounded: after stopTimeout it logs and carries
+	// on. The abandoned loop then returns late and calls this — and without the id it cleared
+	// the pointer and wrote "engine died" onto the healthy engine that replaced it, which is how
+	// the gateway ended up reporting 异常 while it was still serving on the port.
+	if gen != state.generation {
+		state.mu.Unlock()
+		log.Debugf("ignoring failure from engine generation %d: %v", gen, err)
+		return
+	}
 	// A deliberate stop cancels the context, and the engine's Run() returns "context canceled"
 	// for it. That is the normal path out, not a failure — recording it made a stopped gateway
 	// report 异常 with the message "context canceled" the moment the goroutine finished.
@@ -456,6 +683,16 @@ func recordError(err error) {
 	log.Errorf("cpa engine stopped: %v", err)
 }
 
+// bumpGenerationLocked hands out a fresh engine id and installs it as the current one.
+//
+// The caller must hold state.mu. It exists as a separate function only so the two places that
+// retire an engine (a start that decides to build, and every stop) bump the counter the same way.
+func bumpGenerationLocked() uint64 {
+	generationCounter++
+	state.generation = generationCounter
+	return generationCounter
+}
+
 func stopProxy() error {
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
@@ -469,9 +706,13 @@ func stopProxy() error {
 	state.done = nil
 	state.listenAddr = ""
 	state.logFile = nil
+	// A stop retires the generation as well: whatever its goroutine reports on the way out is
+	// about an engine nobody is watching any more.
+	bumpGenerationLocked()
 	state.mu.Unlock()
 
 	if svc == nil || cancel == nil {
+		detachLogger()
 		if logFile != nil {
 			_ = logFile.Close()
 		}
@@ -486,11 +727,13 @@ func stopProxy() error {
 	select {
 	case <-done:
 	case <-time.After(stopTimeout):
+		detachLogger()
 		if logFile != nil {
 			_ = logFile.Close()
 		}
 		return fmt.Errorf("engine shutdown timed out after %s", stopTimeout)
 	}
+	detachLogger()
 	if logFile != nil {
 		_ = logFile.Close()
 	}
@@ -537,6 +780,23 @@ func attachLogger(dataDir string) {
 	log.SetOutput(io.Discard)
 }
 
+// detachLogger stops logrus writing into a file this process is about to close.
+//
+// Closing the handle alone is not enough: logrus keeps the *os.File and every later log line —
+// the engine's own shutdown messages, a late goroutine, the next request — tries to write into a
+// closed descriptor and ends up as "Failed to write to log, write ...: file already closed" on
+// stderr, which on Android is invisible. The interesting messages are the ones right after a
+// stop, so they have to survive.
+func detachLogger() {
+	state.mu.Lock()
+	if state.logFile != nil {
+		_ = state.logFile.Close()
+		state.logFile = nil
+	}
+	state.mu.Unlock()
+	log.SetOutput(io.Discard)
+}
+
 // trimLogFile keeps the newest limit bytes of an oversized log, cutting at a line boundary so
 // the file never starts mid-record. A missing file or a stat error is not a failure: the caller
 // opens the file next and will surface a real problem then.
@@ -569,7 +829,12 @@ func trimLogFile(path string, limit int64) {
 }
 
 func waitForListen(addr string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	return waitForListenUntil(addr, time.Now().Add(timeout))
+}
+
+// waitForListenUntil is waitForListen against a deadline somebody else owns, so the two halves of
+// the readiness gate can share one budget instead of each spending the full timeout.
+func waitForListenUntil(addr string, deadline time.Time) error {
 	var lastErr error
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
@@ -584,6 +849,123 @@ func waitForListen(addr string, timeout time.Duration) error {
 		lastErr = fmt.Errorf("timeout")
 	}
 	return lastErr
+}
+
+// readinessProbe carries what GET /v1/models needs so the gate can be cheap.
+type readinessProbe struct {
+	apiKey  string
+	authDir string
+}
+
+// waitForReady blocks until the engine can actually serve a request, not merely until the port
+// accepts a connection.
+//
+// Measured on the device (Redmi Note 12 Turbo, Android 17): the listener answers at t=0 and the
+// model registry is populated 0.41s later. During that window gin accepts the connection and the
+// router answers "400 unknown provider for model ...", because the server starts before the core
+// auth manager has registered credentials and their models. Every client that opens the app and
+// reconnects immediately lands in that window, which is the "comes up disconnected, needs a
+// gateway restart" report: the restart was only ever a retry that happened to arrive later.
+//
+// The probe is GET /v1/models with the client key: 200 plus at least one entry means the registry
+// is populated. A configured install (credentials in authDir) additionally requires a non-empty
+// list, because the very same request answers 200 with an empty data array while models are still
+// being registered. A fresh install with no credentials has nothing to register, so a 200 is the
+// whole contract there — waiting for entries would never finish.
+func waitForReady(addr string, timeout time.Duration, probe readinessProbe) error {
+	// One budget for both halves. waitForListen and the model poll each used to start their own
+	// deadline from the full timeout, so a start that never becomes ready took twice as long as
+	// advertised to fail — 20 seconds of a frozen "正在启动" on a cold phone.
+	deadline := time.Now().Add(timeout)
+	if err := waitForListenUntil(addr, deadline); err != nil {
+		return err
+	}
+	requireModels := hasCredentials(probe.authDir)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		count, err := probeModelCount(addr, probe.apiKey)
+		if err == nil && (!requireModels || count > 0) {
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("no models registered yet")
+		}
+		time.Sleep(probeInterval)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timeout")
+	}
+	return lastErr
+}
+
+// hasCredentials reports whether any credential file exists, which decides whether the readiness
+// gate should wait for a non-empty model list.
+func hasCredentials(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			return true
+		}
+	}
+	return false
+}
+
+// probeModelCount asks GET /v1/models and returns how many models came back.
+func probeModelCount(addr, apiKey string) (int, error) {
+	host, port, errSplit := net.SplitHostPort(addr)
+	if errSplit != nil {
+		return 0, errSplit
+	}
+	if host == "" || host == anyHost || host == "::" || host == "[::]" {
+		host = loopbackHost
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := "http://" + net.JoinHostPort(host, port) + "/v1/models"
+	req, errReq := http.NewRequest(http.MethodGet, url, nil)
+	if errReq != nil {
+		return 0, errReq
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		return 0, errDo
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if errRead != nil {
+		return 0, errRead
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("models probe returned %d", resp.StatusCode)
+	}
+	var doc struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	if errJSON := json.Unmarshal(body, &doc); errJSON != nil {
+		return 0, errJSON
+	}
+	return len(doc.Data), nil
+}
+
+// firstAPIKey returns the first configured client key, which is what the readiness probe and the
+// host-side sanity checks authenticate with.
+func firstAPIKey(keys []string) string {
+	for _, k := range keys {
+		if trimmed := strings.TrimSpace(k); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func bindHost(configured string) string {
@@ -738,6 +1120,10 @@ func ensureDefaultConfig(dataDir, proxyURL string, allowLan bool, thinkingMode s
 	// runs (Go cannot read packed assets). It is rewritten on every APK update rather than
 	// preserved, because unlike config.yaml it holds no user state.
 	path := configPath(dataDir)
+	// A leftover backup means the process died in the middle of a write. Recover it BEFORE the
+	// stat below, or the truncated file it left behind is treated as a healthy config that only
+	// needs migrating, and the backup is never looked at again.
+	recoverConfigFromBackup(path)
 	if _, err := os.Stat(path); err == nil {
 		// The file predates this build, so it carries whatever the build that wrote it did:
 		// no models.catalog, and possibly the thinking level this app used to hard-code.
@@ -790,9 +1176,17 @@ func migrateExistingConfig(configPath, catalog, thinkingMode string) error {
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
 		doc = doc.Content[0]
 	}
+	if doc.Kind == yaml.DocumentNode {
+		// Still a document after the unwrap means it had no content: an empty or comment-only
+		// file. There is no root mapping to patch, and the version check below would report a
+		// change for a document that has nothing in it.
+		return fmt.Errorf("config has no root node")
+	}
 	if thinkingMode != "" && doc.Kind == yaml.MappingNode {
 		before, _ := yaml.Marshal(&root)
-		applyThinkingVisibility(doc, thinkingMode)
+		if err := applyThinkingVisibility(doc, thinkingMode); err != nil {
+			return err
+		}
 		after, _ := yaml.Marshal(&root)
 		thinkingChanged = string(before) != string(after)
 	}
@@ -811,21 +1205,25 @@ func migrateExistingConfig(configPath, catalog, thinkingMode string) error {
 		return fmt.Errorf("config root is not a YAML mapping")
 	}
 	if versionChanged {
-		setPath(doc, []string{"config-version"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: configVersion})
+		if err := setPath(doc, []string{"config-version"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: configVersion}); err != nil {
+			return err
+		}
 	}
 	if catalogChanged {
 		value := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: catalog}
-		setPath(doc, []string{"models", "catalog"}, value)
+		if err := setPath(doc, []string{"models", "catalog"}, value); err != nil {
+			return err
+		}
 	}
 	out, errMarshal := yaml.Marshal(&root)
 	if errMarshal != nil {
 		return errMarshal
 	}
 	// yaml.v3 keeps the document's head comment, so marshalling already writes the banner
-	// back. Prepending headComments(raw) on top of that duplicated it once per migration —
-	// a config touched four times carried four copies of the same five-line banner, which
-	// is exactly what the in-app editor showed. collapseDuplicateHeadComments also repairs
-	// files that already accumulated copies.
+	// back. Prepending the leading comment block on top of that duplicated it once per
+	// migration — a config touched four times carried four copies of the same five-line
+	// banner, which is exactly what the in-app editor showed.
+	// collapseDuplicateHeadComments also repairs files that already accumulated copies.
 	return writeFileAtomic(configPath, collapseDuplicateHeadComments(out))
 }
 
@@ -929,53 +1327,148 @@ func lookupPath(root *yaml.Node, path []string) string {
 	return cur.Value
 }
 
-// headComments returns the leading comment lines of a YAML file, newline-terminated.
-func headComments(raw []byte) []byte {
-	var out []byte
-	for _, line := range strings.Split(string(raw), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
-			out = append(out, line...)
-			out = append(out, '\n')
-			continue
-		}
-		break
-	}
-	return out
-}
+// configBackupSuffix is the sibling copy of the file as it was BEFORE the write that is in
+// flight. It exists only during a write and is removed once the new bytes are on disk; a leftover
+// means the process died mid-write and [recoverConfigFromBackup] puts the old content back.
+const configBackupSuffix = ".lastgood"
 
+// writeFileAtomic replaces path's contents in place, keeping a durable copy until it is done.
+//
+// It used to stage a temp file and os.Rename() it over the destination. That is atomic, but it
+// swaps the inode, and the engine's fsnotify watch is bound to the inode: measured on the
+// emulator, the first rename produced no reload event at all and every later one was invisible
+// too, so every settings change and every custom-provider save sat in the file until the next
+// restart. (The comment on UpdateQuickSettings claimed "the atomic rename triggers the engine
+// file watcher" — it never did.) An in-place write keeps the watched inode alive; four
+// consecutive in-place writes produced four reload events.
+//
+// What is lost with the rename is the all-or-nothing guarantee, so the file's CURRENT content is
+// copied aside first: if the truncate-and-write is interrupted, [recoverConfigFromBackup] puts
+// that copy back instead of leaving the engine with half a document.
+//
+// The backup holds the OLD bytes, not the new ones. It used to hold the new bytes, which made the
+// recovery path destructive: a write that failed half way left a parseable PREFIX of the new
+// document in the backup, and the next start "restored" that prefix over a perfectly good file.
 func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := ensureDir(dir); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".config-*.yaml")
+	// Refuse to install a document the engine cannot read. Every caller builds its bytes by
+	// marshalling a YAML tree, so an unparsable result means a bug here, and writing it would
+	// take a working gateway down until the next release.
+	if len(bytes.TrimSpace(data)) == 0 {
+		return fmt.Errorf("refusing to write an empty %s", filepath.Base(path))
+	}
+	var probe yaml.Node
+	if errParse := yaml.Unmarshal(data, &probe); errParse != nil {
+		return fmt.Errorf("refusing to write unparsable %s: %w", filepath.Base(path), errParse)
+	}
+
+	backup := path + configBackupSuffix
+	current, errCurrent := os.ReadFile(path)
+	switch {
+	case errCurrent == nil:
+		// Stage the old bytes. A failure here means there is nothing to fall back on, so the new
+		// document is not written at all.
+		if errBackup := writeDurable(backup, current); errBackup != nil {
+			return fmt.Errorf("stage %s: %w", filepath.Base(backup), errBackup)
+		}
+	case os.IsNotExist(errCurrent):
+		// Nothing to lose: a brand-new file needs no fallback.
+		_ = os.Remove(backup)
+	default:
+		return errCurrent
+	}
+
+	if err := writeDurable(path, data); err != nil {
+		// The backup is deliberately left in place: the next start recovers from it.
+		return err
+	}
+	_ = os.Remove(backup)
+	return nil
+}
+
+// writeDurable truncates and rewrites one file, then flushes it to disk.
+//
+// Truncating rather than creating keeps the inode, which is the whole point (see
+// writeFileAtomic). The single Write of a config-sized buffer is what makes the truncate window
+// small; the backup file is what makes it recoverable.
+func writeDurable(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		return err
+	return os.Chmod(path, 0o600)
+}
+
+// recoverConfigFromBackup restores the copy a write stages before it overwrites the file, when
+// that copy was never cleaned up — which means the write that produced it never finished.
+//
+// The presence of the file is the signal, not the state of the live config: a truncated YAML is
+// still valid YAML (half a document parses fine — the tail is what is missing), so "does the live
+// file parse" cannot tell a good file from a half-written one. A completed write always removes
+// its backup, so a leftover backup is by definition an unfinished write.
+//
+// The backup is only restored when the engine itself accepts it. Staging can be interrupted too,
+// and a half-written copy is exactly as broken as a half-written config; restoring one over a
+// readable file would turn a crash into data loss. The check goes through the SDK rather than
+// yaml.Unmarshal because "it parses" is not the same as "the engine will start on it" — a
+// document whose api-keys block lost its keys parses fine and then refuses to load, which is how
+// a recoverable crash turned into a gateway that would not come up.
+func recoverConfigFromBackup(path string) bool {
+	backup := path + configBackupSuffix
+	raw, errBackup := os.ReadFile(backup)
+	if errBackup != nil {
+		return false
 	}
-	return os.Rename(tmpName, path)
+	// Probe a COPY: LoadConfig rewrites the file it validates (it bcrypt-hashes a plaintext
+	// management secret and normalises the layout), and the bytes restored here should be the
+	// ones that were staged, not a normalised derivative of them.
+	probe, errProbe := os.CreateTemp(filepath.Dir(path), ".lastgood-probe-*")
+	if errProbe != nil {
+		return false
+	}
+	probePath := probe.Name()
+	_ = probe.Close()
+	defer func() { _ = os.Remove(probePath) }()
+	if errWrite := os.WriteFile(probePath, raw, 0o600); errWrite != nil {
+		return false
+	}
+	if _, errEngine := sdkconfig.LoadConfig(probePath); errEngine != nil {
+		// The backup itself is unusable, so there is nothing to restore; drop it so it cannot
+		// block or confuse a later write.
+		_ = os.Remove(backup)
+		log.Warnf("discarding an unusable config backup: %v", errEngine)
+		return false
+	}
+	if errRestore := writeDurable(path, raw); errRestore != nil {
+		return false
+	}
+	_ = os.Remove(backup)
+	return true
 }
 
 func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWordsCSV string, thinkingMode string) error {
 	if strings.TrimSpace(dataDir) == "" {
 		return fmt.Errorf("dataDir is required")
 	}
+	// The whole read-modify-write runs under configMu; see its comment for what two interleaved
+	// writers cost.
+	configMu.Lock()
+	defer configMu.Unlock()
+
 	path := configPath(dataDir)
 	if _, err := os.Stat(path); err != nil {
 		if !os.IsNotExist(err) {
@@ -986,6 +1479,7 @@ func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWords
 		}
 	}
 
+	recoverConfigFromBackup(path)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -995,27 +1489,41 @@ func updateQuickSettings(dataDir, proxyURL string, allowLan bool, sensitiveWords
 		return fmt.Errorf("parse config: %w", err)
 	}
 	if len(doc.Content) == 0 {
-		if err := yaml.Unmarshal([]byte("config-version: 8\n"), &doc); err != nil {
-			return err
-		}
+		return fmt.Errorf("parse config: document is empty")
 	}
 	root := doc.Content[0]
+	// The root has to be a mapping, and refusing is the whole point: setPath no longer repairs a
+	// sequence root by replacing it, and this path writes four keys — silently rewriting whatever
+	// the user had down to those four is far worse than an error the settings screen can show.
+	if root == nil || root.Kind != yaml.MappingNode {
+		return fmt.Errorf("config.yaml 根节点不是映射（实际是 %s），没有写入", kindName(root))
+	}
 
 	host := loopbackHost
 	if allowLan {
 		host = anyHost
 	}
-	setPath(root, []string{"server", "host"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: host})
-	setPath(root, []string{"requests", "proxy-url"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: strings.TrimSpace(proxyURL)})
-	setPath(root, []string{"oauth", "auth-dir"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: authDir(dataDir)})
+	if err := setPath(root, []string{"server", "host"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: host}); err != nil {
+		return err
+	}
+	if err := setPath(root, []string{"requests", "proxy-url"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: strings.TrimSpace(proxyURL)}); err != nil {
+		return err
+	}
+	if err := setPath(root, []string{"oauth", "auth-dir"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: authDir(dataDir)}); err != nil {
+		return err
+	}
 
 	seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
 	for _, w := range parseSensitiveWords(sensitiveWordsCSV) {
 		seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: w})
 	}
-	setPath(root, []string{"oauth", "providers", "antigravity", "sensitive-words"}, seq)
+	if err := setPath(root, []string{"oauth", "providers", "antigravity", "sensitive-words"}, seq); err != nil {
+		return err
+	}
 
-	applyThinkingVisibility(root, thinkingMode)
+	if err := applyThinkingVisibility(root, thinkingMode); err != nil {
+		return err
+	}
 
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
@@ -1061,7 +1569,7 @@ func normalizeThinkingMode(mode string) string {
 // Implemented as a requests.payload.override rule so the behaviour is visible in config.yaml
 // and survives an upstream sync. Whatever the mode, only the rule this function owns is
 // replaced: a user's own override entries are left untouched.
-func applyThinkingVisibility(root *yaml.Node, mode string) {
+func applyThinkingVisibility(root *yaml.Node, mode string) error {
 	path := []string{"requests", "payload", "override"}
 	// Always drop our own rule first, then re-add the one this mode needs. Rewriting in place
 	// rather than appending keeps config.yaml from growing a rule per mode change.
@@ -1083,7 +1591,7 @@ func applyThinkingVisibility(root *yaml.Node, mode string) {
 			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: "0"},
 		)
 	default:
-		return
+		return nil
 	}
 
 	rule := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
@@ -1093,15 +1601,32 @@ func applyThinkingVisibility(root *yaml.Node, mode string) {
 			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "*"},
 		}},
 	}}
-	setPath(rule, []string{"models"}, models)
-	setPath(rule, []string{"params"}, params)
+	if err := setPath(rule, []string{"models"}, models); err != nil {
+		return err
+	}
+	if err := setPath(rule, []string{"params"}, params); err != nil {
+		return err
+	}
 
 	seq := lookupNode(root, path)
 	if seq == nil || seq.Kind != yaml.SequenceNode {
 		seq = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
-		setPath(root, path, seq)
+		// setPath COPIES the value struct into the tree, so the local seq is a different pointer
+		// from the one the document now holds; appending to it afterwards would write the rule
+		// into a node nobody can see. Look the node up again instead. This is not hypothetical:
+		// with requests.payload.override missing or shaped like a mapping instead of a list (both
+		// happen in hand-edited configs), the rule was silently never written and the mode switch
+		// did nothing at all.
+		if err := setPath(root, path, seq); err != nil {
+			return err
+		}
+		seq = lookupNode(root, path)
+		if seq == nil {
+			return fmt.Errorf("write %s: path disappeared", strings.Join(path, "."))
+		}
 	}
 	seq.Content = append(seq.Content, rule)
+	return nil
 }
 
 // managedThinkingParams are the payload keys this app is allowed to write or remove. Anything
@@ -1210,6 +1735,11 @@ func removePath(root *yaml.Node, path []string) {
 	key := path[len(path)-1]
 	kept := parent.Content[:0]
 	for j := 0; j+1 < len(parent.Content); j += 2 {
+		// Every copy goes, matching setPath, which writes every copy. A duplicated key is not a
+		// valid document — the engine's own loader fails it with "mapping key %q already
+		// defined" — so "which copy did you mean" has no good answer; the two operations at
+		// least have to agree, or a remove-then-set pair leaves one copy behind carrying the
+		// value the caller thought it had just deleted.
 		if parent.Content[j].Value == key {
 			continue
 		}
@@ -1235,41 +1765,768 @@ func parseSensitiveWords(csv string) []string {
 	return out
 }
 
-func setPath(root *yaml.Node, path []string, value *yaml.Node) {
+// setPath writes value at path, creating the intermediate mappings it needs.
+//
+// Two rules keep it from destroying a document it does not fully understand. It refuses a root
+// that is not a mapping instead of turning it into one — the previous version did exactly that,
+// and since setPath is the tool every writer uses, one call on a config whose root had become a
+// sequence (a bad merge, an external tool) replaced the entire user configuration with the three
+// or four keys that writer happened to set. And an intermediate node that holds something other
+// than a mapping is an error, not something to flatten: "server: []" means the file is not what
+// the caller thinks it is, and silently overwriting it loses whatever was there.
+func setPath(root *yaml.Node, path []string, value *yaml.Node) error {
 	if root == nil {
-		return
+		return fmt.Errorf("set %s: no document", strings.Join(path, "."))
 	}
 	if root.Kind != yaml.MappingNode {
-		root.Kind = yaml.MappingNode
-		root.Tag = "!!map"
-		root.Content = nil
+		return fmt.Errorf("set %s: document root is %s, not a mapping", strings.Join(path, "."), kindName(root))
 	}
-	cur := root
+	// cur is a WORKING SET, not a single node: a key that appears twice in one mapping makes the
+	// document invalid at the engine's loader ("mapping key %q already defined"), so there is no
+	// "right" copy to pick. Every copy gets the same value instead, which is what makes
+	// set and removePath agree — removePath deletes all of them, and a remove-then-set pair that
+	// touched only the first would leave the value the caller meant to replace sitting in the
+	// second copy, where the engine's error message then points at it.
+	cur := []*yaml.Node{root}
 	for i, key := range path {
 		last := i == len(path)-1
-		var child *yaml.Node
-		for j := 0; j+1 < len(cur.Content); j += 2 {
-			if cur.Content[j].Value == key {
-				child = cur.Content[j+1]
-				break
+		next := make([]*yaml.Node, 0, len(cur))
+		// The first copy installed takes the caller's node as-is; further copies are cloned so
+		// two positions in the tree never share one Content slice (editing one later would then
+		// silently edit the other).
+		installed := false
+		take := func() *yaml.Node {
+			if installed {
+				return cloneNode(value)
 			}
+			installed = true
+			return value
+		}
+		for _, node := range cur {
+			found := false
+			for j := 0; j+1 < len(node.Content); j += 2 {
+				if node.Content[j].Value != key {
+					continue
+				}
+				found = true
+				child := node.Content[j+1]
+				if last {
+					overwriteNode(child, take())
+					continue
+				}
+				if child.Kind == yaml.ScalarNode && child.Tag == "!!null" && child.Value == "" {
+					// An explicitly empty key ("server:" with nothing under it) is the one case
+					// where building the mapping is what the user meant.
+					child.Kind, child.Tag, child.Value = yaml.MappingNode, "!!map", ""
+				} else if child.Kind != yaml.MappingNode {
+					return fmt.Errorf("set %s: %s is %s, not a mapping", strings.Join(path, "."), key, kindName(child))
+				}
+				next = append(next, child)
+			}
+			if found {
+				continue
+			}
+			if last {
+				node.Content = append(node.Content,
+					&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, take())
+				continue
+			}
+			child := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			node.Content = append(node.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, child)
+			next = append(next, child)
 		}
 		if last {
-			if child != nil {
-				*child = *value
-				return
-			}
-			cur.Content = append(cur.Content,
-				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, value)
-			return
+			return nil
 		}
-		if child == nil {
-			child = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-			cur.Content = append(cur.Content,
-				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, child)
-		} else if child.Kind != yaml.MappingNode {
-			*child = yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-		}
-		cur = child
+		cur = next
 	}
+	return nil
+}
+
+// overwriteNode replaces a node's content while keeping what identifies it to the rest of the
+// document.
+//
+// A plain *child = *value drops Anchor, Alias and all three comment fields, because they are part
+// of the struct being overwritten. Losing the comments is cosmetic; losing the anchor is not: any
+// other node written as "*h" then points at an anchor that no longer exists, yaml.Marshal happily
+// emits the dangling reference, and the engine refuses the file it just had written for it —
+// "unknown anchor 'h' referenced" on the next start.
+func overwriteNode(child, value *yaml.Node) {
+	if child == nil || value == nil {
+		return
+	}
+	anchor := child.Anchor
+	head, line, foot := child.HeadComment, child.LineComment, child.FootComment
+	*child = *value
+	child.Anchor = anchor
+	child.HeadComment = head
+	child.LineComment = line
+	child.FootComment = foot
+	// Alias is deliberately not carried over. A node that was itself "*h" has no content of its
+	// own, and yaml.Marshal would emit the alias again, silently dropping the value just written.
+	child.Alias = nil
+}
+
+// ---------------------------------------------------------------------------- custom providers
+//
+// Users who pay for an OpenAI-compatible service (DeepSeek, Kimi, OpenRouter, a local llama.cpp…)
+// want it behind the same gateway as the OAuth accounts, so one base URL in SillyTavern reaches
+// every model they own. The kernel already supports that through api-keys.openai-compatibility;
+// what was missing was a way to edit it without hand-writing YAML, so these three exports carry
+// one group list in and out as JSON (gobind cannot marshal structs).
+
+// customProviderModel is one entry of a group's models list. Alias is what clients ask for and
+// Name is what the upstream is told; an empty alias means "same as name".
+type customProviderModel struct {
+	Name  string `json:"name"`
+	Alias string `json:"alias,omitempty"`
+}
+
+// customProvider is one api-keys.openai-compatibility group.
+type customProvider struct {
+	Name     string                `json:"name"`
+	BaseURL  string                `json:"baseUrl"`
+	Keys     []string              `json:"keys,omitempty"`
+	Models   []customProviderModel `json:"models,omitempty"`
+	Disabled bool                  `json:"disabled,omitempty"`
+}
+
+// Field caps for a custom provider.
+//
+// These are not taste: everything here is written into config.yaml verbatim, and the file is
+// re-parsed by the engine at every start. An unbounded name or a 200 KB model list is a config
+// the settings screen can no longer load (the whole document goes through the WebView bridge as
+// one JSON string), and C0 control characters are the one class yaml.v3 will happily quarantine
+// into double quotes while the engine's own loader and the panel both choke on them.
+const (
+	maxProviderNameLen  = 64
+	maxModelNameLen     = 128
+	maxModelAliasLen    = 128
+	maxProviderKeyLen   = 512
+	maxProviderKeys     = 32
+	maxProviderModels   = 256
+	maxProviderCount    = 64
+	maxProviderURLBytes = 2048
+)
+
+// validateProviderFields rejects a provider the settings screen must never be able to save.
+//
+// The old check was a bare prefix test, so "http://", "http:///x" and "https:// " all passed:
+// they are written, the engine loads them, and every request through that group fails at dial
+// time with an error the panel cannot attribute to the field the user edited.
+func validateProviderFields(index int, name string, p customProvider) error {
+	base := strings.TrimSpace(p.BaseURL)
+	if base == "" {
+		return fmt.Errorf("%s 缺少接口地址", name)
+	}
+	if err := validateProviderBaseURL(base); err != nil {
+		return fmt.Errorf("%s 的接口地址%s", name, err)
+	}
+	if err := checkFieldText(name, maxProviderNameLen, "提供商名称"); err != nil {
+		return fmt.Errorf("第 %d 个提供商：%w", index+1, err)
+	}
+	if len(p.Keys) > maxProviderKeys {
+		return fmt.Errorf("%s 的 Key 最多 %d 个（现在 %d 个）", name, maxProviderKeys, len(p.Keys))
+	}
+	for _, k := range p.Keys {
+		if err := checkFieldText(k, maxProviderKeyLen, "Key"); err != nil {
+			return fmt.Errorf("%s：%w", name, err)
+		}
+	}
+	if len(p.Models) > maxProviderModels {
+		return fmt.Errorf("%s 的模型最多 %d 个（现在 %d 个）", name, maxProviderModels, len(p.Models))
+	}
+	for _, m := range p.Models {
+		if err := checkFieldText(m.Name, maxModelNameLen, "模型名"); err != nil {
+			return fmt.Errorf("%s：%w", name, err)
+		}
+		if err := checkFieldText(m.Alias, maxModelAliasLen, "模型别名"); err != nil {
+			return fmt.Errorf("%s：%w", name, err)
+		}
+	}
+	return nil
+}
+
+// validateProviderBaseURL checks the whole URL, not just its prefix.
+//
+// Requirements, all of them load-bearing for "does a request through this group ever work":
+// a http/https scheme, a non-empty host, and a host that is either loopback, a bare hostname
+// with a dot, or a literal IP. A single-label host is allowed only as "localhost": "https://x/v1"
+// resolves through search domains on Android and fails in a way the panel would report as a
+// provider outage.
+func validateProviderBaseURL(raw string) error {
+	if len(raw) > maxProviderURLBytes {
+		return fmt.Errorf("太长（最多 %d 字节）", maxProviderURLBytes)
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("含有控制字符")
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("无法解析：%w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("要以 http:// 或 https:// 开头")
+	}
+	// The character class above already rejected every space, but url.Parse accepts a URL whose
+	// path starts with one after percent-decoding ("https://x/v1 "), and that lands in YAML as
+	// trailing whitespace the user cannot see.
+	if strings.TrimSpace(u.Path) != u.Path || strings.TrimSpace(u.RawQuery) != u.RawQuery {
+		return fmt.Errorf("不能以空格结尾")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("缺少主机名")
+	}
+	if u.User != nil && u.User.Username() == "" {
+		return fmt.Errorf("主机名是空的")
+	}
+	if net.ParseIP(host) != nil || host == "localhost" {
+		return nil
+	}
+	if !strings.Contains(host, ".") {
+		return fmt.Errorf("里的主机名 %q 不完整", host)
+	}
+	return nil
+}
+
+// checkFieldText rejects text that is over the cap or carries C0 control characters.
+func checkFieldText(v string, max int, what string) error {
+	if len(v) > max {
+		return fmt.Errorf("%s 最长 %d 字节（现在 %d 字节）", what, max, len(v))
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x20 || v[i] == 0x7f {
+			return fmt.Errorf("%s 含有控制字符（第 %d 个字节是 0x%02x）", what, i+1, v[i])
+		}
+	}
+	return nil
+}
+
+// customProviderList is the JSON envelope both directions use. Error is only ever set on read.
+type customProviderList struct {
+	Providers []customProvider `json:"providers"`
+	Error     string           `json:"error,omitempty"`
+}
+
+// GetCustomProviders returns the configured OpenAI-compatible providers as JSON.
+func GetCustomProviders(dataDir string) string {
+	list := customProviderList{Providers: []customProvider{}}
+	providers, err := readCustomProviders(dataDir)
+	if err != nil {
+		list.Error = err.Error()
+	} else if providers != nil {
+		list.Providers = providers
+	}
+	out, errMarshal := json.Marshal(list)
+	if errMarshal != nil {
+		return "{\"providers\":[],\"error\":\"encode failed\"}"
+	}
+	return string(out)
+}
+
+// SetCustomProviders replaces the whole group list with the JSON payload and reloads the engine.
+func SetCustomProviders(dataDir string, payload string) string {
+	var in customProviderList
+	if err := json.Unmarshal([]byte(payload), &in); err != nil {
+		return "解析失败：" + err.Error()
+	}
+	if err := writeCustomProviders(dataDir, in.Providers); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func readCustomProviders(dataDir string) ([]customProvider, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil, fmt.Errorf("dataDir is required")
+	}
+	path := configPath(dataDir)
+	// No recovery here. Reading the settings screen must not rewrite config.yaml: the restore
+	// path was reached from this getter, so merely opening the provider editor could replace a
+	// good file with a stale backup. Recovery belongs to startup and to the writers below.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var doc yaml.Node
+	if errUnmarshal := yaml.Unmarshal(raw, &doc); errUnmarshal != nil {
+		return nil, fmt.Errorf("解析 config.yaml 失败：%w", errUnmarshal)
+	}
+	groups := lookupNode(docRoot(&doc), []string{"api-keys", "openai-compatibility"})
+	if groups == nil || groups.Kind != yaml.SequenceNode {
+		return nil, nil
+	}
+	out := make([]customProvider, 0, len(groups.Content))
+	for _, item := range groups.Content {
+		if item == nil || item.Kind != yaml.MappingNode {
+			continue
+		}
+		p := customProvider{
+			Name:     strings.TrimSpace(scalarAt(item, "name")),
+			BaseURL:  strings.TrimSpace(scalarAt(item, "base-url")),
+			Disabled: strings.EqualFold(scalarAt(item, "disabled"), "true"),
+		}
+		// A file written by this app uses keys:, a hand-written v8 file may use
+		// api-key-entries:, and the legacy layout put one key per group. Read all three so the
+		// UI never shows a provider that works as if it had no key.
+		if keys := lookupNode(item, []string{"keys"}); keys != nil && keys.Kind == yaml.SequenceNode {
+			for _, k := range keys.Content {
+				if v := strings.TrimSpace(scalarAt(k, "api-key")); v != "" {
+					p.Keys = append(p.Keys, v)
+				}
+			}
+		} else if entries := lookupNode(item, []string{"api-key-entries"}); entries != nil && entries.Kind == yaml.SequenceNode {
+			for _, k := range entries.Content {
+				if v := strings.TrimSpace(scalarAt(k, "api-key")); v != "" {
+					p.Keys = append(p.Keys, v)
+				}
+			}
+		} else if v := strings.TrimSpace(scalarAt(item, "api-key")); v != "" {
+			p.Keys = append(p.Keys, v)
+		}
+		if models := lookupNode(item, []string{"models"}); models != nil && models.Kind == yaml.SequenceNode {
+			for _, m := range models.Content {
+				name := strings.TrimSpace(scalarAt(m, "name"))
+				if name == "" {
+					continue
+				}
+				p.Models = append(p.Models, customProviderModel{Name: name, Alias: strings.TrimSpace(scalarAt(m, "alias"))})
+			}
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func writeCustomProviders(dataDir string, providers []customProvider) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("dataDir is required")
+	}
+	configMu.Lock()
+	defer configMu.Unlock()
+	path := configPath(dataDir)
+	recoverConfigFromBackup(path)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("先启动一次网关，让 config.yaml 生成：%w", err)
+	}
+	var doc yaml.Node
+	if errUnmarshal := yaml.Unmarshal(raw, &doc); errUnmarshal != nil {
+		return fmt.Errorf("解析 config.yaml 失败：%w", errUnmarshal)
+	}
+	root := docRoot(&doc)
+	if root == nil || root.Kind != yaml.MappingNode {
+		return fmt.Errorf("config.yaml 根节点不是映射")
+	}
+
+	existing := map[string]*yaml.Node{}
+	existingModels := map[string]map[string]*yaml.Node{}
+	if groups := lookupNode(root, []string{"api-keys", "openai-compatibility"}); groups != nil && groups.Kind == yaml.SequenceNode {
+		for _, item := range groups.Content {
+			if item == nil || item.Kind != yaml.MappingNode {
+				continue
+			}
+			name := strings.TrimSpace(scalarAt(item, "name"))
+			// Keyed case-insensitively, because the duplicate check below is: renaming "DeepSeek"
+			// to "deepseek" is a rename to this screen, and looking the old group up by the exact
+			// spelling threw away everything the screen does not edit (priority, headers,
+			// display-name) instead of carrying it over.
+			key := strings.ToLower(name)
+			if name != "" {
+				existing[key] = item
+			}
+			byModel := map[string]*yaml.Node{}
+			if models := lookupNode(item, []string{"models"}); models != nil && models.Kind == yaml.SequenceNode {
+				for _, m := range models.Content {
+					if key := strings.TrimSpace(scalarAt(m, "name")); key != "" {
+						byModel[key] = m
+					}
+				}
+			}
+			existingModels[key] = byModel
+		}
+	}
+
+	if len(providers) > maxProviderCount {
+		return fmt.Errorf("最多 %d 个提供商（现在 %d 个）", maxProviderCount, len(providers))
+	}
+	seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	seen := make(map[string]bool, len(providers))
+	for index, p := range providers {
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			return fmt.Errorf("第 %d 个提供商缺少名称", index+1)
+		}
+		if seen[strings.ToLower(name)] {
+			return fmt.Errorf("提供商名称重复：%s", name)
+		}
+		seen[strings.ToLower(name)] = true
+		if err := validateProviderFields(index, name, p); err != nil {
+			return err
+		}
+		base := strings.TrimSpace(p.BaseURL)
+
+		node := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		// Start from the group already on disk so fields this screen does not manage
+		// (headers, priority, request-retry, prefix…) survive the round trip.
+		if old := existing[strings.ToLower(name)]; old != nil {
+			node = cloneNode(old)
+		}
+		if err := setPath(node, []string{"name"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: name}); err != nil {
+			return err
+		}
+		if err := setPath(node, []string{"base-url"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: base}); err != nil {
+			return err
+		}
+		if p.Disabled {
+			if err := setPath(node, []string{"disabled"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"}); err != nil {
+				return err
+			}
+		} else {
+			removePath(node, []string{"disabled"})
+		}
+		// keys: is the v8 spelling; the loader expands it into api-key-entries. Writing the
+		// expanded form too would leave two lists the runtime has to agree about.
+		removePath(node, []string{"api-key-entries"})
+		keys := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		for _, k := range p.Keys {
+			if v := strings.TrimSpace(k); v != "" {
+				keys.Content = append(keys.Content, &yaml.Node{
+					Kind: yaml.MappingNode, Tag: "!!map",
+					Content: []*yaml.Node{
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: "api-key"},
+						{Kind: yaml.ScalarNode, Tag: "!!str", Value: v},
+					},
+				})
+			}
+		}
+		// keys: is ALWAYS written, even empty. The engine's v8 expansion (internal/config/
+		// config_v8.go expandV8Groups) rejects a group whose keys node is missing or is not a
+		// sequence, and it validates before anything else runs — so a provider saved without a
+		// key (a local llama.cpp or ollama endpoint, which is the obvious thing to configure
+		// here) used to write a config the engine then refused to load at all: the gateway would
+		// not start until the user found and deleted the block by hand. An empty list is
+		// accepted by validateWeightSequenceNode (it iterates zero entries) and starts fine.
+		if err := setPath(node, []string{"keys"}, keys); err != nil {
+			return err
+		}
+
+		models := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		oldModels := existingModels[strings.ToLower(name)]
+		for _, m := range p.Models {
+			modelName := strings.TrimSpace(m.Name)
+			if modelName == "" {
+				continue
+			}
+			alias := strings.TrimSpace(m.Alias)
+			if alias == "" {
+				alias = modelName
+			}
+			mn := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			if old := oldModels[modelName]; old != nil {
+				mn = cloneNode(old)
+			}
+			if err := setPath(mn, []string{"name"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: modelName}); err != nil {
+				return err
+			}
+			if err := setPath(mn, []string{"alias"}, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: alias}); err != nil {
+				return err
+			}
+			models.Content = append(models.Content, mn)
+		}
+		if len(models.Content) == 0 {
+			return fmt.Errorf("%s 至少要写一个模型名", name)
+		}
+		if err := setPath(node, []string{"models"}, models); err != nil {
+			return err
+		}
+		seq.Content = append(seq.Content, node)
+	}
+
+	if len(seq.Content) == 0 {
+		removePath(root, []string{"api-keys", "openai-compatibility"})
+		removeEmptyPath(root, []string{"api-keys"})
+	} else if err := setPath(root, []string{"api-keys", "openai-compatibility"}, seq); err != nil {
+		return err
+	}
+
+	out, errMarshal := yaml.Marshal(&doc)
+	if errMarshal != nil {
+		return errMarshal
+	}
+	// The atomic rename is what the engine's file watcher sees; writing in place would let it
+	// reload a half-written file.
+	return writeFileAtomic(path, out)
+}
+
+// kindName describes a node kind for an error message, without dragging yaml.Kind's integer into
+// the text the settings screen shows.
+func kindName(node *yaml.Node) string {
+	if node == nil {
+		return "空"
+	}
+	switch node.Kind {
+	case yaml.DocumentNode:
+		return "文档"
+	case yaml.MappingNode:
+		return "映射"
+	case yaml.SequenceNode:
+		return "列表"
+	case yaml.ScalarNode:
+		return "标量"
+	case yaml.AliasNode:
+		return "别名"
+	default:
+		return "未知节点"
+	}
+}
+
+func docRoot(doc *yaml.Node) *yaml.Node {
+	if doc == nil {
+		return nil
+	}
+	if doc.Kind == yaml.DocumentNode {
+		if len(doc.Content) == 0 {
+			return nil
+		}
+		return doc.Content[0]
+	}
+	return doc
+}
+
+// scalarAt returns a mapping child's scalar value, or "" when absent.
+func scalarAt(node *yaml.Node, key string) string {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return ""
+	}
+	for j := 0; j+1 < len(node.Content); j += 2 {
+		if node.Content[j].Value == key {
+			return node.Content[j+1].Value
+		}
+	}
+	return ""
+}
+
+// cloneNode deep-copies a YAML subtree so an edit cannot mutate the tree it was read from.
+func cloneNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	dup := *node
+	if len(node.Content) > 0 {
+		dup.Content = make([]*yaml.Node, len(node.Content))
+		for i, child := range node.Content {
+			dup.Content[i] = cloneNode(child)
+		}
+	}
+	return &dup
+}
+
+// removeEmptyPath drops a mapping that ended up with no children, so adding and then deleting
+// the last custom provider does not leave an empty api-keys: block behind.
+func removeEmptyPath(root *yaml.Node, path []string) {
+	node := lookupNode(root, path)
+	if node == nil {
+		return
+	}
+	if node.Kind == yaml.MappingNode && len(node.Content) == 0 {
+		removePath(root, path)
+	}
+}
+
+// SetConfigText installs a config.yaml typed or pasted by the user in the full-text editor.
+//
+// The editor used to write the file directly from the UI thread, which meant one stray keystroke
+// could take the gateway down and, worse, that the backup written there held the NEW bytes — the
+// exact inversion that made this file's recovery path destructive (a failed write left a parseable
+// prefix that the next start "restored" over a good config). Everything that writes config.yaml
+// goes through writeFileAtomic for the same reason: it refuses text that does not parse, stages the
+// OLD bytes as .lastgood, truncates and rewrites the same inode so the engine's watcher still
+// fires, and drops the backup last.
+//
+// Returns "" on success and a readable error otherwise; on error the file is untouched.
+func SetConfigText(dataDir, text string) string {
+	if err := setConfigText(dataDir, text); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func setConfigText(dataDir, text string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("dataDir is required")
+	}
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("配置内容为空")
+	}
+	body := []byte(text)
+	var doc yaml.Node
+	if err := yaml.Unmarshal(body, &doc); err != nil {
+		return fmt.Errorf("YAML 解析失败：%w", err)
+	}
+	root := docRoot(&doc)
+	if root == nil {
+		return fmt.Errorf("YAML 没有内容")
+	}
+	if root.Kind != yaml.MappingNode {
+		// A v8 config is a mapping. Anything else parses but the engine will not start on it, and
+		// accepting it here would let the editor save the gateway into a state it cannot boot from.
+		return fmt.Errorf("根节点必须是映射（实际是 %s）", kindName(root))
+	}
+	if lookupPath(&doc, []string{"config-version"}) == "" {
+		// Not fatal on its own (the engine tolerates a legacy file), but the editor is the only
+		// place a user can produce a document without it, and silently switching the schema
+		// selector off is not something the settings screen should allow.
+		return fmt.Errorf("缺少 config-version")
+	}
+
+	configMu.Lock()
+	defer configMu.Unlock()
+	path := configPath(dataDir)
+	// A leftover backup means an earlier write of ours was interrupted. Recover it first: the user
+	// is about to replace this file, and merging into a half-written one would carry the damage
+	// forward.
+	recoverConfigFromBackup(path)
+	return writeFileAtomic(path, body)
+}
+
+// ---------------------------------------------------------------------------- remote rule packs
+//
+// The Android updater used to fetch a rules file and append it to config.yaml as a comment block,
+// which changed nothing and grew the file forever; it also wrote it back by renaming, which killed
+// the engine's watcher. ApplyRulePack is the supported way in: it parses the remote document and
+// merges ONLY the sections listed in rulePackPaths into the local file.
+
+// rulePackPaths is the complete list of paths a remote rule pack may set.
+//
+// It is a whitelist rather than a blacklist on purpose: a remote file is a complete v8 config
+// (server, access, management, oauth, routing, observability), so "copy everything except these
+// keys" would mean the day upstream adds a section, the remote document starts controlling it.
+// Anything not named here — server.host, server.port, access.api-keys, management.*,
+// oauth.auth-dir, api-keys.openai-compatibility, config-version — can never be reached from a
+// rule pack, not even to "restore" it.
+var rulePackPaths = [][]string{
+	{"requests", "payload"},
+	{"requests", "streaming"},
+	{"oauth", "providers", "antigravity", "sensitive-words"},
+	{"routing"},
+	{"observability"},
+}
+
+// rulePackMaxBytes bounds the remote document. A rules file is a few kilobytes; anything larger
+// is a download error or an attempt to fill the device.
+const rulePackMaxBytes = 512 << 10
+
+// ApplyRulePack merges the whitelisted sections of a remote v8 YAML document into config.yaml.
+// Returns "" on success and a readable error otherwise; the file is untouched on error.
+func ApplyRulePack(dataDir string, text string) string {
+	if err := applyRulePack(dataDir, text); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func applyRulePack(dataDir, text string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return fmt.Errorf("dataDir is required")
+	}
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("规则内容为空")
+	}
+	if len(text) > rulePackMaxBytes {
+		return fmt.Errorf("规则内容过大：%d 字节", len(text))
+	}
+	var remote yaml.Node
+	if err := yaml.Unmarshal([]byte(text), &remote); err != nil {
+		// Return before touching anything: a rule pack that does not parse must not be able to
+		// leave a half-merged config behind.
+		return fmt.Errorf("解析规则失败：%w", err)
+	}
+	remoteRoot := docRoot(&remote)
+	if remoteRoot == nil || remoteRoot.Kind != yaml.MappingNode {
+		return fmt.Errorf("规则根节点不是映射（实际是 %s）", kindName(remoteRoot))
+	}
+
+	configMu.Lock()
+	defer configMu.Unlock()
+
+	path := configPath(dataDir)
+	recoverConfigFromBackup(path)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("先启动一次网关，让 config.yaml 生成：%w", err)
+		}
+		return err
+	}
+	var doc yaml.Node
+	if errUnmarshal := yaml.Unmarshal(raw, &doc); errUnmarshal != nil {
+		return fmt.Errorf("解析 config.yaml 失败：%w", errUnmarshal)
+	}
+	root := docRoot(&doc)
+	if root == nil || root.Kind != yaml.MappingNode {
+		return fmt.Errorf("config.yaml 根节点不是映射（实际是 %s），没有写入", kindName(root))
+	}
+
+	merged := 0
+	for _, p := range rulePackPaths {
+		node := lookupNode(remoteRoot, p)
+		if node == nil {
+			continue
+		}
+		value := cloneNode(node)
+		if errSanitize := sanitizeRemoteNode(value, strings.Join(p, ".")); errSanitize != nil {
+			return errSanitize
+		}
+		if err := setPath(root, p, value); err != nil {
+			return err
+		}
+		merged++
+	}
+	if merged == 0 {
+		// Nothing in the pack is allowed here. Report success rather than error: a pack that only
+		// carries server:/access: is exactly what the updater ships, and failing it would make the
+		// app retry forever.
+		return nil
+	}
+
+	out, errMarshal := yaml.Marshal(&doc)
+	if errMarshal != nil {
+		return errMarshal
+	}
+	// writeFileAtomic writes in place through writeDurable — it stages the file's current bytes
+	// as .lastgood and then truncates and rewrites the same inode, never a rename, because the
+	// engine's fsnotify watch is bound to the inode and a rename would silence every later reload.
+	return writeFileAtomic(path, out)
+}
+
+// sanitizeRemoteNode makes a copied remote subtree safe to emit inside our own document.
+//
+// Anchors and aliases are the dangerous part: the remote file may reference an anchor defined in
+// a section we deliberately did NOT copy, and yaml.Marshal will happily write the dangling alias,
+// producing a config the engine then refuses to load ("unknown anchor ... referenced"). Anchors
+// are dropped and aliases are refused outright rather than resolved, so a rule pack cannot smuggle
+// a value in through an indirection this function does not understand.
+func sanitizeRemoteNode(node *yaml.Node, where string) error {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.AliasNode {
+		return fmt.Errorf("规则 %s 里含有 YAML 别名引用，已拒绝", where)
+	}
+	node.Anchor = ""
+	for _, child := range node.Content {
+		if err := sanitizeRemoteNode(child, where); err != nil {
+			return err
+		}
+	}
+	return nil
 }

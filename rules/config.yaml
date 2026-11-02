@@ -1,6 +1,16 @@
 # CPA-Android remote rule file (L2 hot-reload channel).
-# UpdateManager.syncRules() downloads this file, atomically replaces filesDir/config.yaml and
-# lets the CLIProxyAPI file watcher hot-reload it in milliseconds - no rebuild, no reinstall.
+#
+# UpdateManager.syncRules() downloads this file and hands it to the Go bridge, which merges only
+# the sections listed below into filesDir/config.yaml and lets the engine's file watcher hot-reload
+# the result — no rebuild, no reinstall, no restart.
+#
+# What a remote file MAY change (whitelist, enforced in ApplyRulePack):
+#   requests.payload, requests.streaming, oauth.providers.antigravity.sensitive-words,
+#   routing, observability
+#
+# What it may NEVER change, even if it appears here: server.host, server.port, access.api-keys,
+# management.*, oauth.auth-dir, api-keys.openai-compatibility, config-version. Those stay local.
+# The sections below are therefore shown for reference; they are ignored on merge.
 config-version: 8
 
 server:

@@ -10,6 +10,9 @@ class CpaApp : Application() {
     override fun onCreate() {
         super.onCreate()
         HotSoLoader.loadEngine(this)
+        // The port lives in config.yaml and the user can change it, so every loopback URL has to
+        // learn it before the first request rather than assume 8317.
+        GatewayPort.refresh(this)
         // Housekeeping off the main thread: downloaded APKs from an earlier update are dead
         // weight (about 23 MB each) and nothing else ever deletes them.
         UpdateManager(this).reclaimStorage()

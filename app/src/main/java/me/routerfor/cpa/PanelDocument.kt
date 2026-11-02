@@ -20,8 +20,11 @@ object PanelDocument {
 
     fun intercepted(url: String, colors: Palette.Colors): ByteArrayInputStream? = try {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 8000
-            readTimeout = 20000
+            // Tighter than the first cut (8 s + 20 s). This runs on a WebView request thread,
+            // and a half-dead engine holds it for the whole budget; 12 s total still covers a
+            // cold start on a throttled phone and gives up early enough to show a message.
+            connectTimeout = 4000
+            readTimeout = 8000
             setRequestProperty("Accept", "text/html")
         }
         if (conn.responseCode != HttpURLConnection.HTTP_OK) {
@@ -33,10 +36,18 @@ object PanelDocument {
             val clean = PanelSanitizer.strip(raw)
             val skinned = PanelSkin.inject(clean, colors.resolved, colors)
             val patched = PanelPolyfill.inject(skinned)
+            val leaked = PanelSanitizer.hasSponsorContent(clean)
+            if (leaked) {
+                // Upstream already renamed every identifier once and the rules matched nothing
+                // while still reporting success. A strip that misses must not be silent: it is
+                // logged at warning level so a regression shows up in logcat instead of shipping
+                // an affiliate funnel inside the panel.
+                Log.w(TAG, "sanitizer missed sponsor content; upstream bundle likely changed")
+            }
             Log.i(
                 TAG,
                 "panel raw=${raw.length} clean=${clean.length} patched=${patched.length} " +
-                    "sponsor=${PanelSanitizer.hasSponsorContent(clean)} theme=${colors.resolved}"
+                    "sponsor=$leaked theme=${colors.resolved}"
             )
             ByteArrayInputStream(patched.toByteArray(Charsets.UTF_8))
         }

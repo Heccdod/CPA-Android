@@ -21,8 +21,8 @@ import java.util.concurrent.Executors
  * Nothing is fetched automatically: every network call starts from an explicit tap in 设置,
  * and L3 kernel loading additionally requires AppPrefs.hotUpdateEnabled.
  *
- * L2 (rules): pull a remote config.yaml, atomically replace filesDir/config.yaml, let the
- *             engine's file watcher hot-reload it.
+ * L2 (rules): pull a remote rule pack and hand it to the Go side, which owns the list of keys a
+ *             remote file is allowed to touch. The engine's watcher hot-reloads the result.
  * L3 (kernel/APK): read the GitHub Releases API; a newer libgojni.so is staged into
  *             getDir("hotlibs") only when hot update is enabled, and an .apk is handed to the
  *             system installer through FileProvider.
@@ -33,8 +33,6 @@ import java.util.concurrent.Executors
  * the CI published.
  */
 class UpdateManager(private val context: Context) {
-
-    private val io = Executors.newSingleThreadExecutor()
 
     fun syncRules(onDone: (ok: Boolean, message: String) -> Unit) {
         io.execute {
@@ -47,65 +45,22 @@ class UpdateManager(private val context: Context) {
                 if (body.isBlank()) {
                     return@runCatching "远程规则为空，已保留本地配置" to false
                 }
-                val target = configFile()
-                // The remote rules file is not a full config: it carries the payload rules only.
-                // Writing it over config.yaml verbatim dropped models.catalog, the absolute
-                // oauth.auth-dir and the user's proxy, and the engine's watcher then re-read a
-                // file pointing at ~/.cli-proxy-api. Merge instead of replace.
-                val merged = mergeRules(target.readText(), body)
-                val tmp = File(target.parentFile, ".config-remote.yaml")
-                FileOutputStream(tmp).use { out ->
-                    out.write(merged.toByteArray(Charsets.UTF_8))
-                    out.fd.sync()
+                // The merge happens in Go, not here. Two reasons:
+                //  · the whitelist of mergeable keys has to sit next to the YAML writer that
+                //    enforces the other invariants, or the two drift apart;
+                //  · writing config.yaml from Kotlin means writing it a second way. The old code
+                //    wrote a temp file and rename()d it over the target, which swaps the inode
+                //    and permanently kills the engine's fsnotify watch — after one rule sync
+                //    every later settings change silently stopped taking effect.
+                val error = WebBridgeCompat.applyRulePack(context.filesDir.absolutePath, body)
+                if (error.isNotEmpty()) {
+                    return@runCatching "规则未应用：$error" to false
                 }
-                if (!tmp.renameTo(target)) {
-                    target.delete()
-                    if (!tmp.renameTo(target)) {
-                        return@runCatching "config.yaml 替换失败" to false
-                    }
-                }
-                // Re-assert the local-only keys after the merge so a remote file can never move
-                // the auth directory or the catalog pointer, whatever it contains.
-                WebBridgeCompat.updateQuickSettings(
-                    context.filesDir.absolutePath,
-                    AppPrefs.proxyUrl(context),
-                    AppPrefs.allowLan(context),
-                    AppPrefs.sensitiveWords(context),
-                    AppPrefs.thinkingMode(context)
-                )
                 "规则已更新（${body.length} 字节），引擎正在热重载" to true
             }.getOrElse { e ->
                 "规则同步失败：${e.message}" to false
             }
             onDone(result.second, result.first)
-        }
-    }
-
-    /**
-     * Appends the remote rules under the local ones.
-     *
-     * Deliberately not a YAML merge library: the file is small, the structure is a list of
-     * override rules, and appending keeps every local key intact. A remote file that replaces
-     * the whole document would undo the local auth-dir and catalog on the next watcher tick.
-     */
-    private fun mergeRules(local: String, remote: String): String {
-        val marker = "requests:"
-        if (!remote.contains(marker)) return local
-        // Take only the remote payload block and append it under our own requests section is
-        // over-engineering for a file this shape; the simplest honest rule is: local file, plus
-        // the remote rules appended as a commented reference. The user can copy what they want
-        // and the local invariants survive.
-        return buildString {
-            append(local)
-            if (!local.endsWith("\n")) append("\n")
-            append("\n# ---- remote rules pulled from ")
-            append(BuildConfig.RULES_URL)
-            append(" ----\n")
-            for (line in remote.lineSequence()) {
-                append("# ")
-                append(line)
-                append("\n")
-            }
         }
     }
 
@@ -159,7 +114,10 @@ class UpdateManager(private val context: Context) {
                 if (name.endsWith(".apk") && !name.contains("debug", ignoreCase = true)) {
                     notes.append("发现新版本 $tag（本地 $current）\n")
                     notes.append("发现安装包：$name\n")
-                    downloadAndInstall(asset.optString("browser_download_url"), name)
+                    // The APK is not digest-checked, and it does not need to be: the installer
+                    // verifies the signature against the installed app before replacing it, so a
+                    // tampered download fails there rather than installing.
+                    downloadAndInstall(asset.optString("browser_download_url"), name, notes)
                     return@runCatching
                 }
             }
@@ -186,12 +144,16 @@ class UpdateManager(private val context: Context) {
             val found = newestKernelRelease(repo) ?: return@runCatching
             val tag = found.first
             val target = File(hotLibDir(), "libgojni-$tag.so")
-            val bytes = httpGetBytes(found.second)
+            val bytes = httpGetBytes(found.second, limit = MAX_KERNEL_BYTES)
             val actual = sha256(bytes)
             // Fail closed. GitHub does not always populate `digest` on an asset, and the old code
             // treated a missing digest as "no check needed" — which would System.load() an
             // arbitrary downloaded library. A missing digest now falls back to the
             // SHA256SUMS.txt the release also ships; if that is missing too, nothing is staged.
+            //
+            // Both values come from the same origin, so this catches corruption, not an attacker
+            // who can already answer as github.com. That is why the app no longer trusts
+            // user-installed CAs outside loopback (see res/xml/network_security_config.xml).
             val expected = found.third.removePrefix("sha256:").ifEmpty {
                 readSumsDigest(repo, tag)
             }
@@ -209,10 +171,15 @@ class UpdateManager(private val context: Context) {
                 return@runCatching
             }
             hotLibDir().mkdirs()
-            FileOutputStream(target).use { it.write(bytes) }
+            writeDurably(target, bytes)
             manifest.writeText(actual)
             File(hotLibDir(), "pending.txt").writeText(target.name)
-            notes.append("新内核已就绪（${bytes.size} 字节），重启网关后生效\n")
+            // Restarting the gateway does *not* pick this up: System.load() resolves a library
+            // name once per process, and HotSoLoader.loaded is set in Application.onCreate, so
+            // the new .so is only ever mapped after the process itself is replaced. Promising a
+            // gateway restart here sent users looking for a refresh that could not happen.
+            notes.append("新内核已就绪（${bytes.size} 字节）\n")
+            notes.append("需要完全退出 App 再打开才会加载（重启网关不够）\n")
         }.onFailure { notes.append("内核检查失败：${it.message}\n") }
     }
 
@@ -287,22 +254,36 @@ class UpdateManager(private val context: Context) {
         return ""
     }
 
-    private fun downloadAndInstall(url: String, name: String) {
+    private fun downloadAndInstall(url: String, name: String, notes: StringBuilder) {
+        // The release asset name is attacker-controlled text; it becomes a path inside filesDir
+        // and is handed to the installer. Keep only the basename and refuse separators, so
+        // "../shared_prefs/cpa-prefs.xml" cannot be written by way of a download.
+        val safeName = File(name).name
+        if (safeName.isEmpty() || safeName != name || safeName.contains('\\')) {
+            notes.append("安装包文件名不合法，已忽略\n")
+            return
+        }
         val dir = File(context.filesDir, "updates")
         dir.mkdirs()
         // A downloaded APK is ~23 MB and the installer never deletes it, so every update used to
         // leave another copy behind. Clear the directory first: the only APK that matters is the
         // one about to be written.
         dir.listFiles()?.forEach { runCatching { it.delete() } }
-        val apk = File(dir, name)
-        FileOutputStream(apk).use { it.write(httpGetBytes(url)) }
+        val apk = File(dir, safeName)
+        // Written through writeDurably: an APK truncated by a kill mid-download presents itself
+        // to the installer as a corrupt package, and the user sees a parse error instead of an
+        // update. The rename-free write keeps the file consistent with what was downloaded.
+        writeDurably(apk, httpGetBytes(url, limit = MAX_APK_BYTES))
         val uri: Uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(intent)
+        // A device with installs disabled has no handler for this intent; that is a reportable
+        // condition, not a crash on the update-check thread.
+        runCatching { context.startActivity(intent) }
+            .onFailure { notes.append("无法拉起安装器：${it.message}\n") }
     }
 
     /**
@@ -319,14 +300,19 @@ class UpdateManager(private val context: Context) {
         }
     }
 
-    private fun configFile(): File = File(context.filesDir, "config.yaml")
-
     private fun hotLibDir(): File = HotSoLoader.hotLibDir(context)
 
     private fun httpGet(url: String, accept: String): String =
-        String(httpGetBytes(url, accept), Charsets.UTF_8)
+        String(httpGetBytes(url, accept = accept), Charsets.UTF_8)
 
-    private fun httpGetBytes(url: String, accept: String = "*/*"): ByteArray {
+    /**
+     * Fetches a URL into memory, refusing anything above [limit].
+     *
+     * readBytes() on an unchunked response grows until the heap gives out; the check is done both
+     * against Content-Length (when the server sends one) and against the bytes actually read, so
+     * a server that lies about the length still cannot exhaust the process.
+     */
+    private fun httpGetBytes(url: String, accept: String = "*/*", limit: Long = MAX_JSON_BYTES): ByteArray {
         val conn = URL(url).openConnection() as HttpURLConnection
         conn.connectTimeout = 15000
         conn.readTimeout = 30000
@@ -338,14 +324,67 @@ class UpdateManager(private val context: Context) {
             if (code !in 200..299) {
                 throw IllegalStateException("HTTP $code")
             }
-            return conn.inputStream.use { it.readBytes() }
+            val declared = conn.contentLengthLong
+            if (declared > limit) {
+                throw IllegalStateException("响应过大（$declared 字节）")
+            }
+            val out = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(64 * 1024)
+            var total = 0L
+            conn.inputStream.use { input ->
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    total += read
+                    if (total > limit) {
+                        throw IllegalStateException("响应超过 ${limit} 字节上限")
+                    }
+                    out.write(buffer, 0, read)
+                }
+            }
+            return out.toByteArray()
         } finally {
             conn.disconnect()
+        }
+    }
+
+    /**
+     * Writes [bytes] to [file] in place, with an fsync.
+     *
+     * In place, not via a temp file and rename(): renaming over the target replaces its inode, and
+     * the engine's file watcher is registered on the inode. That is the whole reason settings
+     * stopped hot-reloading in v2.0 — see docs/ENGINEERING.md. The update directories are not
+     * watched, but writing one way everywhere means the mistake cannot be reintroduced by moving
+     * a function.
+     */
+    private fun writeDurably(file: File, bytes: ByteArray) {
+        FileOutputStream(file).use { out ->
+            out.write(bytes)
+            out.fd.sync()
         }
     }
 
     private fun sha256(bytes: ByteArray): String {
         val digest = MessageDigest.getInstance("SHA-256")
         return digest.digest(bytes).joinToString("") { "%02x".format(it) }
+    }
+
+    companion object {
+        private const val MAX_JSON_BYTES = 4L * 1024 * 1024
+        private const val MAX_APK_BYTES = 200L * 1024 * 1024
+        private const val MAX_KERNEL_BYTES = 200L * 1024 * 1024
+
+        /**
+         * One executor for the whole process.
+         *
+         * A per-instance pool leaked a thread on every cold start (CpaApp constructs an
+         * UpdateManager in onCreate and never shuts it down); a daemon-backed single thread does
+         * the same work without holding the process open.
+         */
+        private val io: java.util.concurrent.ExecutorService by lazy {
+            Executors.newSingleThreadExecutor { r ->
+                Thread(r, "cpa-update").apply { isDaemon = true }
+            }
+        }
     }
 }

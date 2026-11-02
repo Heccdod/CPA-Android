@@ -14,7 +14,7 @@ object WebBridgeCompat {
     fun listenAddress(): String = try {
         Cliproxymobile.getListenAddress()
     } catch (t: Throwable) {
-        "127.0.0.1:8317"
+        "127.0.0.1:" + GatewayPort.FALLBACK_PORT
     }
 
     fun managementKey(): String = try {
@@ -102,6 +102,73 @@ object WebBridgeCompat {
         thinkingMode: String
     ): String = try {
         Cliproxymobile.updateQuickSettings(dataDir, proxyUrl, allowLan, csv, thinkingMode)
+    } catch (t: Throwable) {
+        t.message ?: t.javaClass.simpleName
+    }
+
+    /**
+     * The configured OpenAI-compatible providers, as the Go side serialises them.
+     *
+     * JSON rather than a bound object graph because gobind cannot marshal structs or slices:
+     * every export crosses the boundary as a string. An empty result still has to be valid JSON,
+     * so a failure in Go comes back as {"providers":[],"error":"..."} instead of blank text.
+     */
+    fun getCustomProviders(dataDir: String): String = try {
+        Cliproxymobile.getCustomProviders(dataDir)
+    } catch (t: Throwable) {
+        "{\"providers\":[],\"error\":\"" + (t.message ?: t.javaClass.simpleName)
+            .replace("\\", "\\\\").replace("\"", "\\\"") + "\"}"
+    }
+
+    fun setCustomProviders(dataDir: String, payload: String): String = try {
+        Cliproxymobile.setCustomProviders(dataDir, payload)
+    } catch (t: Throwable) {
+        t.message ?: t.javaClass.simpleName
+    }
+
+    /**
+     * The key a client (SillyTavern, an SDK, curl) has to present to /v1.
+     *
+     * This is *not* the management key. The two were the same constant until api-keys became a
+     * randomly generated `cpa-android-<hex>`, and the home screen kept showing the management
+     * key: copying it into a client produced a 401 that looked like a broken gateway.
+     */
+    fun clientApiKey(dataDir: String): String = try {
+        Cliproxymobile.clientAPIKey(dataDir)
+    } catch (t: Throwable) {
+        ""
+    }
+
+    /**
+     * Replaces every entry of access.api-keys that still holds the legacy literal.
+     *
+     * Nothing migrates on upgrade by itself: the seeded key is only generated when config.yaml
+     * does not exist yet, and no settings write ever touches that list. An install that started
+     * on v2.0 therefore keeps the string this repository publishes, which is the entire gate on
+     * a 0.0.0.0 bind. Returns "" when it succeeded or had nothing to do.
+     */
+    fun rotateClientApiKey(dataDir: String): String = try {
+        Cliproxymobile.rotateClientAPIKey(dataDir)
+    } catch (t: Throwable) {
+        t.message ?: t.javaClass.simpleName
+    }
+
+    /**
+     * Applies a remote rule pack through the Go side, which owns the whitelist of keys a remote
+     * file may touch. Returns "" on success.
+     */
+    fun applyRulePack(dataDir: String, text: String): String = try {
+        Cliproxymobile.applyRulePack(dataDir, text)
+    } catch (t: Throwable) {
+        t.message ?: t.javaClass.simpleName
+    }
+
+    /**
+     * Writes the whole document the config editor holds, through the same validate-then-write
+     * path every other writer uses. Returns "" on success.
+     */
+    fun setConfigText(dataDir: String, text: String): String = try {
+        Cliproxymobile.setConfigText(dataDir, text)
     } catch (t: Throwable) {
         t.message ?: t.javaClass.simpleName
     }

@@ -84,4 +84,34 @@
     <string name="settings_thinking_compact">不思考（默认）· 正文最长</string>
     <string name="settings_thinking_visible">显示思维链 · 需要约 1000 以上预算</string>
     <string name="settings_thinking_off">不写规则 · 让模型自己决定</string>
+
+    <string name="settings_providers">自定义模型</string>
+    <string name="settings_providers_entry">OpenAI 兼容接口</string>
+    <string name="settings_providers_desc">接入 DeepSeek、Kimi、OpenRouter 或本地模型，与已登录账号共用同一个网关</string>
+    <string name="settings_providers_empty">还没有添加</string>
+    <string name="providers_title">自定义模型</string>
+    <string name="providers_add">添加提供商</string>
+    <string name="providers_name">名称</string>
+    <string name="providers_name_hint">deepseek</string>
+    <string name="providers_base_url">接口地址</string>
+    <string name="providers_base_url_hint">https://api.deepseek.com/v1</string>
+    <string name="providers_keys">API 密钥</string>
+    <string name="providers_keys_hint">每行一个；同名提供商的多个密钥会轮换使用</string>
+    <string name="providers_models">模型</string>
+    <string name="providers_models_hint">每行一个；写成 name = alias 可让客户端用别的名字调用</string>
+    <string name="providers_disabled">停用这个提供商</string>
+    <string name="providers_save">保存</string>
+    <string name="providers_delete">删除</string>
+    <string name="providers_delete_confirm">删除 %1$s？它下面的模型会立刻从模型列表里消失。</string>
+    <string name="providers_saved">已保存，引擎正在热重载</string>
+    <string name="providers_need_name">名称不能为空</string>
+    <string name="providers_need_base_url">接口地址不能为空</string>
+    <string name="providers_need_models">至少要写一个模型名</string>
+    <string name="settings_rotate_key">更换 API 密钥</string>
+    <string name="settings_rotate_key_desc">仍是安装时的公开默认值，同一网络下任何人都猜得到</string>
+    <string name="settings_rotate_key_ok">已是随机生成的密钥</string>
+    <string name="rotate_key_title">更换 API 密钥？</string>
+    <string name="rotate_key_body">会生成一个新的随机密钥并写进 config.yaml，引擎随即热重载。已经配置了这个密钥的客户端（SillyTavern、SDK、curl 脚本）需要改成新的；旧密钥立刻失效。</string>
+    <string name="rotate_key_done">已更换：%1$s</string>
+    <string name="rotate_key_failed">更换失败：%1$s</string>
 </resources>

@@ -17,7 +17,11 @@ set -uo pipefail
 ADB=${ADB:-adb}
 SERIAL=${1:-}
 PKG=me.routerfor.cpa
-KEY=cpa-android-local
+# Two different secrets, and conflating them hid a real defect: the management key opens
+# /v8/management/* but a client (SillyTavern, curl) needs the key from access.api-keys, which is
+# randomly generated at first start. This script used the management key for both, so the home
+# screen once showed the wrong key and nothing here noticed.
+MGMT_KEY=cpa-android-local
 LOCAL_PORT=18317
 
 if [ -n "$SERIAL" ]; then
@@ -79,11 +83,28 @@ echo "== C4 management panel =="
 UNAUTH=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "http://127.0.0.1:$LOCAL_PORT/v8/management/config")
 [ "$UNAUTH" = "401" ] || [ "$UNAUTH" = "403" ] && ok "management API rejects anonymous ($UNAUTH)" \
   || note "anonymous status $UNAUTH"
-BODY=$(curl -s -m 8 -H "Authorization: Bearer $KEY" "http://127.0.0.1:$LOCAL_PORT/v8/management/config")
+BODY=$(curl -s -m 8 -H "Authorization: Bearer $MGMT_KEY" "http://127.0.0.1:$LOCAL_PORT/v8/management/config")
 printf %s "$BODY" | grep -q antigravity && ok "v8 config served with the local key" || bad "authenticated config fetch failed"
 
+# The key a client must present to /v1 is access.api-keys, not the management key. They were one
+# constant until api-keys became random, and the home screen kept showing the management key: the
+# user copied it into a client and got a 401 that looked like a broken gateway.
+CLIENT_KEY=$(printf %s "$BODY" | sed -n 's/.*"api-keys":\[ *"\([^"]*\)".*/\1/p' | head -1)
+if [ -n "$CLIENT_KEY" ]; then
+  note "client api key: $CLIENT_KEY"
+  CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $CLIENT_KEY" \
+    "http://127.0.0.1:$LOCAL_PORT/v1/models")
+  [ "$CODE" = "200" ] && ok "/v1 accepts the client api key" || bad "/v1 rejected the client api key ($CODE)"
+  CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $MGMT_KEY" \
+    "http://127.0.0.1:$LOCAL_PORT/v1/models")
+  [ "$CODE" = "401" ] && ok "the management key is not a client key ($CODE)" \
+    || note "management key also opens /v1 ($CODE) - config may still carry the legacy shared key"
+else
+  bad "could not read access.api-keys out of the served config"
+fi
+
 echo "== C5 OAuth auth-url =="
-AUTH=$(curl -s -m 15 -H "Authorization: Bearer $KEY" \
+AUTH=$(curl -s -m 15 -H "Authorization: Bearer $MGMT_KEY" \
   "http://127.0.0.1:$LOCAL_PORT/v8/management/oauth/auth-url?provider=antigravity&is_webui=1")
 printf %s "$AUTH" | grep -q "accounts.google.com" && ok "consent URL issued" || bad "no consent URL: ${AUTH:0:160}"
 STATE=$(printf %s "$AUTH" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
@@ -100,7 +121,7 @@ if [ -n "$STATE" ]; then
     "http://127.0.0.1:51121/oauth-callback?code=fake-code&state=$STATE")
   [ "$CODE" = "302" ] && ok "forwarder relayed the redirect (302)" || note "forwarder returned $CODE"
   sleep 2
-  STATUS=$(curl -s -m 8 -H "Authorization: Bearer $KEY" \
+  STATUS=$(curl -s -m 8 -H "Authorization: Bearer $MGMT_KEY" \
     "http://127.0.0.1:$LOCAL_PORT/v8/management/oauth/status?state=$STATE")
   note "session status: ${STATUS:0:160}"
   printf %s "$STATUS" | grep -qE '"status":"(wait|error|ok)"' \
@@ -122,7 +143,7 @@ $ADB push "$CFG_TMP" /data/local/tmp/cpa-cfg.yaml >/dev/null 2>&1
 $ADB shell chmod 644 /data/local/tmp/cpa-cfg.yaml
 $ADB shell run-as $PKG cp /data/local/tmp/cpa-cfg.yaml files/config.yaml 2>/dev/null
 sleep 6
-AFTER=$(curl -s -m 8 -H "Authorization: Bearer $KEY" "http://127.0.0.1:$LOCAL_PORT/v8/management/config" | grep -o '"keepalive-seconds":[0-9]*' | head -1)
+AFTER=$(curl -s -m 8 -H "Authorization: Bearer $MGMT_KEY" "http://127.0.0.1:$LOCAL_PORT/v8/management/config" | grep -o '"keepalive-seconds":[0-9]*' | head -1)
 note "engine now reports: ${AFTER:-unknown}"
 printf %s "$AFTER" | grep -q ":$TARGET" && ok "engine hot-reloaded keepalive ${BEFORE_VAL} -> $TARGET without a restart" || bad "hot reload did not apply (want $TARGET)"
 RELOADS_AFTER=$($ADB shell run-as $PKG grep -c "config successfully reloaded" files/cpa-engine.log 2>/dev/null | tr -d "\r" | sed "s/.*://" | tr -dc "0-9")

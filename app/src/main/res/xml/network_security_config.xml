@@ -1,9 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Two rules, deliberately narrow.
+
+  1. Cleartext is allowed only for the loopback gateway (and the emulator's alias for the host),
+     because that is the only plaintext peer this app talks to. A blanket
+     cleartextTrafficPermitted="true" would also let an https:// URL silently downgrade.
+
+  2. User-installed CAs are trusted only for those same loopback hosts. Trusting them globally
+     handed anyone who could install a profile the ability to answer as api.github.com and serve
+     both a kernel .so and the SHA-256 that vouches for it — the digest comes from the same
+     response, so it proves nothing against a man in the middle. Loopback keeps that CA useful for
+     the one thing it is genuinely needed for: inspecting the local gateway.
+-->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true">
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
         <trust-anchors>
             <certificates src="system" />
             <certificates src="user" />
         </trust-anchors>
-    </base-config>
+    </domain-config>
 </network-security-config>

@@ -28,6 +28,30 @@ class PanelActivity : AppCompatActivity() {
     private lateinit var loading: ProgressBar
     private lateinit var hint: TextView
 
+    /**
+     * Retry budget for the "gateway still starting" case.
+     *
+     * This used to re-post itself with no limit and no cancellation, and the Activity had no
+     * onDestroy at all: leaving the screen while the gateway was down left a Runnable firing
+     * every 600 ms forever, each round doing a loopback dial on the main thread and holding the
+     * detached Activity plus its whole WebView (renderer included) alive.
+     */
+    private var attempts = 0
+
+    private val retry = Runnable { load() }
+
+    override fun onDestroy() {
+        webView.removeCallbacks(retry)
+        webView.stopLoading()
+        // destroy(), not just detach: a WebView kept in a detached tree holds its renderer
+        // process for the life of the app.
+        webView.onPanelReady = null
+        webView.onPanelProblem = null
+        (webView.parent as? ViewGroup)?.removeView(webView)
+        webView.destroy()
+        super.onDestroy()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ui = UiKit(this, ThemeManager.colors(this))
@@ -105,11 +129,21 @@ class PanelActivity : AppCompatActivity() {
         return root
     }
 
+    private companion object {
+        /** 20 × 600 ms: enough for a cold engine start, short enough to give up honestly. */
+        const val MAX_ATTEMPTS = 20
+    }
+
     private fun load() {
         if (webView.loadIfNeeded()) return
         loading.visibility = View.VISIBLE
         hint.text = "网关正在启动，稍后自动加载"
         hint.visibility = View.VISIBLE
-        webView.postDelayed({ load() }, 600L)
+        if (attempts >= MAX_ATTEMPTS) {
+            hint.text = "网关没有启动，请回到主界面点「启动」"
+            return
+        }
+        attempts++
+        webView.postDelayed(retry, 600L)
     }
 }

@@ -18,8 +18,8 @@ android {
         // Personal-use build: the API 28 compatibility mode keeps cleartext loopback HTTP
         // and System.load() of a .so from the private hot-update dir working.
         targetSdk = 28
-        versionCode = 11
-        versionName = "2.6.0"
+        versionCode = 13
+        versionName = "2.7.1"
         // Shipped update channel: the app reads releases/latest from this repository only.
         buildConfigField("String", "UPDATE_REPO", "\"Heccdod/CPA-Android\"")
         buildConfigField("String", "RULES_URL", "\"https://raw.githubusercontent.com/Heccdod/CPA-Android/main/rules/config.yaml\"")
@@ -119,4 +119,7 @@ dependencies {
     // That matters more than usual here: the sanitiser's failure mode is silence (it replaces
     // nothing and still reports success), which a screenshot cannot catch reliably.
     testImplementation("junit:junit:4.13.2")
+    // The unit-test classpath would otherwise resolve org.json to the android.jar stub, whose
+    // methods all throw "not mocked" - useless for testing a JSON parser.
+    testImplementation("org.json:json:20240303")
 }
