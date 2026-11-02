@@ -4,6 +4,7 @@
 package cliproxymobile
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -507,8 +508,17 @@ func clearLastError() {
 	state.mu.Unlock()
 }
 
+// engineLogMaxBytes caps the engine log at 4 MB. The log is append-only and every proxied
+// request writes at least one line, so without a cap a heavy SillyTavern user turns a few days
+// of chatting into tens of megabytes the app never gives back. Trimming happens once at start:
+// when the file is over the cap, the newest half is kept and the rest is dropped. Rotating on
+// every write would need a writer wrapper and a mutex on the hot path for no real benefit -
+// the interesting part of a log is always the tail.
+const engineLogMaxBytes = 4 << 20
+
 func attachLogger(dataDir string) {
 	path := filepath.Join(dataDir, "cpa-engine.log")
+	trimLogFile(path, engineLogMaxBytes)
 	if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
 		state.mu.Lock()
 		// Close the previous handle before replacing it. A start that failed at waitForListen
@@ -525,6 +535,37 @@ func attachLogger(dataDir string) {
 		return
 	}
 	log.SetOutput(io.Discard)
+}
+
+// trimLogFile keeps the newest limit bytes of an oversized log, cutting at a line boundary so
+// the file never starts mid-record. A missing file or a stat error is not a failure: the caller
+// opens the file next and will surface a real problem then.
+func trimLogFile(path string, limit int64) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= limit {
+		return
+	}
+	src, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer src.Close()
+	// Overshoot by one byte so the first partial line is visible and can be dropped.
+	if _, err := src.Seek(info.Size()-limit-1, io.SeekStart); err != nil {
+		return
+	}
+	tail, err := io.ReadAll(src)
+	if err != nil || len(tail) == 0 {
+		return
+	}
+	if i := bytes.IndexByte(tail, '\n'); i >= 0 && i+1 < len(tail) {
+		tail = tail[i+1:]
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, tail, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 func waitForListen(addr string, timeout time.Duration) error {

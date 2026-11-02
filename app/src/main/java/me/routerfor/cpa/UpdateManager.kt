@@ -290,6 +290,10 @@ class UpdateManager(private val context: Context) {
     private fun downloadAndInstall(url: String, name: String) {
         val dir = File(context.filesDir, "updates")
         dir.mkdirs()
+        // A downloaded APK is ~23 MB and the installer never deletes it, so every update used to
+        // leave another copy behind. Clear the directory first: the only APK that matters is the
+        // one about to be written.
+        dir.listFiles()?.forEach { runCatching { it.delete() } }
         val apk = File(dir, name)
         FileOutputStream(apk).use { it.write(httpGetBytes(url)) }
         val uri: Uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
@@ -299,6 +303,20 @@ class UpdateManager(private val context: Context) {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)
+    }
+
+    /**
+     * Deletes APKs staged for install. Called on every cold start.
+     *
+     * The engine trims its own log when it attaches the logger; this covers the APKs, which
+     * nothing else would ever remove.
+     */
+    fun reclaimStorage() {
+        io.execute {
+            runCatching {
+                File(context.filesDir, "updates").listFiles()?.forEach { it.delete() }
+            }
+        }
     }
 
     private fun configFile(): File = File(context.filesDir, "config.yaml")
