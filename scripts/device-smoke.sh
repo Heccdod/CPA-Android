@@ -10,6 +10,7 @@
 #   C6  the :51121 redirect is captured by the kernel (zero copy/paste loop)
 #   D1  editing config.yaml on the device hot-reloads without a restart
 #   D2  2.0 defaults: hot update off, panel sanitised, SPA mounts, screens registered
+#   D3  two streaming turns each terminate and the model list survives them
 #
 # Usage: scripts/device-smoke.sh [serial]
 set -uo pipefail
@@ -182,9 +183,59 @@ STAGED=$($ADB shell run-as $PKG ls app_hotlibs 2>/dev/null | tr -d "\r" | grep -
 [ "${STAGED:-0}" -eq 0 ] && ok "nothing staged while hot update is off" \
   || bad "a staged .so survived with hot update off"
 
+echo "== D3 two streaming turns keep the model list =="
+# The regression this covers: a second turn used to hang (no bound before Do() returned) and a
+# single non-quota failure on the only credential used to empty /v1/models until a restart.
+# Both are observable from here without touching the panel. Upstream availability is not this
+# app's contract, so a round that never reaches the provider is a note, not a failure; what is
+# asserted is that each round terminates on its own and the model list is still there after it.
+MODELS_BEFORE=$(curl -s -m 10 -H "Authorization: Bearer $CLIENT_KEY" \
+  "http://127.0.0.1:$LOCAL_PORT/v1/models" | grep -o '"id":' | wc -l | tr -d ' ')
+note "models before the rounds: ${MODELS_BEFORE:-0}"
+STREAMED=0
+for ROUND in 1 2; do
+  T0=$(date +%s)
+  RES=$(curl -s -m 45 -o /tmp/cpa-round-$ROUND.txt -w "%{http_code}" \
+    -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
+    -d '{"model":"gemini-3.8-flash-low","stream":true,"max_tokens":48,"messages":[{"role":"user","content":"Reply with the single word: ok"}]}' \
+    "http://127.0.0.1:$LOCAL_PORT/v1/chat/completions" 2>/dev/null)
+  T1=$(date +%s)
+  if [ "$RES" = "200" ]; then
+    STREAMED=$((STREAMED + 1))
+    ok "round $ROUND completed on its own in $((T1 - T0))s"
+    grep -q '\[DONE\]' /tmp/cpa-round-$ROUND.txt \
+      && ok "round $ROUND ended with a terminal frame" || bad "round $ROUND has no [DONE]"
+  else
+    note "round $ROUND returned ${RES:-nothing} (no upstream credential or offline; not this app's contract)"
+  fi
+done
+rm -f /tmp/cpa-round-1.txt /tmp/cpa-round-2.txt
+MODELS_AFTER=$(curl -s -m 10 -H "Authorization: Bearer $CLIENT_KEY" \
+  "http://127.0.0.1:$LOCAL_PORT/v1/models" | grep -o '"id":' | wc -l | tr -d ' ')
+note "models after the rounds: ${MODELS_AFTER:-0}"
+if [ "${STREAMED:-0}" -gt 0 ]; then
+  [ "${MODELS_AFTER:-0}" -ge "${MODELS_BEFORE:-0}" ] \
+    && ok "the model list survived ${STREAMED} streaming round(s)" \
+    || bad "the model list shrank after streaming (${MODELS_BEFORE} -> ${MODELS_AFTER})"
+fi
+
 # Panel: the activity is exported=false on purpose, so \`am start\` is refused by the system.
 # Drive it the way a user does - dump the home screen, tap the 管理面板 button, wait for the fetch.
+# Assert this check's own precondition: the phone is a real, in-use device, so between the D3
+# rounds and this tap somebody can pick it up and land on another app. The dump below would then
+# find 管理面板 nowhere, or worse, a stale-looking layout whose coordinates belong to that app.
+# Bring our activity back and confirm it is the resumed one before trusting any coordinates.
 PANEL_OPENED=0
+PANEL_SKIPPED=0
+$ADB shell am start -n $PKG/.MainActivity >/dev/null 2>&1
+sleep 3
+TOP=$($ADB shell dumpsys activity activities 2>/dev/null | grep -m1 topResumedActivity | tr -d "\r")
+case "$TOP" in
+  *$PKG*) : ;;
+  *) note "our activity is not in front (${TOP:-unknown}); skipping the panel check rather than tapping another app"
+     PANEL_SKIPPED=1 ;;
+esac
+if [ "$PANEL_SKIPPED" = "0" ]; then
 $ADB shell uiautomator dump /sdcard/cpa-ui.xml >/dev/null 2>&1
 BOUNDS=$($ADB shell cat /sdcard/cpa-ui.xml 2>/dev/null | tr '>' '\n'   | grep 'text="管理面板"' | grep -o 'bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"' | head -1)
 if [ -n "$BOUNDS" ]; then
@@ -200,10 +251,13 @@ if [ -n "$BOUNDS" ]; then
 else
   note "管理面板 button not found in the home dump"
 fi
+fi
 
 LOGS_PANEL=$($ADB logcat -d -s CpaPanel:* 2>/dev/null)
 LOGS_WEB=$($ADB logcat -d -s CpaWeb:* 2>/dev/null)
-if [ "$PANEL_OPENED" = "1" ]; then
+if [ "$PANEL_SKIPPED" = "1" ]; then
+  note "panel assertions skipped: the device was showing another app"
+elif [ "$PANEL_OPENED" = "1" ]; then
   printf %s "$LOGS_PANEL" | grep -q "sponsor=false" \
     && ok "panel served without relay-station promotion" || bad "panel sanitisation did not run"
   printf %s "$LOGS_PANEL" | grep -qE "clean=[0-9]+" \

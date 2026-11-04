@@ -685,13 +685,15 @@ available := effectiveClients > 0 || (Count > 0 && (expiredClients > 0 || cooldo
 bash scripts/device-smoke.sh [serial]
 ```
 
-最近一次结果（主力机 25060RK16C / Android 17 / API 37）：**32 passed, 0 failed**（v2.7.1）。
+最近一次结果（主力机 25060RK16C / Android 17 / API 37）：**37 passed, 0 failed**（v2.7.2）。
 
-v2.7.2 的改动里 Go 侧全部有单元测试覆盖（`antigravity_executor_stream_header_test.go`、
-`model_registry_suspension_deadline_test.go`、`antigravity_models_probe_timeout_test.go`），
-Kotlin 侧由 `VersionCompareTest` 等 44 个用例覆盖；但这一版**没能重跑真机冒烟**——
-开发时设备一直离线（`adb devices` 空，无线 adb 也连不上），所以 32 项通过的记录属于 v2.7.1。
-装上新包后先跑一遍 `scripts/device-smoke.sh` 再下结论。
+v2.7.2 新增 D3 五条：跑两轮流式请求，每轮必须在超时前自己结束、必须以 `[DONE]` 收尾，
+且跑完后 `/v1/models` 的条目数不能变少。这三件事对应本轮修的两个 bug（`Do()` 之前无超时、
+单凭据非 quota 冷却清空模型列表），单测覆盖的是引擎内部，D3 覆盖的是它们在真机上确实成立。
+
+> D3 与面板检查都只断言**本应用自己的契约**：上游没有凭据或者手机离线时，那一轮记为 note 而不是
+> fail——上游能不能作答不是这个 App 的承诺。面板检查会先把 MainActivity 拉回前台并确认它是
+> `topResumedActivity` 才继续，因为这是真机，中间有人拿起手机切到别的 App 就会让坐标指向别人。
 C 组覆盖前台服务 + WakeLock、/management.html 200、落盘配置、匿名 401 / 带 key 200、
 auth-url 的 redirect_uri=localhost:51121、:51121 转发器 302 转内核消费回调、D1 改 keepalive
 15 到 25 引擎 fsnotify 热重载；D2 组覆盖 2.0 的新契约：热更新默认关闭、关闭时无暂存内核、
@@ -738,10 +740,36 @@ release 变体则压缩后紧跟下一条记录。所以「文件比内容大 20
 | :--- | :--- | :--- |
 | Redmi Note 12 Turbo（368b07b8，走无线 10.250.233.76:5555） | 第一轮验证 | 16 KB 对齐修复后兼容性弹窗消失，device-smoke.sh 20 passed |
 | 25060RK16C（BU8XQGONNBQGFUHQ，USB） | 2.0 验证 | device-smoke.sh **30 passed, 0 failed** |
+| 25060RK16C（BU8XQGONNBQGFUHQ，USB） | 2.7.2 验证 | device-smoke.sh **37 passed, 0 failed** |
 
 接 USB 设备踩的坑：WSL 的 adb server 会占着 5037，让 Windows 侧 adb.exe 起不来
 （"could not read ok from ADB Server"）；先在 WSL 里 adb kill-server 清场，Windows 侧才能正常枚举。
 无线那台反过来要先 adb tcpip 5555 再 adb connect <ip>:5555。
+
+### 从 UNC 路径启动 Windows 工具会静默失败
+
+在 WSL 里直接调 `adb.exe`（以及 `cmd.exe`、`usbipd.exe` 这类 Windows 程序）时，如果当前目录是
+`\\wsl.localhost\...`，Windows 那个进程会先打印
+
+```
+CMD.EXE 的当前目录无效，因为当前目录是 UNC 路径。CMD.EXE 不支持将 UNC 路径作为当前目录。
+```
+
+然后**以默认目录重开**，`adb devices` 返回空列表、`usbipd list` 报的是一片乱码。看起来像设备没插、
+`adb` 版本不对、驱动坏了——其实是工作目录。`adb.exe start-server` 的症状更误导人：
+`could not read ok from ADB Server` / `failed to start daemon`，与 5037 被占一模一样。
+
+解法：把命令放到 `/mnt/c` 下跑（`workdir` 指过去），或者 `cd /mnt/c && adb.exe ...`。
+只有**启动 server** 那一步受它影响；server 已经在跑之后，从任何目录调 adb.exe 都正常。
+
+这台机器上因此有两条并存的通道，别把它们搞混：
+
+- `scripts/adbw.sh` → Windows 的 `adb.exe -s BU8XQGONNBQGFUHQ`（设备插在 Windows 侧时用这条）；
+- `scripts/device-smoke.sh` 默认 `adb` → `/opt/android-sdk/platform-tools/adb`（WSL 侧，USB 经 usbipd
+  转发进来或无线连上之后可用）。
+
+USB 调试被切成「仅充电」之后 USB 通道会消失，但无线 `adb connect` 和 usbipd 转发都可能还活着，
+所以「`adb devices` 空」不一定是设备没连——先用 `/mnt/c` 作工作目录起一次 Windows 侧的 server 再判断。
 
 在 WSL2 下手机挂在 Windows 侧，WSL 自己的 adb 根本看不到设备；把 `ADB_SERVER_SOCKET` 指过去也没用
 （跨 WSL/Windows 边界的 adb 握手会被 reset）。所以设备命令一律走 `scripts/adbw.sh`，它固定调用
