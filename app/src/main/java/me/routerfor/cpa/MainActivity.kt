@@ -1025,8 +1025,17 @@ class MainActivity : AppCompatActivity() {
         engineText.text = if (!error.isNullOrEmpty()) {
             "内核异常：" + error
         } else {
-            val hot = if (AppPrefs.hotUpdateEnabled(this)) getString(R.string.hot_on) else getString(R.string.hot_off)
-            "内核 " + BuildConfig.VERSION_NAME + " · 热更新" + hot
+            // Read the kernel that actually mapped, not the switch that permits a download:
+            // they disagree in exactly the cases that matter. The switch stays ON while a staged
+            // library is missing or was rejected at load, so this line kept advertising "热更新
+            // 已开启" over a packaged kernel.
+            val state = HotSoLoader.hotState(this)
+            val kernel = if (state.startsWith("hot:")) {
+                getString(R.string.engine_hot, state.removePrefix("hot:"))
+            } else {
+                getString(R.string.engine_packaged)
+            }
+            "内核 " + BuildConfig.VERSION_NAME + " · " + kernel
         }
         // Three-way, not two: "running" offers 重启 because that is what a stalled gateway
         // needs, and everything else offers 启动 — including STOPPED, which previously offered

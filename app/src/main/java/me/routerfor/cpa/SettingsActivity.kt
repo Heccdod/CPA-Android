@@ -947,13 +947,21 @@ class SettingsActivity : AppCompatActivity() {
      * kernel is in use and whether a restart would change it.
      */
     private fun describeHotState(): String {
-        val enabled = AppPrefs.hotUpdateEnabled(this)
-        val loaded = HotSoLoader.loadedKernel(this)
+        if (!AppPrefs.hotUpdateEnabled(this)) return getString(R.string.hot_off)
+        // One read: hotState() touches pending.txt, loaded.txt and the staged name, all small,
+        // and asking it twice would read the same three files twice on the render path.
+        val state = HotSoLoader.hotState(this)
+        // Staged, verified, and different from what this process mapped: a restart is the fix,
+        // and saying so is the whole point of splitting loaded from pending.
+        if (HotSoLoader.restartPending(this)) return "已开启 · 有新内核，需完全退出 App 后生效"
+        // Staged but unusable — pending.txt names a file that is gone, or verification rejected
+        // it. This used to fall through to "当前用内置内核", the same line a fresh install shows
+        // before its first download, so a broken kernel looked like nothing had been downloaded.
         return when {
-            !enabled -> getString(R.string.hot_off)
-            HotSoLoader.restartPending(this) -> "已开启 · 有新内核，需完全退出 App 后生效"
-            loaded.isEmpty() || loaded == "packaged" -> "已开启 · 当前用内置内核"
-            else -> "已开启 · 当前运行 " + loaded
+            state == "pending" -> getString(R.string.settings_hot_state_broken)
+            state.startsWith("hot:") ->
+                getString(R.string.settings_hot_state_hot, state.removePrefix("hot:"))
+            else -> getString(R.string.settings_hot_state_packaged)
         }
     }
 

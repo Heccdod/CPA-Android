@@ -261,9 +261,10 @@ Go 读不了 APK 里的 asset，所以复制这一步必须在 Kotlin 侧。
 
 ## 上游补丁
 
-本地有三个改动要落在上游源码上，但又不能改上游仓库：`maxOutputTokens` 被无条件删除、
-静态模型表缺 `gemini-3.8-flash-low` / `-medium`、以及守着前两者的测试断言。
-它们存在 `upstream-patches.diff`，由构建流程打上去：
+本地有六个改动要落在上游源码上，但又不能改上游仓库：`maxOutputTokens` 被无条件删除、
+静态模型表缺 `gemini-3.8-flash-low` / `-medium`、流式结束时上游不给终止帧、`Do()` 之前
+没有任何超时、唯一凭据冷却时所有模型从列表消失、目录探针没有超时。它们存在
+`upstream-patches.diff`（1801 行 / 86 hunks / 21 个文件），由构建流程打上去：
 
 ```bash
 scripts/apply-upstream-patch.sh            # 打到 upstream-cliproxy（幂等，已打则跳过）
@@ -273,9 +274,16 @@ scripts/apply-upstream-patch.sh --refresh  # 从工作树重新生成 upstream-p
 
 **CI 也走这一步。** `auto-sync-upstream` 会 clone 一份干净上游，如果只在本地打补丁，
 CI 产出的内核就会静默丢掉这些修复，本地包和 CI 包行为不一致而没人知道。
-所以 workflow 在 clone 之后立刻 `git apply --3way`，然后**断言修正确实生效**
-（源码里不再出现删除 `maxOutputTokens` 的语句、模型表里有 `gemini-3.8-flash-low`）。
-打不上或断言失败就整个 job 失败——发布一个丢了修复的内核比不发布更糟。
+所以 workflow 在 clone 之后立刻 `git apply --3way`，然后**断言修正确实生效**：10 条 marker
+（六个改动各自的关键符号）、源码里不再出现任何拼法的 `maxOutputTokens` 删除、
+模型表里有 `gemini-3.8-flash-low`。打不上或断言失败就整个 job 失败——发布一个丢了修复的
+内核比不发布更糟。
+
+注意 CI 用的是 `git clone --depth 1`，**没有历史 blob，`--3way` 会退化成直连应用**。
+所以补丁必须与 `.upstream-sha` 那个 commit 精确对齐：上游一前进就得 `--rebase` 重做，
+否则报的是一句很误导人的 `repository lacks the necessary blob to perform 3-way merge`。
+2026-11 那五次 CI 全红就是这么来的（上游把 `sjson` 换成 `ojson`，两处
+`maxOutputTokens` 的 hunk 全废）。
 
 ## 构建
 
@@ -372,16 +380,19 @@ R8（`isMinifyEnabled`）保持关闭：内核已经剥过，R8 只能再省约 
 - **主动检查**：设置 → 更新 → 「检查更新」，或首页齿轮进去点。开关关着也能查，查到 .so 会明确提示
   「发现新内核，但「内核热更新」已关闭，已跳过」，不会静默吞掉。
 - **L2 规则热重载**：`UpdateManager.syncRules()` 拉取 `BuildConfig.RULES_URL`
-  （`raw.githubusercontent.com/Heccdod/CPA-Android/main/rules/config.yaml`）→ 原子覆写
-  `filesDir/config.yaml` → 引擎的文件 watcher 毫秒级热重载。同样是手动触发，不再自动跑。
+  （`raw.githubusercontent.com/Heccdod/CPA-Android/main/rules/config.yaml`）→ 交给 Go 侧的
+  `applyRulePack()`（白名单：`requests.payload` / `requests.streaming` /
+  `oauth.providers.antigravity.sensitive-words` / `routing` / `observability`）→ 原地重写
+  `filesDir/config.yaml` → 引擎的文件 watcher 立即热重载。同样是手动触发，不再自动跑。
 
-  > 注意这条路是**整份覆盖**（点之前弹的确认框写的就是这句）。`rules/config.yaml` 里**没有**
-  > `requests.payload.override`，也没有 `models.catalog`，所以同步一次会把「思考预算」的规则和
-  > 自定义模型目录一起冲掉——额度、账号、面板都不受影响，只是思维链静默失效、模型列表退回上游那几档。
-  > 恢复：设置页把「思考预算」切到别的档再切回来（`applyThinkingVisibility()` 重新写入），
-  > 再「重启网关」（`migrateExistingConfig()` 把 `models.catalog` 补回）。
+  > 2.7.1 之前这条路是**整份覆盖**，会顺手冲掉 `models.catalog`、账号、密钥——凡是没写进
+  > `rules/config.yaml` 的键全部消失。现在只替换白名单里的五个路径，其余节点连同注释、
+  > `anchor`/`alias` 原样克隆回来；锚点节点不是从零构造，而是从磁盘上那份克隆的——
+  > 从零构造会让 `settings-node` 之类的共享锚点失去定义，整份文件读不回来。
 - **L3 整包热更**：`UpdateManager.checkAppRelease()` 读
-  `api.github.com/repos/Heccdod/CPA-Android/releases/latest`，比对 `tag_name` 与本地 `versionName`；
+  `api.github.com/repos/Heccdod/CPA-Android/releases/latest`，用 `compareVersions()` 对
+  `tag_name` 与本地 `versionName` 做**有序**比较，只有远端更高才继续（相等比较没有方向：
+  `/releases/latest` 停在 v2.5.3 时，2.7.1 会被告知「发现新版本 v2.5.3」并真的降级装回去）；
   `.apk` 下载后经 `FileProvider` 拉起系统安装器覆盖安装。
 - **L3 内核热更**：`checkKernelRelease()` 走**另一条**查询 ——
   `releases?per_page=20`，取第一个 `prerelease && tag.startsWith("upstream-")` 的 release 里的
@@ -391,12 +402,26 @@ R8（`isMinifyEnabled`）保持关闭：内核已经剥过，R8 只能再省约 
   **按定义排除 prerelease** —— 只用 `/latest` 的话，内核热更永远看不到任何东西。这是 2.5.0 之前的
   实际状态：仓库里有 `upstream-*` 包，App 一个都拉不到。
 
+  内核通道也加了防降级闸门：`installedKernelTag()` 从 `pending.txt` 反解已装载的 tag，
+  `tag <= installed` 直接报「内核已是最新」。以前只按 `published_at` 挑「发布最晚的一个」，
+  渠道里重发一个旧内核就会覆盖掉新的；而 `pending.txt` 是粘的（它钉住文件名），
+  装上去之后下一次检查还会因为摘要相等报「已是最新」，永久停在旧内核上。
+
+  `installedKernelTag()` 有两种情况返回 `null`（=允许任何候选）：tag 解析不出来；
+  或 `pending.txt` 点名的那个 `.so` 已经不在盘上——后者是刻意的，否则用户删掉内核之后就再也下不回来。
+
   摘要校验是**失败即拒绝**：先看 asset 的 `digest` 字段，为空则回退去读同 release 的
   `SHA256SUMS.txt`；两者都没有就拒绝安装。`HotSoLoader` 同理 —— 没有 manifest 就不加载已暂存的
   `.so`。以前缺清单时直接跳过校验并 `System.load()`。
 
 > 注意摘要只能证明「下载没坏」，证明不了「这是你发的」。仓库地址与 key 都在 `BuildConfig` 里，
 > 想换源要重新编译；真正要防的是 GitHub 账号被盗后发一个恶意 Release——所以默认关闭是这道防线的第一层。
+
+开关状态和**实际加载的内核**是两件事，界面上要分开显示。`HotSoLoader.hotState()` 返回
+`off` / `pending` / `packaged` / `hot:<name>` 四种，首页引擎行与设置「关于」都读它。
+以前两边分别显示「开关开没开」和「loaded 是否为空或 packaged」，于是
+「刚打开、还没下过」与「pending 指向的文件已被清掉、静默回落到打包内核」在界面上完全同形——
+后者是坏的，但看起来一样，而且回落的那个分支原本一行日志都没有。
 
 ## 默认配置里预置的防风控项
 
@@ -579,6 +604,80 @@ reload。两个连带细节：
 **修复**：两边各加一个 `quotaIo` 单线程池（`bgQuota`/`bgQuota`），额度走它，其余仍走 `io`；
 `onDestroy` 两个都 `shutdownNow()`。
 
+### 9. 第二轮回答卡死：`Do()` 之前一个超时都没有
+
+**症状**：第一轮正常，第二轮客户端一直停在「生成中」。SSE 连接是活的（每 15 秒收到
+`: keep-alive`），但没有任何内容；杀掉网关闭环，再跑一轮又坏。
+
+**机制**：`antigravity_executor_stream.go` 里读流的 watchdog 有两个——静默 90 秒关 body、
+终止帧后 2 秒宽限——但它们都在 `Do()` **返回之后**才创建。`Do()` 自己拿的 client 是
+`newAntigravityHTTPClient(ctx, cfg, auth, 0)`，timeout 传 0，而 `helps/proxy_helpers.go`
+只在 `timeout > 0` 时才设 `http.Client.Timeout`；**全仓 `ResponseHeaderTimeout` 命中数为 0**。
+于是上游吃完 TCP/TLS 却不回响应头时，`Do()` 永不返回，两段 watchdog 都没机会跑。
+下游 keep-alive 照常发，客户端看到的就是「连接活着、永远没内容」。
+
+**修复**（`internal/runtime/executor/antigravity_executor.go`）：
+
+- 包级 var `antigravityStreamResponseHeaderTimeout = 2 * time.Minute`；
+- `cloneTransportWithHTTP11` 加 `headerTimeout` 参数，在里面
+  `if headerTimeout > 0 { clone.ResponseHeaderTimeout = headerTimeout }`——
+  直连与代理两条路径都走这一个函数，改一处即全覆盖；
+- `antigravityTransportKey` 也加 `headerTimeout`。**这一条容易漏**：键里不含超时的话，
+  2 分钟的流式 transport 会被复用给长非流式生成请求，把长生成也一起掐断；
+- `newAntigravityHTTPClient` 加末位参数，只有流式那一处传非零，其余 8 处传 0；
+- `isTransientTransportMessage` 加 `"timeout awaiting response headers"`——
+  这条超时会被降级成 Result 文本再进分类器，不认它就等于把一次网络抖动记成凭据故障。
+
+**测试**：`antigravity_executor_stream_header_test.go` 起一个只 `Accept` 不写字节的 httptest
+服务，把包级 var 临时设成 300ms，断言 `ExecuteStream` 数秒内返回。失败注入实测：
+把末参改回 0，测试立刻报 `ExecuteStream() never returned: a silent upstream still blocks the
+stream forever`——守卫是真的。
+
+顺带一个结论：`sdk/httptransport/decorator.go:56 Decorate` 只替换 `Transport`，不碰
+`Timeout`，也不碰 `*http.Transport` 的字段，所以 `ResponseHeaderTimeout` 不会被它抹掉。
+
+### 10. 唯一凭据冷却时，模型列表整个变空
+
+**症状**：跑坏一轮之后客户端模型下拉列表一条都不剩（不是少几个，是全空），重启网关立刻好，
+再坏一轮又空。
+
+**机制**：`internal/registry/model_registry.go:1496 modelRegistrationAvailability` 用
+
+```go
+effectiveClients := Count - expiredClients - cooldownSuspended - otherSuspended + quotaAndSuspended
+available := effectiveClients > 0 || (Count > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0)
+```
+
+判「是不是 quota 类挂起」的 `isQuotaSuspension` 只认 `quota` 与 `credential_quota`，而挂起原因
+是 `conductor_cooldown.go:833 cooldownReason` 从 `quota.Reason` → `StatusMessage` →
+`LastError.Code` → `LastError.Message` 依次取的，**基本就是错误原文**。所以唯一那个凭据只要
+因为任何非 quota 原因被挂起（401 记 `unauthorized`、404 记 `not_found`、5xx 记
+`transient upstream error`），`otherSuspended` 就是 1、`effectiveClients` 归零，
+这个凭据下**每一个**模型都从 `/v1/models` 消失。`SuspendedClients` 是纯内存、**没有时间
+过期**，只有重新注册才清——所以「重启就好、再跑一轮又坏」。
+
+上游只有 `model_registry_sole_credential_quota_test.go` 覆盖 quota 情形，而且把
+`"unauthorized"` 必须隐藏写成了契约。
+
+**修复**：把挂起分成有界与无界。有截止时间（冷却）的期间模型**继续列出**——凭据只是暂时不接活，
+模型本身还在，没必要把客户端的选项清空；没有截止时间的（手动禁用、401 这类要人介入的）仍隐藏。
+
+- `ModelRegistration` 加 `SuspendedUntil map[string]time.Time`，新增
+  `classifySuspension(reason, until, now)` 返回 `suspensionNone / suspensionCooldown / suspensionOther`。
+  截止时间已过就地判成 None——投影前没人清这个 map。
+- `modelRegistrationAvailability`、`GetAvailableModelsByProvider`（`:1690` 起逐字复制了同一套
+  统计，**漏改一处行为就会不一致**）与 `GetModelCount` 三处统一用该分类；有界时把模型列表缓存
+  的 `expiresAt` 收到 `until` 之前，否则缓存会活过冷却。
+- `ClientModelProjection` 加 `SuspendUntil`，`ApplyClientModelProjections` 锁步写/删，
+  `reason` 或 `until` 任一变化才算 changed（只比 reason 的话每轮都判脏）。
+- `clientModelProjectionForAuth` 里非永久挂起时取 `earliestFutureInstant(...)` 作截止时间；
+  `hasUnauthorizedAuthFailure` 与 `StatusDisabled` 仍算永久。
+
+**测试**：`model_registry_suspension_deadline_test.go` 五个用例。核心那条断言的是
+**「列表里有，但 `GetModelCount()==0`」**——只断言「还在列表里」会漏掉「其实根本没在接活」。
+既有契约 `service_auth_sync_test.go` 的两个端到端用例原断言 401 后模型必须消失，改成断言
+`GetByID(authID).Unavailable == true` 且模型仍在列表。
+
 ## 设备侧验证（scripts/device-smoke.sh）
 
 ```
@@ -586,7 +685,13 @@ reload。两个连带细节：
 bash scripts/device-smoke.sh [serial]
 ```
 
-最近一次结果（主力机 25060RK16C / Android 17 / API 37）：**30 passed, 0 failed**。
+最近一次结果（主力机 25060RK16C / Android 17 / API 37）：**32 passed, 0 failed**（v2.7.1）。
+
+v2.7.2 的改动里 Go 侧全部有单元测试覆盖（`antigravity_executor_stream_header_test.go`、
+`model_registry_suspension_deadline_test.go`、`antigravity_models_probe_timeout_test.go`），
+Kotlin 侧由 `VersionCompareTest` 等 44 个用例覆盖；但这一版**没能重跑真机冒烟**——
+开发时设备一直离线（`adb devices` 空，无线 adb 也连不上），所以 32 项通过的记录属于 v2.7.1。
+装上新包后先跑一遍 `scripts/device-smoke.sh` 再下结论。
 C 组覆盖前台服务 + WakeLock、/management.html 200、落盘配置、匿名 401 / 带 key 200、
 auth-url 的 redirect_uri=localhost:51121、:51121 转发器 302 转内核消费回调、D1 改 keepalive
 15 到 25 引擎 fsnotify 热重载；D2 组覆盖 2.0 的新契约：热更新默认关闭、关闭时无暂存内核、

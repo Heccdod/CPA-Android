@@ -1,8 +1,402 @@
+diff --git a/internal/registry/model_registry.go b/internal/registry/model_registry.go
+index 7f82e7d..52da504 100644
+--- a/internal/registry/model_registry.go
++++ b/internal/registry/model_registry.go
+@@ -174,6 +174,62 @@ type ModelRegistration struct {
+ 	Providers map[string]int
+ 	// SuspendedClients tracks temporarily disabled clients keyed by client ID
+ 	SuspendedClients map[string]string
++	// SuspendedUntil records the deadline of each suspension in SuspendedClients.
++	// A client with a deadline is in a bounded cooldown: the model keeps being
++	// listed while that cooldown lasts, so a request receives the retry hint
++	// instead of "model not found". A client without a deadline - a manual
++	// suspension, a disabled credential, a failure whose recovery time is unknown -
++	// is treated as permanent and hides the model once no effective client is left.
++	SuspendedUntil map[string]time.Time
++}
++
++// suspensionState classifies how one recorded suspension affects a model's availability.
++type suspensionState int
++
++const (
++	// suspensionNone means the client no longer counts as suspended: no record
++	// exists, or the recorded deadline has already lapsed.
++	suspensionNone suspensionState = iota
++	// suspensionCooldown means the client is in a bounded cooldown. The model stays
++	// listed, exactly as quota cooldowns always did.
++	suspensionCooldown
++	// suspensionOther means the client is suspended with no known end.
++	suspensionOther
++)
++
++// classifySuspension reads the effective state of one suspension.
++//
++// The deadline, not the reason string, decides whether a suspension is temporary:
++// cooldownReason builds the reason from an upstream error message, so a plain 401
++// produced "unauthorized" and hid the model even though the conductor was going to
++// retry that credential in thirty minutes. A lapsed deadline is reported as
++// suspensionNone because nothing clears the map entry until the next projection,
++// and an idle registry must not keep hiding a model whose cooldown ended.
++func classifySuspension(reason string, until time.Time, now time.Time) suspensionState {
++	if !until.IsZero() && !now.Before(until) {
++		return suspensionNone
++	}
++	if isQuotaSuspension(reason) || !until.IsZero() {
++		return suspensionCooldown
++	}
++	return suspensionOther
++}
++
++// setSuspendedUntilLocked records (or clears) the deadline of one client's suspension.
++// Callers must hold the registry mutex. Allocating lazily keeps the extra map absent
++// on models that never had a suspension.
++func (registration *ModelRegistration) setSuspendedUntilLocked(clientID string, until time.Time) {
++	if registration == nil {
++		return
++	}
++	if until.IsZero() {
++		delete(registration.SuspendedUntil, clientID)
++		return
++	}
++	if registration.SuspendedUntil == nil {
++		registration.SuspendedUntil = make(map[string]time.Time)
++	}
++	registration.SuspendedUntil[clientID] = until
+ }
+ 
+ // ModelRegistryHook provides optional callbacks for external integrations to track model list changes.
+@@ -693,6 +749,7 @@ func (r *ModelRegistry) registerClientLocked(clientID, clientProvider string, mo
+ 			if !preserveState || providerChanged || oldCounts[id] == 0 {
+ 				delete(reg.QuotaExceededClients, clientID)
+ 				delete(reg.SuspendedClients, clientID)
++				delete(reg.SuspendedUntil, clientID)
+ 			}
+ 			if providerChanged && provider != "" {
+ 				if _, newlyAdded := addedSet[id]; newlyAdded {
+@@ -757,6 +814,9 @@ func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *Mo
+ 		if existing.SuspendedClients == nil {
+ 			existing.SuspendedClients = make(map[string]string)
+ 		}
++		if existing.SuspendedUntil == nil {
++			existing.SuspendedUntil = make(map[string]time.Time)
++		}
+ 		if existing.InfoByProvider == nil {
+ 			existing.InfoByProvider = make(map[string]*ModelInfo)
+ 		}
+@@ -780,6 +840,7 @@ func (r *ModelRegistry) addModelRegistration(modelID, provider string, model *Mo
+ 		LastUpdated:          now,
+ 		QuotaExceededClients: make(map[string]*time.Time),
+ 		SuspendedClients:     make(map[string]string),
++		SuspendedUntil:       make(map[string]time.Time),
+ 	}
+ 	if provider != "" {
+ 		registration.Providers = map[string]int{provider: 1}
+@@ -800,6 +861,7 @@ func (r *ModelRegistry) removeModelRegistration(clientID, modelID, provider stri
+ 	if !preserveState {
+ 		delete(registration.QuotaExceededClients, clientID)
+ 		delete(registration.SuspendedClients, clientID)
++		delete(registration.SuspendedUntil, clientID)
+ 	}
+ 	if registration.Count < 0 {
+ 		registration.Count = 0
+@@ -937,6 +999,7 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
+ 			if registration.SuspendedClients != nil {
+ 				delete(registration.SuspendedClients, clientID)
+ 			}
++			delete(registration.SuspendedUntil, clientID)
+ 
+ 			if hasProvider && registration.Providers != nil {
+ 				if count, ok := registration.Providers[provider]; ok {
+@@ -1023,6 +1086,11 @@ type ClientModelProjection struct {
+ 	Suspended     bool
+ 	SuspendReason string
+ 	QuotaExceeded bool
++	// SuspendUntil is the instant the suspension is expected to lift. A zero value
++	// means the suspension has no known end, so it hides the model once the client
++	// has no other effective provider; a future value keeps the model listed while
++	// the cooldown runs, the same way a quota cooldown has always been listed.
++	SuspendUntil time.Time
+ }
+ 
+ // ApplyClientModelProjections atomically applies model suspension and quota exceeded state for clientID
+@@ -1104,13 +1172,18 @@ func (r *ModelRegistry) ApplyClientModelProjections(clientID string, epoch uint6
+ 			continue
+ 		}
+ 
+-		// Update suspended state
++		// Update suspended state. The deadline moves in lockstep with the map entry:
++		// a stale deadline on a live suspension would silently downgrade an
++		// open-ended suspension to a bounded one.
+ 		if proj.Suspended {
+ 			if registration.SuspendedClients == nil {
+ 				registration.SuspendedClients = make(map[string]string)
+ 			}
+-			if currentReason, ok := registration.SuspendedClients[clientID]; !ok || currentReason != proj.SuspendReason {
++			currentReason, recorded := registration.SuspendedClients[clientID]
++			currentUntil := registration.SuspendedUntil[clientID]
++			if !recorded || currentReason != proj.SuspendReason || !currentUntil.Equal(proj.SuspendUntil) {
+ 				registration.SuspendedClients[clientID] = proj.SuspendReason
++				registration.setSuspendedUntilLocked(clientID, proj.SuspendUntil)
+ 				registration.LastUpdated = now
+ 				changed = true
+ 			}
+@@ -1122,6 +1195,7 @@ func (r *ModelRegistry) ApplyClientModelProjections(clientID string, epoch uint6
+ 					changed = true
+ 				}
+ 			}
++			delete(registration.SuspendedUntil, clientID)
+ 		}
+ 
+ 		// Update quota exceeded state
+@@ -1352,6 +1426,8 @@ func (r *ModelRegistry) SuspendClientModel(clientID, modelID, reason string) {
+ 		return
+ 	}
+ 	registration.SuspendedClients[clientID] = reason
++	// A manual suspension carries no end: it stays until ResumeClientModel.
++	delete(registration.SuspendedUntil, clientID)
+ 	registration.LastUpdated = time.Now()
+ 	r.invalidateAvailableModelsCacheLocked()
+ 	if reason != "" {
+@@ -1381,6 +1457,7 @@ func (r *ModelRegistry) ResumeClientModel(clientID, modelID string) {
+ 		return
+ 	}
+ 	delete(registration.SuspendedClients, clientID)
++	delete(registration.SuspendedUntil, clientID)
+ 	registration.LastUpdated = time.Now()
+ 	r.invalidateAvailableModelsCacheLocked()
+ 	log.Debugf("Resumed client %s for model %s", clientID, modelID)
+@@ -1519,11 +1596,24 @@ func modelRegistrationAvailability(registration *ModelRegistration, now time.Tim
+ 	quotaAndSuspended := 0
+ 	if registration.SuspendedClients != nil {
+ 		for clientID, reason := range registration.SuspendedClients {
++			until := registration.SuspendedUntil[clientID]
++			state := classifySuspension(reason, until, now)
++			if state == suspensionNone {
++				// The deadline lapsed (or the record is a quota-only artefact). The
++				// suspension no longer removes the client; if the quota window is
++				// still open the client is already counted in expiredClients.
++				continue
++			}
+ 			if quotaTime := registration.QuotaExceededClients[clientID]; quotaTime != nil && now.Before(quotaTime.Add(modelQuotaExceededWindow)) {
+ 				quotaAndSuspended++
+ 			}
+-			if isQuotaSuspension(reason) {
++			if state == suspensionCooldown {
+ 				cooldownSuspended++
++				// The answer changes when this cooldown ends, so let the model list
++				// cache expire then instead of waiting for the next projection.
++				if !until.IsZero() && (expiresAt.IsZero() || until.Before(expiresAt)) {
++					expiresAt = until
++				}
+ 				continue
+ 			}
+ 			otherSuspended++
+@@ -1716,10 +1806,16 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
+ 					if p, okProvider := r.clientProviders[clientID]; !okProvider || p != provider {
+ 						continue
+ 					}
++					// Same classification as modelRegistrationAvailability: a bounded
++					// cooldown keeps the model listed, an open-ended suspension does not.
++					state := classifySuspension(reason, registration.SuspendedUntil[clientID], now)
++					if state == suspensionNone {
++						continue
++					}
+ 					if quotaTime := registration.QuotaExceededClients[clientID]; quotaTime != nil && now.Before(quotaTime.Add(modelQuotaExceededWindow)) {
+ 						quotaAndSuspended++
+ 					}
+-					if isQuotaSuspension(reason) {
++					if state == suspensionCooldown {
+ 						cooldownSuspended++
+ 						continue
+ 					}
+@@ -1769,7 +1865,11 @@ func (r *ModelRegistry) GetModelCount(modelID string) int {
+ 			}
+ 		}
+ 		suspendedClients := 0
+-		for clientID := range registration.SuspendedClients {
++		for clientID, reason := range registration.SuspendedClients {
++			// A lapsed cooldown no longer removes the client from the count.
++			if classifySuspension(reason, registration.SuspendedUntil[clientID], now) == suspensionNone {
++				continue
++			}
+ 			if quotaTime := registration.QuotaExceededClients[clientID]; quotaTime != nil && now.Before(quotaTime.Add(modelQuotaExceededWindow)) {
+ 				continue
+ 			}
+diff --git a/internal/registry/model_registry_suspension_deadline_test.go b/internal/registry/model_registry_suspension_deadline_test.go
+new file mode 100644
+index 0000000..b7259bd
+--- /dev/null
++++ b/internal/registry/model_registry_suspension_deadline_test.go
+@@ -0,0 +1,164 @@
++package registry
++
++import (
++	"testing"
++	"time"
++)
++
++// A single credential that fails with a request-level error still gets a cooldown
++// deadline from the conductor. While that deadline is live the model must stay
++// listed - a request then reaches scheduling and receives the retry hint instead of
++// "model not found" - and once it lapses the model must come back on its own,
++// without a restart and without waiting for another projection.
++func TestBoundedSuspensionKeepsSoleCredentialModelListed(t *testing.T) {
++	r := newTestModelRegistry()
++	models := []*ModelInfo{
++		{ID: "claude-sonnet-5", OwnedBy: "anthropic", Type: "claude"},
++		{ID: "claude-opus-5-5", OwnedBy: "anthropic", Type: "claude"},
++	}
++	r.RegisterClient("solo", "claude", models)
++	_, epoch := r.GetModelsAndEpochForClient("solo")
++
++	until := time.Now().Add(30 * time.Minute)
++	if !r.ApplyClientModelProjections("solo", epoch, 1, []ClientModelProjection{
++		{ModelID: "claude-sonnet-5", Suspended: true, SuspendReason: "unauthorized", SuspendUntil: until},
++		{ModelID: "claude-opus-5-5", Suspended: true, SuspendReason: "unauthorized", SuspendUntil: until},
++	}) {
++		t.Fatal("failed to apply the bounded suspension")
++	}
++	if got := len(r.GetAvailableModels("claude")); got != len(models) {
++		t.Errorf("/v1/models lists %d models during a bounded cooldown, want %d", got, len(models))
++	}
++	if got := len(r.GetAvailableModelsByProvider("claude")); got != len(models) {
++		t.Errorf("provider catalog lists %d models during a bounded cooldown, want %d", got, len(models))
++	}
++	if got := len(r.GetAvailableModelInfos()); got != len(models) {
++		t.Errorf("metadata catalog lists %d models during a bounded cooldown, want %d", got, len(models))
++	}
++	if got := r.GetModelCount("claude-sonnet-5"); got != 0 {
++		t.Errorf("a cooling credential still counts as an available client: count=%d", got)
++	}
++
++	// Move the deadline into the past: the suspension is over even though the map
++	// entry is still there, because nothing but the next projection clears it.
++	registration := r.models["claude-sonnet-5"]
++	registration.SuspendedUntil["solo"] = time.Now().Add(-time.Second)
++	registration = r.models["claude-opus-5-5"]
++	registration.SuspendedUntil["solo"] = time.Now().Add(-time.Second)
++	r.invalidateAvailableModelsCacheLocked()
++
++	if got := len(r.GetAvailableModels("claude")); got != len(models) {
++		t.Errorf("/v1/models lists %d models after the cooldown lapsed, want %d", got, len(models))
++	}
++	if got := r.GetModelCount("claude-sonnet-5"); got != 1 {
++		t.Errorf("a lapsed cooldown still removes the client: count=%d", got)
++	}
++}
++
++// The recorded deadline must also bound the model list cache, otherwise a client
++// asking right after the cooldown ended keeps reading the stale empty answer.
++func TestBoundedSuspensionExpiresTheModelListCache(t *testing.T) {
++	r := newTestModelRegistry()
++	r.RegisterClient("solo", "claude", []*ModelInfo{{ID: "claude-sonnet-5", OwnedBy: "anthropic", Type: "claude"}})
++	_, epoch := r.GetModelsAndEpochForClient("solo")
++
++	until := time.Now().Add(250 * time.Millisecond)
++	if !r.ApplyClientModelProjections("solo", epoch, 1, []ClientModelProjection{
++		{ModelID: "claude-sonnet-5", Suspended: true, SuspendReason: "request failed", SuspendUntil: until},
++	}) {
++		t.Fatal("failed to apply the bounded suspension")
++	}
++	if got := len(r.GetAvailableModels("claude")); got != 1 {
++		t.Fatalf("/v1/models lists %d models, want 1", got)
++	}
++	cache, ok := r.availableModelsCache["claude"]
++	if !ok {
++		t.Fatal("the model list was not cached at all")
++	}
++	if cache.expiresAt.IsZero() || cache.expiresAt.After(until) {
++		t.Errorf("model list cache expires at %v, want it bounded by the suspension deadline %v", cache.expiresAt, until)
++	}
++}
++
++// A suspension with no deadline - a manual one, or one whose recovery instant is
++// unknown - still hides the model once no effective client is left. This is the
++// behaviour the registry always had and the conductor relies on.
++func TestOpenEndedSuspensionStillHidesTheModel(t *testing.T) {
++	r := newTestModelRegistry()
++	r.RegisterClient("solo", "claude", []*ModelInfo{{ID: "claude-sonnet-5", OwnedBy: "anthropic", Type: "claude"}})
++	_, epoch := r.GetModelsAndEpochForClient("solo")
++
++	if !r.ApplyClientModelProjections("solo", epoch, 1, []ClientModelProjection{
++		{ModelID: "claude-sonnet-5", Suspended: true, SuspendReason: "manual"},
++	}) {
++		t.Fatal("failed to apply the open-ended suspension")
++	}
++	if got := len(r.GetAvailableModels("claude")); got != 0 {
++		t.Errorf("/v1/models lists %d models under an open-ended suspension, want 0", got)
++	}
++	if got := len(r.GetAvailableModelsByProvider("claude")); got != 0 {
++		t.Errorf("provider catalog lists %d models under an open-ended suspension, want 0", got)
++	}
++}
++
++// Resuming, unregistering and re-registering must not leave a deadline behind: a
++// stale future deadline would keep a later open-ended suspension listed.
++func TestSuspensionDeadlineIsDroppedWithTheSuspension(t *testing.T) {
++	r := newTestModelRegistry()
++	r.RegisterClient("solo", "claude", []*ModelInfo{{ID: "claude-sonnet-5", OwnedBy: "anthropic", Type: "claude"}})
++	_, epoch := r.GetModelsAndEpochForClient("solo")
++
++	if !r.ApplyClientModelProjections("solo", epoch, 1, []ClientModelProjection{
++		{ModelID: "claude-sonnet-5", Suspended: true, SuspendReason: "request failed", SuspendUntil: time.Now().Add(time.Hour)},
++	}) {
++		t.Fatal("failed to apply the bounded suspension")
++	}
++	registration := r.models["claude-sonnet-5"]
++	if _, ok := registration.SuspendedUntil["solo"]; !ok {
++		t.Fatal("the suspension deadline was not recorded")
++	}
++
++	_, epoch = r.GetModelsAndEpochForClient("solo")
++	if !r.ApplyClientModelProjections("solo", epoch, 2, []ClientModelProjection{{ModelID: "claude-sonnet-5"}}) {
++		t.Fatal("failed to clear the suspension")
++	}
++	if _, ok := registration.SuspendedUntil["solo"]; ok {
++		t.Error("clearing a suspension left its deadline behind")
++	}
++
++	// A manual suspension records no deadline even when a projection carried one
++	// just before it.
++	r.SuspendClientModel("solo", "claude-sonnet-5", "manual")
++	if _, ok := registration.SuspendedUntil["solo"]; ok {
++		t.Error("a manual suspension inherited a previous deadline")
++	}
++	r.ResumeClientModel("solo", "claude-sonnet-5")
++	if _, ok := registration.SuspendedUntil["solo"]; ok {
++		t.Error("resuming left a deadline behind")
++	}
++}
++
++// The projection must publish the deadline the scheduler already honours, and must
++// keep publishing none for a credential nothing will revive on its own.
++func TestClassifySuspensionUsesTheDeadline(t *testing.T) {
++	now := time.Now()
++	cases := []struct {
++		name   string
++		reason string
++		until  time.Time
++		want   suspensionState
++	}{
++		{name: "no deadline is open ended", reason: "unauthorized", want: suspensionOther},
++		{name: "future deadline is a cooldown", reason: "unauthorized", until: now.Add(time.Minute), want: suspensionCooldown},
++		{name: "lapsed deadline is over", reason: "unauthorized", until: now.Add(-time.Minute), want: suspensionNone},
++		{name: "quota without deadline stays a cooldown", reason: "credential_quota", want: suspensionCooldown},
++		{name: "quota with lapsed deadline is over", reason: "quota", until: now.Add(-time.Second), want: suspensionNone},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := classifySuspension(tc.reason, tc.until, now); got != tc.want {
++				t.Errorf("classifySuspension(%q, %v) = %v, want %v", tc.reason, tc.until, got, tc.want)
++			}
++		})
++	}
++}
 diff --git a/internal/registry/models/models.json b/internal/registry/models/models.json
-index eccedee..cae52c2 100644
+index 8e1a020..a403749 100644
 --- a/internal/registry/models/models.json
 +++ b/internal/registry/models/models.json
-@@ -4350,6 +4350,74 @@
+@@ -4360,6 +4360,74 @@
        "native_capabilities": {
          "web_search": true
        }
@@ -77,11 +471,193 @@ index eccedee..cae52c2 100644
      }
    ],
    "xai": [
+diff --git a/internal/runtime/executor/antigravity_executor.go b/internal/runtime/executor/antigravity_executor.go
+index bd0c33e..6cb63de 100644
+--- a/internal/runtime/executor/antigravity_executor.go
++++ b/internal/runtime/executor/antigravity_executor.go
+@@ -87,6 +87,20 @@ func (e *AntigravityExecutor) obfuscateSensitiveWordsDoc(doc *ojson.Doc) bool {
+ var (
+ 	antigravityBaseTransport = defaultAntigravityBaseTransport()
+ 	antigravityTransports    = helps.NewTransportCache[antigravityTransportKey](antigravityTransportCacheCapacity)
++
++	// antigravityStreamResponseHeaderTimeout bounds how long a streaming call may wait
++	// for the upstream response headers before the request is abandoned. Without it
++	// Do() never returns when the upstream accepts the TCP/TLS handshake and then
++	// stays silent: the idle watchdog is only created after Do() returns, so nothing
++	// on the streaming path can interrupt that wait, while the SSE keep-alives we emit
++	// downstream keep the client convinced the connection is healthy.
++	//
++	// Only streaming needs this bound. A non-streaming execute receives its response
++	// headers only once the whole generation is finished, so the same two minutes would
++	// kill perfectly healthy long generations; those callers therefore pass 0 (unset).
++	//
++	// It is a var, not a const, so tests can shorten it.
++	antigravityStreamResponseHeaderTimeout = 2 * time.Minute
+ )
+ 
+ const (
+@@ -237,6 +251,11 @@ type antigravityTransportKey struct {
+ 	shortMode           bool
+ 	idleConnTimeout     time.Duration
+ 	maxIdleConnsPerHost int
++	// headerTimeout is part of the key because a pool built for a streaming call must
++	// never be handed to a non-streaming one (and vice versa): the ResponseHeaderTimeout
++	// lives on the transport, so sharing it would either disable the streaming bound or
++	// impose it on long non-streaming generations.
++	headerTimeout time.Duration
+ }
+ 
+ func defaultAntigravityBaseTransport() *http.Transport {
+@@ -246,12 +265,18 @@ func defaultAntigravityBaseTransport() *http.Transport {
+ 	return &http.Transport{}
+ }
+ 
+-func cloneTransportWithHTTP11(base *http.Transport, cfgs ...*config.Config) *http.Transport {
++func cloneTransportWithHTTP11(base *http.Transport, headerTimeout time.Duration, cfgs ...*config.Config) *http.Transport {
+ 	if base == nil {
+ 		return nil
+ 	}
+ 
+ 	clone := base.Clone()
++	// Only override when asked to. A non-positive value keeps whatever the base
++	// transport (or the operator's context transport) already configured instead of
++	// silently clearing a bound somebody else set on purpose.
++	if headerTimeout > 0 {
++		clone.ResponseHeaderTimeout = headerTimeout
++	}
+ 	clone.ForceAttemptHTTP2 = false
+ 	// Wipe TLSNextProto to prevent implicit HTTP/2 upgrade.
+ 	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+@@ -325,7 +350,7 @@ func applyAntigravityPoolLimits(transport *http.Transport, cfgs ...*config.Confi
+ // antigravityHTTP11Transport returns the HTTP/1.1 pool shared by every request that
+ // uses the same credential and the same base transport. The base is either the
+ // process default or a transport provided through the request context.
+-func antigravityHTTP11Transport(auth *cliproxyauth.Auth, base *http.Transport, cfgs ...*config.Config) *http.Transport {
++func antigravityHTTP11Transport(auth *cliproxyauth.Auth, base *http.Transport, headerTimeout time.Duration, cfgs ...*config.Config) *http.Transport {
+ 	if base == nil {
+ 		return nil
+ 	}
+@@ -340,16 +365,17 @@ func antigravityHTTP11Transport(auth *cliproxyauth.Auth, base *http.Transport, c
+ 		shortMode:           settings.shortMode,
+ 		idleConnTimeout:     settings.idleConnTimeout,
+ 		maxIdleConnsPerHost: settings.maxIdleConnsPerHost,
++		headerTimeout:       headerTimeout,
+ 	}
+ 	transport, errGet := antigravityTransports.Get(key, func() (*http.Transport, error) {
+-		return cloneTransportWithHTTP11(base, cfgs...), nil
++		return cloneTransportWithHTTP11(base, headerTimeout, cfgs...), nil
+ 	})
+ 	if errGet != nil {
+ 		// Defensive only: the builder above cannot fail. Never return nil here, because a
+ 		// nil Transport makes http.Client fall back to http.DefaultTransport, which
+ 		// advertises h2 over ALPN and would break the Antigravity wire fingerprint.
+ 		log.Debugf("antigravity executor: cache HTTP/1.1 transport failed: %v", errGet)
+-		return cloneTransportWithHTTP11(base, cfgs...)
++		return cloneTransportWithHTTP11(base, headerTimeout, cfgs...)
+ 	}
+ 	return transport
+ }
+@@ -358,7 +384,7 @@ func antigravityHTTP11Transport(auth *cliproxyauth.Auth, base *http.Transport, c
+ // one proxy setting, or nil when the proxy setting cannot be turned into a
+ // transport. Keying on the normalized proxy string rather than on a prebuilt
+ // transport keeps one pool per credential and proxy instead of one per request.
+-func antigravityProxiedHTTP11Transport(auth *cliproxyauth.Auth, proxyURL string, cfgs ...*config.Config) *http.Transport {
++func antigravityProxiedHTTP11Transport(auth *cliproxyauth.Auth, proxyURL string, headerTimeout time.Duration, cfgs ...*config.Config) *http.Transport {
+ 	proxyURL = strings.TrimSpace(proxyURL)
+ 	if proxyURL == "" {
+ 		return nil
+@@ -374,6 +400,7 @@ func antigravityProxiedHTTP11Transport(auth *cliproxyauth.Auth, proxyURL string,
+ 		shortMode:           settings.shortMode,
+ 		idleConnTimeout:     settings.idleConnTimeout,
+ 		maxIdleConnsPerHost: settings.maxIdleConnsPerHost,
++		headerTimeout:       headerTimeout,
+ 	}
+ 	transport, errGet := antigravityTransports.Get(key, func() (*http.Transport, error) {
+ 		base, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+@@ -383,7 +410,7 @@ func antigravityProxiedHTTP11Transport(auth *cliproxyauth.Auth, proxyURL string,
+ 		if base == nil {
+ 			return nil, fmt.Errorf("antigravity executor: proxy setting produced no transport")
+ 		}
+-		return cloneTransportWithHTTP11(base, cfgs...), nil
++		return cloneTransportWithHTTP11(base, headerTimeout, cfgs...), nil
+ 	})
+ 	if errGet != nil {
+ 		// The caller falls back to NewProxyAwareHTTPClient, which reports the failure
+@@ -444,13 +471,18 @@ func antigravityCredentialScope(prefix, secret string) string {
+ // negotiates TLS 1.3 without advertising an ALPN protocol and therefore never uses h2.
+ // The underlying Transport is always shared so keep-alive connections survive across
+ // requests instead of forcing a fresh TCP + TLS handshake every time.
+-func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (clientOut *http.Client) {
++//
++// headerTimeout bounds how long a request may wait for the response headers. Callers
++// pass a positive value only for streaming, where the upstream can hold the socket open
++// after the handshake and never send headers; non-streaming callers pass 0 because their
++// headers only arrive once the whole generation is done.
++func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, headerTimeout time.Duration) (clientOut *http.Client) {
+ 	defer func() { clientOut = httptransport.Decorate(ctx, clientOut) }()
+ 	// Native Antigravity reuses one transport across requests. Opt into a
+ 	// credential-scoped proxy transport only here so other providers keep their
+ 	// existing lifecycle and different OAuth identities remain isolated.
+ 	if proxyURL := antigravityProxyURL(ctx, cfg, auth); proxyURL != "" {
+-		if transport := antigravityProxiedHTTP11Transport(auth, proxyURL, cfg); transport != nil {
++		if transport := antigravityProxiedHTTP11Transport(auth, proxyURL, headerTimeout, cfg); transport != nil {
+ 			return &http.Client{Transport: transport, Timeout: timeout}
+ 		}
+ 		// Fall through so NewProxyAwareHTTPClient reports the failure and applies the
+@@ -460,7 +492,7 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
+ 	client := helps.NewProxyAwareHTTPClient(httptransport.WithoutDecorator(ctx), cfg, auth, timeout)
+ 	// Direct requests share an HTTP/1.1 pool only within the selected credential.
+ 	if client.Transport == nil {
+-		client.Transport = antigravityHTTP11Transport(auth, antigravityBaseTransport, cfg)
++		client.Transport = antigravityHTTP11Transport(auth, antigravityBaseTransport, headerTimeout, cfg)
+ 		return client
+ 	}
+ 
+@@ -478,7 +510,7 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
+ 		// Antigravity fingerprint, so substitute the process base transport.
+ 		transport = antigravityBaseTransport
+ 	}
+-	client.Transport = antigravityHTTP11Transport(auth, transport, cfg)
++	client.Transport = antigravityHTTP11Transport(auth, transport, headerTimeout, cfg)
+ 	return client
+ }
+ 
+@@ -1036,7 +1068,7 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
+ 		return nil, err
+ 	}
+ 
+-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
++	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0, 0)
+ 	return helps.WithAntigravityHTTPClientTrace(httpClient, auth, "http_request").Do(httpReq)
+ }
+ 
+diff --git a/internal/runtime/executor/antigravity_executor_auth.go b/internal/runtime/executor/antigravity_executor_auth.go
+index 6571930..6158b4a 100644
+--- a/internal/runtime/executor/antigravity_executor_auth.go
++++ b/internal/runtime/executor/antigravity_executor_auth.go
+@@ -166,7 +166,7 @@ func (e *AntigravityExecutor) refreshTokenSingleFlight(ctx context.Context, auth
+ 	// Real Antigravity uses Go's default User-Agent for OAuth token refresh
+ 	httpReq.Header.Set("User-Agent", "Go-http-client/2.0")
+ 
+-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
++	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0, 0)
+ 	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "oauth_refresh").Do(httpReq)
+ 	if errDo != nil {
+ 		return nil, errDo
+@@ -239,7 +239,7 @@ func (e *AntigravityExecutor) fetchAntigravityProjectID(ctx context.Context, aut
+ 	// Project discovery is required credential preparation, not a generation request.
+ 	acquisitionCtx, cancelAcquisition := context.WithTimeout(ctx, antigravityCredentialAcquisitionTimeout)
+ 	defer cancelAcquisition()
+-	httpClient := newAntigravityHTTPClient(acquisitionCtx, e.cfg, auth, 0)
++	httpClient := newAntigravityHTTPClient(acquisitionCtx, e.cfg, auth, 0, 0)
+ 	tracedClient := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "project_discovery")
+ 	projectID, errFetch := sdkAuth.FetchAntigravityProjectID(acquisitionCtx, token, tracedClient)
+ 	if errFetch != nil {
 diff --git a/internal/runtime/executor/antigravity_executor_buildrequest_test.go b/internal/runtime/executor/antigravity_executor_buildrequest_test.go
-index 69e7a1c..184edd3 100644
+index b43078e..707d75f 100644
 --- a/internal/runtime/executor/antigravity_executor_buildrequest_test.go
 +++ b/internal/runtime/executor/antigravity_executor_buildrequest_test.go
-@@ -390,9 +390,13 @@ func assertNonSchemaRequestPreserved(t *testing.T, body map[string]any) {
+@@ -471,9 +471,13 @@ func assertNonSchemaRequestPreserved(t *testing.T, body map[string]any) {
  		t.Fatalf("x-extra should be preserved outside schema cleanup path, got=%v", nonSchema["x-extra"])
  	}
  
@@ -97,40 +673,62 @@ index 69e7a1c..184edd3 100644
  		}
  	}
  }
+diff --git a/internal/runtime/executor/antigravity_executor_credits.go b/internal/runtime/executor/antigravity_executor_credits.go
+index 2e4e623..609ae13 100644
+--- a/internal/runtime/executor/antigravity_executor_credits.go
++++ b/internal/runtime/executor/antigravity_executor_credits.go
+@@ -549,7 +549,7 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalanceForTask(ctx context
+ 	httpReq.Header.Set("Content-Type", "application/json")
+ 	httpReq.Header.Set("User-Agent", userAgent)
+ 
+-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
++	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0, 0)
+ 	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "credits_query").Do(httpReq)
+ 	if errDo != nil {
+ 		log.Debugf("antigravity executor: loadCodeAssist request error: %v", errDo)
+diff --git a/internal/runtime/executor/antigravity_executor_execute.go b/internal/runtime/executor/antigravity_executor_execute.go
+index a0a9c78..279cdde 100644
+--- a/internal/runtime/executor/antigravity_executor_execute.go
++++ b/internal/runtime/executor/antigravity_executor_execute.go
+@@ -104,7 +104,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
+ 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
+ 
+ 	baseURL := resolveAntigravityRequestBaseURL(auth)
+-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
++	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0, 0)
+ 	httpClient = reporter.TrackHTTPClient(httpClient)
+ 	// Credential retry rounds are owned by the conductor. Perform one upstream
+ 	// request per credential so request-retry is not consumed twice.
+@@ -325,7 +325,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
+ 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
+ 
+ 	baseURL := resolveAntigravityRequestBaseURL(auth)
+-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
++	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0, 0)
+ 	httpClient = reporter.TrackHTTPClient(httpClient)
+ 
+ 	// Credential retry rounds are owned by the conductor. Perform one upstream
 diff --git a/internal/runtime/executor/antigravity_executor_request.go b/internal/runtime/executor/antigravity_executor_request.go
-index bdb56aa..7b5b514 100644
+index 2a7df38..bc9f0f2 100644
 --- a/internal/runtime/executor/antigravity_executor_request.go
 +++ b/internal/runtime/executor/antigravity_executor_request.go
-@@ -82,9 +82,10 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
- 				updated, _ := sjson.SetBytes([]byte(payloadStr), "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
- 				payloadStr = string(updated)
- 			}
--		} else {
--			payloadStr, _ = sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")
+@@ -85,9 +85,12 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
+ 		if !promptStructuredOutput {
+ 			_ = doc.Set("request.toolConfig.functionCallingConfig.mode", "VALIDATED")
  		}
-+		// maxOutputTokens is preserved here for the same reason as in the non-sanitized path:
-+		// the upstream honours it, and dropping it turns a capped request into an unbounded one
-+		// whose truncation still reports finish_reason "stop".
+-	} else {
+-		_ = doc.Delete("request.generationConfig.maxOutputTokens")
+ 	}
++	// maxOutputTokens is preserved here for the same reason as in the pre-Doc code path:
++	// the upstream honours the field (it answers finishReason MAX_TOKENS when the cap is
++	// reached), so deleting it meant a client's max_tokens was silently ignored - a request
++	// capped at 1 token produced 3289, and a truncated stream still reported finish_reason
++	// "stop", which leaves clients like SillyTavern waiting for a completion that already ended.
  
- 		payloadStrBytes := applyAntigravityNativeSignatureReplayIfNeeded(modelName, []byte(payloadStr))
- 		payloadStrBytes = helps.FinalizePayload(ctx, payloadStrBytes)
-@@ -97,9 +98,12 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
- 			if !promptStructuredOutput {
- 				payload, _ = sjson.SetBytes(payload, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
- 			}
--		} else {
--			payload, _ = sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")
- 		}
-+		// maxOutputTokens used to be stripped for every non-Claude model here. The upstream
-+		// honours the field (it answers finishReason MAX_TOKENS when the cap is reached), so
-+		// deleting it meant a client's max_tokens was silently ignored: a request capped at 1
-+		// token produced 3289, and a truncated stream still reported finish_reason "stop",
-+		// which leaves clients like SillyTavern waiting for a completion that already ended.
- 
- 		payload = applyAntigravityNativeSignatureReplayIfNeeded(modelName, payload)
- 		payload = helps.FinalizePayload(ctx, payload)
+ 	applyAntigravityNativeSignatureReplayIfNeededDoc(modelName, doc)
+ 	helps.FinalizePayloadDoc(ctx, doc)
 diff --git a/internal/runtime/executor/antigravity_executor_stream.go b/internal/runtime/executor/antigravity_executor_stream.go
-index bba3a96..9925fd2 100644
+index b4ec1ac..892cb8e 100644
 --- a/internal/runtime/executor/antigravity_executor_stream.go
 +++ b/internal/runtime/executor/antigravity_executor_stream.go
 @@ -9,6 +9,7 @@ import (
@@ -140,9 +738,9 @@ index bba3a96..9925fd2 100644
 +	"sync/atomic"
  	"time"
  
- 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
-@@ -22,6 +23,20 @@ import (
- 	"github.com/tidwall/sjson"
+ 	"github.com/MoeForge/moego/ojson"
+@@ -21,6 +22,20 @@ import (
+ 	log "github.com/sirupsen/logrus"
  )
  
 +// antigravityStreamIdleTimeout is how long a streaming response may go without a single byte
@@ -162,7 +760,16 @@ index bba3a96..9925fd2 100644
  // ExecuteStream performs a streaming request to the Antigravity API.
  func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
  	if opts.Alt == "responses/compact" {
-@@ -209,6 +224,40 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -104,7 +119,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+ 	useCredits := cliproxyauth.AntigravityCreditsRequested(ctx) && antigravityCreditsRetryEnabled(e.cfg)
+ 
+ 	baseURL := resolveAntigravityRequestBaseURL(auth)
+-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
++	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0, antigravityStreamResponseHeaderTimeout)
+ 	httpClient = reporter.TrackHTTPClient(httpClient)
+ 
+ 	// Credential retry rounds are owned by the conductor. Perform one upstream
+@@ -210,6 +225,40 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  				log.Errorf("antigravity executor: close response line error: %v", errClose)
  			}
  		}()
@@ -203,7 +810,7 @@ index bba3a96..9925fd2 100644
  		scanner := bufio.NewScanner(resp.Body)
  		scanner.Buffer(nil, streamScannerBuffer)
  		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
-@@ -217,6 +266,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -219,6 +268,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  		var pendingJSON []byte
  		var replayCommitted bool
  		var terminalDelivered bool
@@ -211,7 +818,7 @@ index bba3a96..9925fd2 100644
  		var param any
  		commitReplay := func() {
  			if !replayCommitted && replayAccumulator != nil && replayAccumulator.terminal && helps.ApplyPatchTranslationError(param) == nil {
-@@ -224,6 +274,31 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -226,6 +276,31 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  				replayCommitted = true
  			}
  		}
@@ -243,7 +850,7 @@ index bba3a96..9925fd2 100644
  		defer func() {
  			defer stopDeliverySupport()
  			if helps.ApplyPatchTranslationError(param) != nil {
-@@ -261,6 +336,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -263,6 +338,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  		}()
  		helps.InitializeApplyPatchStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, &param)
  		for scanner.Scan() {
@@ -251,7 +858,7 @@ index bba3a96..9925fd2 100644
  			line := scanner.Bytes()
  			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
  			if replayAccumulator != nil {
-@@ -370,6 +446,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -372,6 +448,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  			}
  			if isTerminalChunk {
  				terminalDelivered = true
@@ -265,7 +872,7 @@ index bba3a96..9925fd2 100644
  			}
  			if helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
  				return
-@@ -378,7 +461,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -380,7 +463,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  		if helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
  			return
  		}
@@ -280,7 +887,7 @@ index bba3a96..9925fd2 100644
  			streamErr = errScan
  			if errors.Is(errScan, context.Canceled) && ctx.Err() != nil {
  				if terminalDelivered {
-@@ -400,17 +489,11 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
+@@ -402,17 +491,11 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
  			// stream as a successful completion. A clean EOF is a normal end
  			// even without finishReason: real Antigravity tool-call streams
  			// end that way (see antigravityNoFinishReasonSSE).
@@ -303,9 +910,152 @@ index bba3a96..9925fd2 100644
  			}
  			terminalDelivered = true
  		}
+diff --git a/internal/runtime/executor/antigravity_executor_stream_header_test.go b/internal/runtime/executor/antigravity_executor_stream_header_test.go
+new file mode 100644
+index 0000000..8c1f3a2
+--- /dev/null
++++ b/internal/runtime/executor/antigravity_executor_stream_header_test.go
+@@ -0,0 +1,137 @@
++package executor
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
++	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
++)
++
++// TestAntigravityStreamAbandonsSilentUpstream covers the failure that left the Android
++// gateway unusable after a single answer: the upstream accepts the TCP and TLS handshake
++// and then sends nothing at all — not even a status line.
++//
++// Do() used to have no bound at all on that wait (client timeout 0, and the base transport
++// carries no ResponseHeaderTimeout), and the idle watchdog that does exist is created only
++// after Do() returns, so nothing could interrupt it. Meanwhile the gateway keeps writing
++// SSE keep-alives downstream, so the client sees a healthy connection that never produces
++// content.
++//
++// The bound must be short enough to matter, so the package-level value is lowered for the
++// duration of this test and restored afterwards. It is deliberately not parallel: the value
++// is shared package state.
++func TestAntigravityStreamAbandonsSilentUpstream(t *testing.T) {
++	previous := antigravityStreamResponseHeaderTimeout
++	antigravityStreamResponseHeaderTimeout = 300 * time.Millisecond
++	defer func() { antigravityStreamResponseHeaderTimeout = previous }()
++
++	// release lets the handlers return before the server is shut down: a handler blocked
++	// only on r.Context().Done() would keep httptest.Server.Close waiting until the test
++	// binary times out, because a timed-out request leaves the server-side conn alive.
++	release := make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		// Write nothing at all — no status line, no header, no byte — exactly like an
++		// upstream that completed the handshake and then stalled.
++		select {
++		case <-release:
++		case <-r.Context().Done():
++		}
++	}))
++	defer server.Close()
++	defer close(release)
++
++	executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
++	started := time.Now()
++	resultCh := make(chan struct {
++		result *cliproxyexecutor.StreamResult
++		err    error
++	}, 1)
++	go func() {
++		result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
++			Metadata: map[string]any{
++				"access_token": "token-123",
++				"expired":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
++				"project_id":   "project-1",
++			},
++			Attributes: map[string]string{"base_url": server.URL},
++		}, cliproxyexecutor.Request{
++			Model:   "gemini-3.7-flash",
++			Payload: []byte(`{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"hello"}],"stream":true}`),
++		}, cliproxyexecutor.Options{
++			SourceFormat:   sdktranslator.FormatOpenAI,
++			ResponseFormat: sdktranslator.FormatOpenAI,
++			Stream:         true,
++		})
++		resultCh <- struct {
++			result *cliproxyexecutor.StreamResult
++			err    error
++		}{result, errExecute}
++	}()
++
++	select {
++	case got := <-resultCh:
++		if got.err == nil {
++			t.Fatal("ExecuteStream() returned no error while the upstream never sent headers")
++		}
++		if !strings.Contains(strings.ToLower(got.err.Error()), "timeout awaiting response headers") {
++			t.Fatalf("ExecuteStream() error = %v, want a response-header timeout", got.err)
++		}
++		if elapsed := time.Since(started); elapsed > 10*time.Second {
++			t.Fatalf("ExecuteStream() took %v to give up on a silent upstream", elapsed)
++		}
++	case <-time.After(20 * time.Second):
++		t.Fatal("ExecuteStream() never returned: a silent upstream still blocks the stream forever")
++	}
++}
++
++// TestAntigravityTransportResponseHeaderTimeoutIsPoolScoped pins the two properties the
++// streaming bound depends on: the timeout reaches the transport, and two requests that ask
++// for different bounds never share one pooled transport. Sharing would either drop the
++// bound for streams or impose it on non-streaming calls, whose headers only arrive once the
++// whole generation has finished.
++func TestAntigravityTransportResponseHeaderTimeoutIsPoolScoped(t *testing.T) {
++	auth := antigravityAuthWithIDAndProxy("header-timeout-auth", "")
++	cfg := &config.Config{}
++
++	const streaming = 300 * time.Millisecond
++	streamClient := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, streaming)
++	plainClient := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, 0)
++
++	streamTransport, ok := streamClient.Transport.(*http.Transport)
++	if !ok {
++		t.Fatalf("streaming client transport = %T, want *http.Transport", streamClient.Transport)
++	}
++	if streamTransport.ResponseHeaderTimeout != streaming {
++		t.Fatalf("streaming ResponseHeaderTimeout = %v, want %v", streamTransport.ResponseHeaderTimeout, streaming)
++	}
++
++	plainTransport, ok := plainClient.Transport.(*http.Transport)
++	if !ok {
++		t.Fatalf("non-streaming client transport = %T, want *http.Transport", plainClient.Transport)
++	}
++	if plainTransport.ResponseHeaderTimeout != 0 {
++		t.Fatalf("non-streaming ResponseHeaderTimeout = %v, want 0 (unset)", plainTransport.ResponseHeaderTimeout)
++	}
++	if streamTransport == plainTransport {
++		t.Fatal("transports with different response-header timeouts must not share a pool")
++	}
++
++	// A non-positive value must leave whatever the base transport configured alone, so an
++	// operator who set their own bound through the request context is not silently reset.
++	base := defaultAntigravityBaseTransport().Clone()
++	base.ResponseHeaderTimeout = 45 * time.Second
++	kept := antigravityHTTP11Transport(auth, base, 0, cfg)
++	if kept == nil {
++		t.Fatal("expected a transport for a non-nil base")
++	}
++	if kept.ResponseHeaderTimeout != 45*time.Second {
++		t.Fatalf("base ResponseHeaderTimeout = %v, want it preserved at 45s", kept.ResponseHeaderTimeout)
++	}
++}
 diff --git a/internal/runtime/executor/antigravity_executor_stream_hold_test.go b/internal/runtime/executor/antigravity_executor_stream_hold_test.go
 new file mode 100644
-index 0000000..02f740c
+index 0000000..1601c8b
 --- /dev/null
 +++ b/internal/runtime/executor/antigravity_executor_stream_hold_test.go
 @@ -0,0 +1,107 @@
@@ -319,11 +1069,11 @@ index 0000000..02f740c
 +	"testing"
 +	"time"
 +
++	"github.com/MoeForge/moego/ojson"
 +	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 +	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 +	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 +	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-+	"github.com/tidwall/gjson"
 +)
 +
 +// TestAntigravityStreamEndsWhenUpstreamHoldsTheSocket covers the shape that left
@@ -400,11 +1150,11 @@ index 0000000..02f740c
 +			if chunk.Err != nil {
 +				t.Fatalf("unexpected stream error: %v", chunk.Err)
 +			}
-+			if gjson.GetBytes(chunk.Payload, "choices.0.finish_reason").String() != "" {
++			if ojson.GetBytesNoCopy(chunk.Payload, "choices.0.finish_reason").String() != "" {
 +				sawFinish = true
 +				// The terminal frame must carry the accounting even though the connection was
 +				// still open when it arrived.
-+				if got := gjson.GetBytes(chunk.Payload, "usage.total_tokens").Int(); got != 12 {
++				if got := ojson.GetBytesNoCopy(chunk.Payload, "usage.total_tokens").Int(); got != 12 {
 +					t.Fatalf("terminal total_tokens = %d, want 12", got)
 +				}
 +			}
@@ -416,3 +1166,636 @@ index 0000000..02f740c
 +		t.Fatal("no terminal chunk before the stream ended")
 +	}
 +}
+diff --git a/internal/runtime/executor/antigravity_executor_tokens.go b/internal/runtime/executor/antigravity_executor_tokens.go
+index a076b45..1e2faf6 100644
+--- a/internal/runtime/executor/antigravity_executor_tokens.go
++++ b/internal/runtime/executor/antigravity_executor_tokens.go
+@@ -79,7 +79,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
+ 	_ = doc.Delete("request.sessionId")
+ 
+ 	base := resolveAntigravityRequestBaseURL(auth)
+-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
++	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0, 0)
+ 
+ 	var authID, authLabel, authType, authValue string
+ 	if auth != nil {
+diff --git a/internal/runtime/executor/antigravity_executor_transport_test.go b/internal/runtime/executor/antigravity_executor_transport_test.go
+index 3cee647..c40637d 100644
+--- a/internal/runtime/executor/antigravity_executor_transport_test.go
++++ b/internal/runtime/executor/antigravity_executor_transport_test.go
+@@ -73,8 +73,8 @@ func TestNewAntigravityHTTPClientSharesTransport(t *testing.T) {
+ 	}
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+-			first := newAntigravityHTTPClient(context.Background(), tc.cfg, tc.auth, 0)
+-			second := newAntigravityHTTPClient(context.Background(), tc.cfg, tc.auth, 0)
++			first := newAntigravityHTTPClient(context.Background(), tc.cfg, tc.auth, 0, 0)
++			second := newAntigravityHTTPClient(context.Background(), tc.cfg, tc.auth, 0, 0)
+ 			if first.Transport == nil || second.Transport == nil {
+ 				t.Fatal("expected a transport to be configured")
+ 			}
+@@ -188,7 +188,7 @@ func TestAntigravityPoolLimitsGuardsDefaultAndGFECutoff(t *testing.T) {
+ func TestNewAntigravityHTTPClientRejectsTypedNilContextTransport(t *testing.T) {
+ 	var typedNil *http.Transport
+ 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(typedNil))
+-	client := newAntigravityHTTPClient(ctx, &config.Config{}, antigravityAuthWithIDAndProxy("typed-nil", ""), 0)
++	client := newAntigravityHTTPClient(ctx, &config.Config{}, antigravityAuthWithIDAndProxy("typed-nil", ""), 0, 0)
+ 
+ 	transport, ok := client.Transport.(*http.Transport)
+ 	if !ok || transport == nil {
+@@ -209,7 +209,7 @@ func TestNewAntigravityHTTPClientKeepsForeignRoundTripper(t *testing.T) {
+ 		return nil, errors.New("unused")
+ 	})
+ 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(foreign))
+-	client := newAntigravityHTTPClient(ctx, &config.Config{}, antigravityAuthWithIDAndProxy("foreign-rt", ""), 0)
++	client := newAntigravityHTTPClient(ctx, &config.Config{}, antigravityAuthWithIDAndProxy("foreign-rt", ""), 0, 0)
+ 	if _, isTransport := client.Transport.(*http.Transport); isTransport {
+ 		t.Fatal("a non-*http.Transport RoundTripper must be preserved as-is")
+ 	}
+@@ -240,7 +240,7 @@ func TestAntigravityConcurrentRequestsReusePooledConnections(t *testing.T) {
+ 			},
+ 		},
+ 	}
+-	client := &http.Client{Transport: antigravityHTTP11Transport(auth, http.DefaultTransport.(*http.Transport), poolCfg)}
++	client := &http.Client{Transport: antigravityHTTP11Transport(auth, http.DefaultTransport.(*http.Transport), 0, poolCfg)}
+ 
+ 	const (
+ 		waves      = 3
+@@ -312,7 +312,7 @@ func TestAntigravityConcurrentRequestsDefaultPoolLimitsToTwo(t *testing.T) {
+ 			},
+ 		},
+ 	}
+-	client := &http.Client{Transport: antigravityHTTP11Transport(auth, http.DefaultTransport.(*http.Transport), poolCfg)}
++	client := &http.Client{Transport: antigravityHTTP11Transport(auth, http.DefaultTransport.(*http.Transport), 0, poolCfg)}
+ 
+ 	const (
+ 		waves      = 3
+@@ -363,8 +363,8 @@ func TestAntigravityConcurrentRequestsDefaultPoolLimitsToTwo(t *testing.T) {
+ 
+ func TestNewAntigravityHTTPClientDistinctProxiesUseDistinctPools(t *testing.T) {
+ 	cfg := &config.Config{}
+-	a := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithProxy("http://127.0.0.1:18090"), 0)
+-	b := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithProxy("http://127.0.0.1:18091"), 0)
++	a := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithProxy("http://127.0.0.1:18090"), 0, 0)
++	b := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithProxy("http://127.0.0.1:18091"), 0, 0)
+ 	if a.Transport == b.Transport {
+ 		t.Fatal("expected distinct proxies to use distinct connection pools")
+ 	}
+@@ -374,9 +374,9 @@ func TestNewAntigravityHTTPClientScopesPoolsByAuthIdentity(t *testing.T) {
+ 	cfg := &config.Config{}
+ 	const proxyURL = "http://127.0.0.1:18092"
+ 
+-	a1 := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("auth-a", proxyURL), 0)
+-	a2 := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("auth-a", proxyURL), 0)
+-	b := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("auth-b", proxyURL), 0)
++	a1 := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("auth-a", proxyURL), 0, 0)
++	a2 := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("auth-a", proxyURL), 0, 0)
++	b := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("auth-b", proxyURL), 0, 0)
+ 	if a1.Transport != a2.Transport {
+ 		t.Fatal("the same auth identity must share its connection pool across sessions")
+ 	}
+@@ -384,8 +384,8 @@ func TestNewAntigravityHTTPClientScopesPoolsByAuthIdentity(t *testing.T) {
+ 		t.Fatal("different auth identities must not share a proxied connection pool")
+ 	}
+ 
+-	directA := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("direct-a", ""), 0)
+-	directB := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("direct-b", ""), 0)
++	directA := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("direct-a", ""), 0, 0)
++	directB := newAntigravityHTTPClient(context.Background(), cfg, antigravityAuthWithIDAndProxy("direct-b", ""), 0, 0)
+ 	if directA.Transport == directB.Transport {
+ 		t.Fatal("different auth identities must not share a direct connection pool")
+ 	}
+@@ -399,35 +399,35 @@ func TestAntigravityHTTP11TransportReusesPoolWithoutAuthID(t *testing.T) {
+ 	base := http.DefaultTransport.(*http.Transport)
+ 
+ 	anonymous := &cliproxyauth.Auth{}
+-	first := antigravityHTTP11Transport(anonymous, base)
+-	second := antigravityHTTP11Transport(anonymous, base)
++	first := antigravityHTTP11Transport(anonymous, base, 0)
++	second := antigravityHTTP11Transport(anonymous, base, 0)
+ 	if first == nil || second == nil {
+ 		t.Fatal("expected a transport for an auth without an ID")
+ 	}
+ 	if first != second {
+ 		t.Fatal("an auth without any identity must reuse one shared pool instead of leaking a new pool per request")
+ 	}
+-	if nilAuth := antigravityHTTP11Transport(nil, base); nilAuth != first {
++	if nilAuth := antigravityHTTP11Transport(nil, base, 0); nilAuth != first {
+ 		t.Fatal("a nil auth carries no credential to isolate and must share the same pool")
+ 	}
+ 
+ 	// An auth without an ID but with credential material stays isolated from both the
+ 	// anonymous pool and from a different credential.
+-	tokenA := antigravityHTTP11Transport(&cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token-a"}}, base)
+-	tokenB := antigravityHTTP11Transport(&cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token-b"}}, base)
++	tokenA := antigravityHTTP11Transport(&cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token-a"}}, base, 0)
++	tokenB := antigravityHTTP11Transport(&cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token-b"}}, base, 0)
+ 	if tokenA == first || tokenB == first {
+ 		t.Fatal("a credential with an access token must not fall back to the anonymous pool")
+ 	}
+ 	if tokenA == tokenB {
+ 		t.Fatal("different access tokens must not share a connection pool")
+ 	}
+-	if again := antigravityHTTP11Transport(&cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token-a"}}, base); again != tokenA {
++	if again := antigravityHTTP11Transport(&cliproxyauth.Auth{Metadata: map[string]any{"access_token": "token-a"}}, base, 0); again != tokenA {
+ 		t.Fatal("the same access token must resolve to the same pool across requests")
+ 	}
+ 
+ 	// Identified auths keep sharing their pool.
+ 	identified := &cliproxyauth.Auth{ID: "stable-identity"}
+-	if antigravityHTTP11Transport(identified, base) != antigravityHTTP11Transport(identified, base) {
++	if antigravityHTTP11Transport(identified, base, 0) != antigravityHTTP11Transport(identified, base, 0) {
+ 		t.Fatal("an auth with a stable ID must reuse its cached pool")
+ 	}
+ }
+@@ -499,7 +499,7 @@ func TestAntigravityTransportScopeIgnoresNonUniqueLabel(t *testing.T) {
+ 	}
+ 
+ 	base := http.DefaultTransport.(*http.Transport)
+-	if antigravityHTTP11Transport(first, base) == antigravityHTTP11Transport(second, base) {
++	if antigravityHTTP11Transport(first, base, 0) == antigravityHTTP11Transport(second, base, 0) {
+ 		t.Fatal("credentials sharing only a label must not share a connection pool")
+ 	}
+ }
+@@ -562,7 +562,7 @@ func TestAntigravityTransportCacheEvictsStalePools(t *testing.T) {
+ 	cfg := &config.Config{}
+ 	for i := 0; i < 40; i++ {
+ 		auth := antigravityAuthWithIDAndProxy("rotating-auth", fmt.Sprintf("http://127.0.0.1:%d", 19000+i))
+-		if client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0); client.Transport == nil {
++		if client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, 0); client.Transport == nil {
+ 			t.Fatalf("request %d: expected a transport", i)
+ 		}
+ 	}
+@@ -576,7 +576,7 @@ func TestAntigravityTransportCacheEvictsStalePools(t *testing.T) {
+ 	for i := 0; i < 40; i++ {
+ 		fresh := http.DefaultTransport.(*http.Transport).Clone()
+ 		ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(fresh))
+-		if client := newAntigravityHTTPClient(ctx, cfg, auth, 0); client.Transport == nil {
++		if client := newAntigravityHTTPClient(ctx, cfg, auth, 0, 0); client.Transport == nil {
+ 			t.Fatalf("ctx request %d: expected a transport", i)
+ 		}
+ 	}
+@@ -589,14 +589,14 @@ func TestAntigravityTransportCacheEvictsStalePools(t *testing.T) {
+ // fall back instead of caching a broken pool.
+ func TestAntigravityProxiedHTTP11TransportRejectsInvalidProxy(t *testing.T) {
+ 	auth := antigravityAuthWithIDAndProxy("invalid-proxy", "ftp://127.0.0.1:1")
+-	if transport := antigravityProxiedHTTP11Transport(auth, "ftp://127.0.0.1:1"); transport != nil {
++	if transport := antigravityProxiedHTTP11Transport(auth, "ftp://127.0.0.1:1", 0); transport != nil {
+ 		t.Fatal("an unsupported proxy scheme must not produce a transport")
+ 	}
+-	if transport := antigravityProxiedHTTP11Transport(auth, "   "); transport != nil {
++	if transport := antigravityProxiedHTTP11Transport(auth, "   ", 0); transport != nil {
+ 		t.Fatal("a blank proxy must not produce a transport")
+ 	}
+ 	// A failed build must not occupy a cache slot, so a later valid setting still works.
+-	if transport := antigravityProxiedHTTP11Transport(auth, "http://127.0.0.1:18099"); transport == nil {
++	if transport := antigravityProxiedHTTP11Transport(auth, "http://127.0.0.1:18099", 0); transport == nil {
+ 		t.Fatal("a valid proxy must produce a transport")
+ 	}
+ }
+@@ -628,7 +628,7 @@ func TestAntigravityTransportMatchesNativeTLSProfile(t *testing.T) {
+ 
+ 	base := http.DefaultTransport.(*http.Transport).Clone()
+ 	base.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+-	transport := antigravityHTTP11Transport(antigravityAuthWithIDAndProxy("native-tls-profile", ""), base)
++	transport := antigravityHTTP11Transport(antigravityAuthWithIDAndProxy("native-tls-profile", ""), base, 0)
+ 	resp, errDo := (&http.Client{Transport: transport}).Get(server.URL)
+ 	if errDo != nil {
+ 		t.Fatalf("GET() error = %v", errDo)
+@@ -676,7 +676,7 @@ func TestAntigravityProxiedRequestsReuseOneConnection(t *testing.T) {
+ 	auth := antigravityAuthWithProxy(srv.URL)
+ 	const requests = 8
+ 	for i := 0; i < requests; i++ {
+-		client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0)
++		client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, 0)
+ 		req, errReq := http.NewRequest(http.MethodGet, "http://antigravity.invalid/v1internal:streamGenerateContent", nil)
+ 		if errReq != nil {
+ 			t.Fatalf("NewRequest() error = %v", errReq)
+@@ -841,7 +841,7 @@ func TestAntigravityPoolConfigIdleTimeoutCustomAndCap(t *testing.T) {
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			auth := antigravityAuthWithIDAndProxy("cfg-test-"+tc.name, "")
+-			client := newAntigravityHTTPClient(context.Background(), tc.cfg, auth, 0)
++			client := newAntigravityHTTPClient(context.Background(), tc.cfg, auth, 0, 0)
+ 			transport, ok := client.Transport.(*http.Transport)
+ 			if !ok {
+ 				t.Fatalf("expected *http.Transport, got %T", client.Transport)
+@@ -887,7 +887,7 @@ func TestAntigravityShortModeNeverAdvertisesConnectionCloseAndDisconnects(t *tes
+ 
+ 	const requests = 4
+ 	for i := 0; i < requests; i++ {
+-		client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0)
++		client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, 0)
+ 		req, errReq := http.NewRequest(http.MethodGet, "http://antigravity.invalid/v1internal:streamGenerateContent", nil)
+ 		if errReq != nil {
+ 			t.Fatalf("NewRequest() error = %v", errReq)
+@@ -922,7 +922,7 @@ func TestCloseAntigravityAuthIdleTransportsEvictsIdlePool(t *testing.T) {
+ 	auth := antigravityAuthWithIDAndProxy("auth-to-close", "")
+ 	cfg := &config.Config{}
+ 
+-	client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0)
++	client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, 0)
+ 	if client.Transport == nil {
+ 		t.Fatal("expected transport to be initialized")
+ 	}
+@@ -983,7 +983,7 @@ func TestAntigravityCountTokens429EvictsIdleTransports(t *testing.T) {
+ 	exec := NewAntigravityExecutor(cfg)
+ 
+ 	// Build client to populate cache
+-	client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0)
++	client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, 0)
+ 	if client.Transport == nil {
+ 		t.Fatal("expected transport to be initialized")
+ 	}
+@@ -1024,7 +1024,7 @@ func TestAntigravityTransportKeySeparatesPoolSettingsAcrossReload(t *testing.T)
+ 
+ 	// 1. Client with short connection mode (default enabled: false)
+ 	cfgShort := &config.Config{}
+-	clientShort := newAntigravityHTTPClient(context.Background(), cfgShort, auth, 0)
++	clientShort := newAntigravityHTTPClient(context.Background(), cfgShort, auth, 0, 0)
+ 
+ 	// 2. Client with pooled mode (enabled: true)
+ 	enabledPool := true
+@@ -1035,7 +1035,7 @@ func TestAntigravityTransportKeySeparatesPoolSettingsAcrossReload(t *testing.T)
+ 			},
+ 		},
+ 	}
+-	clientPooled := newAntigravityHTTPClient(context.Background(), cfgPooled, auth, 0)
++	clientPooled := newAntigravityHTTPClient(context.Background(), cfgPooled, auth, 0, 0)
+ 
+ 	// Transports must NOT be shared because their pool settings keys differ!
+ 	if clientShort.Transport == clientPooled.Transport {
+diff --git a/internal/runtime/executor/antigravity_transport_decorator_test.go b/internal/runtime/executor/antigravity_transport_decorator_test.go
+index a7c8538..025e79e 100644
+--- a/internal/runtime/executor/antigravity_transport_decorator_test.go
++++ b/internal/runtime/executor/antigravity_transport_decorator_test.go
+@@ -37,8 +37,8 @@ func TestAntigravityDecoratorRunsAfterCredentialHTTP11PoolSelection(t *testing.T
+ 				return &auditTestTransport{RoundTripper: next}
+ 			})
+ 			auth := &coreauth.Auth{ID: "decorator-fixture", ProxyURL: proxy}
+-			c := newAntigravityHTTPClient(ctx, &config.Config{}, auth, 0)
+-			plain := newAntigravityHTTPClient(context.Background(), &config.Config{}, auth, 0)
++			c := newAntigravityHTTPClient(ctx, &config.Config{}, auth, 0, 0)
++			plain := newAntigravityHTTPClient(context.Background(), &config.Config{}, auth, 0, 0)
+ 			if calls != 1 {
+ 				t.Fatalf("decorator calls = %d, want 1", calls)
+ 			}
+@@ -53,7 +53,7 @@ func TestAntigravityDecoratorRunsAfterCredentialHTTP11PoolSelection(t *testing.T
+ func TestAntigravityDecoratorConcurrentIsolation(t *testing.T) {
+ 	auth := &coreauth.Auth{ID: "decorator-race-auth"}
+ 	cfg := &config.Config{}
+-	baseClient := newAntigravityHTTPClient(context.Background(), cfg, auth, 0)
++	baseClient := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, 0)
+ 
+ 	var wg sync.WaitGroup
+ 	for i := 0; i < 8; i++ {
+@@ -63,7 +63,7 @@ func TestAntigravityDecoratorConcurrentIsolation(t *testing.T) {
+ 			ctx := httptransport.WithDecorator(context.Background(), func(next http.RoundTripper) http.RoundTripper {
+ 				return &auditTestTransport{RoundTripper: next}
+ 			})
+-			c := newAntigravityHTTPClient(ctx, cfg, auth, 0)
++			c := newAntigravityHTTPClient(ctx, cfg, auth, 0, 0)
+ 			wrapped, ok := c.Transport.(*auditTestTransport)
+ 			if !ok || wrapped.RoundTripper != baseClient.Transport {
+ 				t.Errorf("expected wrapped transport around shared pool %T, got %T", baseClient.Transport, c.Transport)
+@@ -71,7 +71,7 @@ func TestAntigravityDecoratorConcurrentIsolation(t *testing.T) {
+ 		}()
+ 		go func() {
+ 			defer wg.Done()
+-			c := newAntigravityHTTPClient(context.Background(), cfg, auth, 0)
++			c := newAntigravityHTTPClient(context.Background(), cfg, auth, 0, 0)
+ 			if c.Transport != baseClient.Transport {
+ 				t.Errorf("undecorated client transport = %p, want %p", c.Transport, baseClient.Transport)
+ 			}
+diff --git a/sdk/cliproxy/antigravity_models.go b/sdk/cliproxy/antigravity_models.go
+index 6c46f95..5a15bb0 100644
+--- a/sdk/cliproxy/antigravity_models.go
++++ b/sdk/cliproxy/antigravity_models.go
+@@ -35,6 +35,18 @@ const (
+ 	antigravityRefreshScanInterval   = time.Minute
+ )
+ 
++var (
++	// antigravityProbeTimeout bounds one catalog probe. The probe client used to have
++	// no timeout at all, so an upstream that accepted the connection and then went
++	// silent parked the probe goroutine forever while still holding one of the
++	// antigravityProbeSlots entries; after five such probes every later refresh queued
++	// behind them and the model list could never recover.
++	//
++	// It is a var, not a const, so tests that need a probe to stay in flight can opt
++	// out by setting it to zero.
++	antigravityProbeTimeout = 30 * time.Second
++)
++
+ type antigravityProbeStatus int
+ 
+ const (
+@@ -461,7 +473,11 @@ func (s *Service) probeAntigravityModelCapabilityHints(ctx context.Context, auth
+ 	if len(baseURLs) == 0 {
+ 		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
+ 	}
+-	client := &http.Client{}
++	client := &http.Client{Timeout: antigravityProbeTimeout}
++	if antigravityProbeTimeout <= 0 {
++		// Tests that must observe an in-flight probe keep the historical unbounded client.
++		client.Timeout = 0
++	}
+ 	transport, _, errProxy := proxyutil.BuildHTTPTransport(proxyURL)
+ 	if errProxy != nil {
+ 		return antigravityModelCapabilityHints{}, antigravityProbeStatusTransientError
+diff --git a/sdk/cliproxy/antigravity_models_probe_timeout_test.go b/sdk/cliproxy/antigravity_models_probe_timeout_test.go
+new file mode 100644
+index 0000000..b7f158e
+--- /dev/null
++++ b/sdk/cliproxy/antigravity_models_probe_timeout_test.go
+@@ -0,0 +1,92 @@
++package cliproxy
++
++import (
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
++	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
++)
++
++// A catalog probe that waits forever on the upstream used to hold one of the five
++// probe slots for the lifetime of the process, so five stalled accounts stopped every
++// later refresh from ever running. The probe client now has a timeout, and this test
++// pins it: an upstream that accepts the request and then says nothing must end the
++// probe as a transient error instead of parking the goroutine.
++func TestAntigravityProbeClientHonoursItsTimeout(t *testing.T) {
++	resetAntigravityCapabilityCache()
++	defer resetAntigravityCapabilityCache()
++
++	previous := antigravityProbeTimeout
++	antigravityProbeTimeout = 200 * time.Millisecond
++	defer func() { antigravityProbeTimeout = previous }()
++
++	transport := http.DefaultTransport
++	defer func() { http.DefaultTransport = transport }()
++	released := make(chan struct{})
++	// The handler blocks until the client gives up, which is exactly the behaviour the
++	// timeout must interrupt. It reports that it saw the cancellation through ctx.
++	http.DefaultTransport = antigravityReviewTransport(func(r *http.Request) (*http.Response, error) {
++		defer close(released)
++		<-r.Context().Done()
++		return nil, r.Context().Err()
++	})
++
++	svc := &Service{cfg: &config.Config{}, coreManager: coreauth.NewManager(nil, nil, nil)}
++	auth := antigravityTestAuth("probe-timeout", "https://probe.invalid")
++
++	start := time.Now()
++	hints, status := svc.probeAntigravityModelCapabilityHints(t.Context(), auth, []string{"https://probe.invalid"}, "", "token", "ua")
++	elapsed := time.Since(start)
++
++	if status != antigravityProbeStatusTransientError {
++		t.Errorf("stalled probe status = %v, want a transient error", status)
++	}
++	if hints.ModelIDs != nil {
++		t.Errorf("stalled probe returned model hints: %v", hints.ModelIDs)
++	}
++	if elapsed > 5*time.Second {
++		t.Errorf("stalled probe took %v; the client timeout is not being applied", elapsed)
++	}
++	if elapsed < antigravityProbeTimeout {
++		t.Errorf("stalled probe returned after %v, before its %v timeout", elapsed, antigravityProbeTimeout)
++	}
++	select {
++	case <-released:
++	default:
++		t.Error("the probe transport was never cancelled")
++	}
++}
++
++// The timeout must not interfere with a probe that answers normally.
++func TestAntigravityProbeAcceptsAFastCatalog(t *testing.T) {
++	resetAntigravityCapabilityCache()
++	defer resetAntigravityCapabilityCache()
++
++	transport := http.DefaultTransport
++	defer func() { http.DefaultTransport = transport }()
++	http.DefaultTransport = antigravityReviewTransport(func(r *http.Request) (*http.Response, error) {
++		body := `{"models":{"gemini-3-pro-preview":{},"claude-sonnet-5":{}}}`
++		return &http.Response{
++			StatusCode: http.StatusOK,
++			Header:     http.Header{"Content-Type": []string{"application/json"}},
++			Body:       io.NopCloser(strings.NewReader(body)),
++			Request:    r,
++		}, nil
++	})
++
++	svc := &Service{cfg: &config.Config{}, coreManager: coreauth.NewManager(nil, nil, nil)}
++	auth := antigravityTestAuth("probe-ok", "https://probe.invalid")
++	hints, status := svc.probeAntigravityModelCapabilityHints(t.Context(), auth, []string{"https://probe.invalid"}, "", "token", "ua")
++	if status != antigravityProbeStatusSuccess {
++		t.Fatalf("probe status = %v, want success", status)
++	}
++	for _, want := range []string{"gemini-3-pro-preview", "claude-sonnet-5"} {
++		if _, ok := hints.ModelIDs[want]; !ok {
++			t.Errorf("probe dropped %q from %v", want, hints.ModelIDs)
++		}
++	}
++}
+diff --git a/sdk/cliproxy/antigravity_models_refresh_test.go b/sdk/cliproxy/antigravity_models_refresh_test.go
+index ae23ed4..25e1da2 100644
+--- a/sdk/cliproxy/antigravity_models_refresh_test.go
++++ b/sdk/cliproxy/antigravity_models_refresh_test.go
+@@ -16,10 +16,25 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+ )
+ 
++// stalledProbeTimeout makes the catalog probe unbounded for one test.
++//
++// These tests assert what happens while a probe is still in flight, and the client
++// timeout is measured on the synthetic clock that synctest advances by whole minutes.
++// Leaving the production timeout in place would let the clock cancel the very probe
++// the test is watching, so the timeout is switched off here and covered separately by
++// TestAntigravityProbeClientHonoursItsTimeout.
++func stalledProbeTimeout(t *testing.T) {
++	t.Helper()
++	previous := antigravityProbeTimeout
++	antigravityProbeTimeout = 0
++	t.Cleanup(func() { antigravityProbeTimeout = previous })
++}
++
+ func TestAntigravityStalledAccountDoesNotBlockOtherRetries(t *testing.T) {
+ 	synctest.Test(t, func(t *testing.T) {
+ 		resetAntigravityCapabilityCache()
+ 		defer resetAntigravityCapabilityCache()
++		stalledProbeTimeout(t)
+ 		svc := &Service{cfg: &config.Config{}, coreManager: coreauth.NewManager(nil, nil, nil)}
+ 		for _, id := range []string{"refresh-stall", "refresh-retry"} {
+ 			auth, errRegister := svc.coreManager.Register(t.Context(), antigravityTestAuth(id, "https://refresh.invalid"))
+@@ -67,6 +82,7 @@ func TestAntigravityPluginRefreshDoesNotWaitForProbe(t *testing.T) {
+ 	synctest.Test(t, func(t *testing.T) {
+ 		resetAntigravityCapabilityCache()
+ 		defer resetAntigravityCapabilityCache()
++		stalledProbeTimeout(t)
+ 		svc := &Service{cfg: &config.Config{}, coreManager: coreauth.NewManager(nil, nil, nil), pluginHost: pluginhost.New()}
+ 		auth, errRegister := svc.coreManager.Register(t.Context(), antigravityTestAuth("plugin-refresh-stall", "https://refresh.invalid"))
+ 		if errRegister != nil {
+@@ -106,6 +122,7 @@ func TestAntigravityRefreshBoundsQueuedWorkAndCancels(t *testing.T) {
+ 	synctest.Test(t, func(t *testing.T) {
+ 		resetAntigravityCapabilityCache()
+ 		defer resetAntigravityCapabilityCache()
++		stalledProbeTimeout(t)
+ 		// Blocked semaphore operations must belong to this synthetic-time bubble.
+ 		slots := antigravityProbeSlots
+ 		antigravityProbeSlots = make(chan struct{}, cap(slots))
+diff --git a/sdk/cliproxy/auth/conductor_cooldown.go b/sdk/cliproxy/auth/conductor_cooldown.go
+index 9303439..ce43873 100644
+--- a/sdk/cliproxy/auth/conductor_cooldown.go
++++ b/sdk/cliproxy/auth/conductor_cooldown.go
+@@ -2198,6 +2198,14 @@ func isTransientTransportMessage(message string) bool {
+ 		strings.Contains(lower, "connection aborted"),
+ 		strings.Contains(lower, "use of closed network connection"),
+ 		strings.Contains(lower, "unexpected eof"),
++		// net/http reports ResponseHeaderTimeout as
++		// "net/http: timeout awaiting response headers", which arrives here as a plain
++		// message when the error has already been reduced to a Result. Typed
++		// *url.Error values are covered by isTransientTransportError, but the reduced
++		// form has no type left to inspect, so the phrase itself has to be listed.
++		// Streaming Antigravity requests now bound that wait on purpose, and the
++		// credential must not be cooled down just because one upstream stayed silent.
++		strings.Contains(lower, "timeout awaiting response headers"),
+ 		isHTTP2ClosedConnectionMessage(lower):
+ 		return true
+ 	default:
+diff --git a/sdk/cliproxy/auth/conductor_models.go b/sdk/cliproxy/auth/conductor_models.go
+index 3ac8b28..be6715d 100644
+--- a/sdk/cliproxy/auth/conductor_models.go
++++ b/sdk/cliproxy/auth/conductor_models.go
+@@ -236,13 +236,24 @@ func (m *Manager) clientModelProjectionForAuth(auth *Auth, routeModel string, no
+ 
+ 	state := existingModelState(auth, targetKey)
+ 	isSuspended := auth.Disabled || auth.Status == StatusDisabled
++	// permanentSuspension marks a suspension nothing will lift on its own: a
++	// disabled credential, a rejected token the conductor stopped retrying, or a
++	// deliberately disabled model state. Only an explicit resume clears those, so no
++	// deadline may be recorded for them - a deadline here would keep listing a model
++	// that nothing is going to serve.
++	permanentSuspension := isSuspended || hasUnauthorizedAuthFailure(auth)
+ 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+ 		isSuspended = true
+ 	}
+ 	isQuotaExceeded := false
+ 	var suspendReason string
++	var suspendUntil time.Time
+ 	if state != nil {
+-		if state.Status == StatusDisabled || state.Unavailable || (!state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now)) {
++		if state.Status == StatusDisabled {
++			isSuspended = true
++			permanentSuspension = true
++		}
++		if state.Unavailable || (!state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now)) {
+ 			isSuspended = true
+ 		}
+ 		if state.Quota.Exceeded && (state.Quota.NextRecoverAt.IsZero() || state.Quota.NextRecoverAt.After(now)) {
+@@ -259,8 +270,29 @@ func (m *Manager) clientModelProjectionForAuth(auth *Auth, routeModel string, no
+ 		// credential-wide fields must not suspend them here either.
+ 		isSuspended = true
+ 	}
+-	if isSuspended && suspendReason == "" {
+-		suspendReason = cooldownReason(auth.StatusMessage, auth.Quota, auth.LastError)
++	if isSuspended {
++		if suspendReason == "" {
++			suspendReason = cooldownReason(auth.StatusMessage, auth.Quota, auth.LastError)
++		}
++		// Publish the recovery instant the scheduler is already honouring. The
++		// registry keeps a suspended model listed while that instant is in the
++		// future, which is what stops a single upstream failure from emptying
++		// /v1/models until the process restarts.
++		if !permanentSuspension {
++			credentialUntil := time.Time{}
++			if auth.Quota.Exceeded {
++				credentialUntil = auth.Quota.NextRecoverAt
++			}
++			modelUntil := time.Time{}
++			modelQuotaUntil := time.Time{}
++			if state != nil {
++				modelUntil = state.NextRetryAfter
++				if state.Quota.Exceeded {
++					modelQuotaUntil = state.Quota.NextRecoverAt
++				}
++			}
++			suspendUntil = earliestFutureInstant(now, modelUntil, modelQuotaUntil, auth.NextRetryAfter, credentialUntil)
++		}
+ 	}
+ 
+ 	return registry.ClientModelProjection{
+@@ -268,7 +300,24 @@ func (m *Manager) clientModelProjectionForAuth(auth *Auth, routeModel string, no
+ 		Suspended:     isSuspended,
+ 		SuspendReason: suspendReason,
+ 		QuotaExceeded: isQuotaExceeded,
++		SuspendUntil:  suspendUntil,
++	}
++}
++
++// earliestFutureInstant returns the earliest candidate that is still in the future.
++// A zero result means no candidate bounds the wait, so the caller must treat the
++// suspension as open-ended.
++func earliestFutureInstant(now time.Time, candidates ...time.Time) time.Time {
++	var earliest time.Time
++	for _, candidate := range candidates {
++		if candidate.IsZero() || !candidate.After(now) {
++			continue
++		}
++		if earliest.IsZero() || candidate.Before(earliest) {
++			earliest = candidate
++		}
+ 	}
++	return earliest
+ }
+ 
+ func (m *Manager) stateModelForExecution(auth *Auth, routeModel, upstreamModel string, pooled bool) string {
+diff --git a/sdk/cliproxy/service_auth_sync_test.go b/sdk/cliproxy/service_auth_sync_test.go
+index 9ba47e7..9a1ea7e 100644
+--- a/sdk/cliproxy/service_auth_sync_test.go
++++ b/sdk/cliproxy/service_auth_sync_test.go
+@@ -1711,7 +1711,13 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
+ 		})
+ 	}
+ 
+-	// Confirm all 4 models are now omitted from /v1/models due to active error/cooldown
++	// The credential is now cooling down, but the models must stay listed: a 401 with a
++	// thirty-minute deadline is a bounded cooldown, and hiding the catalog makes the
++	// client report "model not found" instead of retrying later. What must not happen
++	// is the credential serving traffic - that is asserted on the auth state below.
++	if failed, _ := service.coreManager.GetByID(authID); failed == nil || !failed.Unavailable {
++		t.Fatalf("expected the credential to be marked unavailable after the 401, got %+v", failed)
++	}
+ 	rec = httptest.NewRecorder()
+ 	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+ 	handler.ServeHTTP(rec, req)
+@@ -1720,8 +1726,8 @@ func TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart(t *t
+ 		t.Fatalf("failed to decode /v1/models response: %v", err)
+ 	}
+ 	for _, m := range teamModels {
+-		if hasModel(m) {
+-			t.Fatalf("expected %q to be absent after terminal auth failure", m)
++		if !hasModel(m) {
++			t.Fatalf("a bounded cooldown hid %q from /v1/models: %s", m, rec.Body.String())
+ 		}
+ 	}
+ 
+@@ -1879,9 +1885,13 @@ func TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart(t *testing
+ 		}
+ 		return false
+ 	}
++	// A bounded cooldown keeps the catalog intact; only the credential stops serving.
++	if failed, _ := service.coreManager.GetByID(authID); failed == nil || !failed.Unavailable {
++		t.Fatalf("expected the credential to be marked unavailable after the 401, got %+v", failed)
++	}
+ 	for _, m := range teamModels {
+-		if hasModel(m) {
+-			t.Fatalf("expected %q to be absent after terminal auth failure", m)
++		if !hasModel(m) {
++			t.Fatalf("a bounded cooldown hid %q from /v1/models: %s", m, rec.Body.String())
+ 		}
+ 	}
+ 

@@ -1,16 +1,19 @@
 # 上游问题与补丁
 
 本目录的 `upstream-patches.diff` 是针对 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-的三个改动，覆盖 `internal/registry/models/models.json` 与
-`internal/runtime/executor/antigravity_executor_request.go` 及其测试，可以直接 `git apply` 到上游。
+的六个改动，覆盖 21 个文件：模型目录、请求构造、流式收尾、凭据冷却、模型列表可见性与
+antigravity 目录探针及其测试，可以直接 `git apply` 到上游。
 
-- 基线：上游 `ad8bdd3`（`fix(middleware): bound zstd decompression output and window in request logging`），
-  见 `.upstream-sha`。上一版基线是 `3078035`，上游前进后补丁已 rebase 到新基线。
-- 校验：在干净的 `ad8bdd3` 工作树上 `git apply --check` 通过、打上后
-  `go test ./internal/runtime/executor/ ./internal/translator/antigravity/...` 全绿。
+- 基线：上游 `01b24f1`（见 `.upstream-sha`）。上一版基线是 `ad8bdd3`，上游把 `sjson` 换成
+  `ojson` 之后 `maxOutputTokens` 的补丁 hunk 全废，已随 `--rebase` 重做——这也是 CI 连续五次
+  在「Apply the local upstream patches」失败的真正原因。
+- 校验：在干净的 `01b24f1` 工作树上 `git apply --3way` 全部 clean（21 个文件），打上后
+  `go build ./...` 通过，`go test ./internal/registry/ ./internal/runtime/executor/
+  ./sdk/cliproxy/ ./sdk/cliproxy/auth/ ./sdk/api/handlers/openai/` 全绿。
   `internal/registry` 里 `TestCodexConfigurationUpdateCapability` 在**未打补丁的干净上游**上就失败
   （与本补丁无关，已单独确认），所以不列入判据。
-- 应用方式：`scripts/apply-upstream-patch.sh`（幂等）。CI 也执行同一步，并在应用后断言修正确实生效。
+- 应用方式：`scripts/apply-upstream-patch.sh`（幂等）。CI 也执行同一步，并在应用后断言修正确实生效
+  （10 条 marker，覆盖六个改动各自的关键符号）。
 
 每个问题按 **现象 / 根因（精确到文件行号）/ 验证方式 / 修复方案** 记录，方便直接转成 issue。
 
@@ -209,13 +212,155 @@ requests:
 
 ---
 
+## 4. 流式回答结束不了：没有终止帧，也没有首字节超时
+
+**现象**：网关跑一轮正常，第二轮开始客户端一直显示「生成中」，SSE 连接是活的（每 15 秒还有
+keep-alive 心跳），但再也不出内容。杀掉网关闭环。
+
+**根因**：两件独立的事，第一件已经在本项目的旧补丁里修掉，第二件没有。
+
+**（a）上游正常结束却不给终止帧**。`internal/runtime/executor/antigravity_executor_stream.go`
+的读取循环逐行扫描 SSE，但上游常常在发出最后一条 data 帧后就保持连接不关，或干脆直接关 socket
+而不发任何终止帧。客户端无法判断「说完了」，只能等自己超时。旧补丁给循环加了：
+
+- `antigravityStreamIdleTimeout = 90 * time.Second`——每读到一行就 `idle.Reset`，静默超过 90 秒
+  就主动关掉 body；
+- `antigravityStreamGraceTimeout = 2 * time.Second`——识别到终止帧（`finishReason` / `[DONE]` /
+  `response.completed` / `message_stop`）后起一个 2 秒宽限，到点关连接，把「上游不关连接」
+  变成干净结束；
+- `closedOnPurpose := errScan != nil && terminalDelivered && graceClosed.Load()`——自己关掉导致的
+  `Err` 不算失败，不进冷却；`emitSyntheticTail()` 先置 `tailEmitted = true` 再补终止帧，
+  防止客户端中途断开时重复终止。
+
+**（b）`Do()` 之前完全没有超时，这一条以前是漏的**。`antigravity_executor_stream.go:153` 的
+`helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate_stream").Do(httpReq)` 建立连接、
+发完请求就阻塞在等响应头上。client 由 `newAntigravityHTTPClient(ctx, cfg, auth, 0)` 生成，
+`timeout = 0`（`antigravity_executor.go:440-483`），`helps/proxy_helpers.go:36-41` 只在
+`timeout > 0` 时设 `http.Client.Timeout`，而**全仓 `ResponseHeaderTimeout` 命中数为 0**。
+watchdog 是在 `Do` 返回**之后**才创建的（`:234-238`），所以上游吃完 TCP/TLS 却不回响应头时
+`Do` 永不返回，两段 watchdog 都没机会跑。下游 keep-alive 照常发，客户端看到的是「连接活着、
+永远没有内容」——正是用户说的「卡了」。
+
+**修复方案**：
+
+1. `antigravity_executor.go` 新增包级 var `antigravityStreamResponseHeaderTimeout = 2 * time.Minute`；
+   `cloneTransportWithHTTP11` 加 `headerTimeout time.Duration` 参数并在 clone 上
+   `if headerTimeout > 0 { clone.ResponseHeaderTimeout = headerTimeout }`——
+   直连与代理两条路径都经过这一个函数，改一处即全覆盖。
+2. `antigravityTransportKey` 也加 `headerTimeout` 字段。这一条是必需的：键里不含超时的话，
+   2 分钟的流式 transport 会被复用给非流式的长生成请求，把长生成也一起掐断。
+3. `newAntigravityHTTPClient` 加末位参数，**只有流式一处（`antigravity_executor_stream.go:122`）传非零**，
+   另外 8 处（execute / tokens / credits / auth）传 0，保持长非流式请求不设限。
+4. `conductor_cooldown.go` 的 `isTransientTransportMessage` 加
+   `strings.Contains(lower, "timeout awaiting response headers")`——这条超时错误会被降级成
+   Result 文本再进分类器，不认它就等于把一次网络抖动记成凭据故障。
+
+**验证方式**：`antigravity_executor_stream_header_test.go` 起一个只 `Accept` 不写字节的
+`httptest` 服务，把包级 var 临时设成 300ms，断言 `ExecuteStream` 在数秒内返回且错误里带
+`timeout awaiting response headers`；另有
+`TestAntigravityTransportResponseHeaderTimeoutIsPoolScoped` 断言 300ms 会透传、传 0 时尊重 base
+上已有的 45s、两种 transport 指针不同。失败注入实测：把 `:122` 的末参改回 0，测试立刻报
+`ExecuteStream() never returned: a silent upstream still blocks the stream forever`。
+
+---
+
+## 5. 唯一一个凭据被冷却时，所有模型从 `/v1/models` 消失
+
+**现象**：跑坏一轮之后，客户端的模型下拉列表整个变空（不是「某个模型没了」，是一条都不剩），
+重启网关立刻恢复，再跑坏一轮又空。
+
+**根因**：`internal/registry/model_registry.go:1496 modelRegistrationAvailability` 的判定是
+
+```go
+effectiveClients := Count - expiredClients - cooldownSuspended - otherSuspended + quotaAndSuspended
+available := effectiveClients > 0 ||
+    (Count > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0)
+```
+
+`isQuotaSuspension`（`:1492`）只认 `quota` 与 `credential_quota` 两个 reason。而 reason 是
+`conductor_cooldown.go:833 cooldownReason` 依次从 `quota.Reason` → `StatusMessage` → `LastError.Code`
+→ `LastError.Message` 里取的，**基本就是错误原文**。所以只要唯一那个凭据因为任何非 quota 的原因
+被挂起（401 记 `unauthorized`、404 记 `not_found`、5xx 记 `transient upstream error`、
+其余记 `request failed`），`otherSuspended` 就变成 1、`effectiveClients` 归零，
+**该凭据下的每一个模型都从 `/v1/models`、`GetAvailableModelsByProvider`、`GetAvailableModelInfos`
+里消失**。写入口只有一个：`MarkResult` 尾部 → `clientModelProjectionForAuth` →
+`ApplyClientModelProjections`；`conductor_models.go:255-261` 在
+`len(auth.ModelStates)==0 && auth.Unavailable && auth.NextRetryAfter.After(now)` 时给每一个模型置
+suspended。`SuspendedClients` 是纯内存（`model_registry.go:175`），**没有任何时间过期**，
+只有重新注册才清——这就是「重启就好、再跑一轮又坏」。
+
+上游只有 `model_registry_sole_credential_quota_test.go` 覆盖了 quota 情形，
+非 quota 的单凭据情形是空的（而且测试把 `"unauthorized"` 必须隐藏写成了契约，见 `:50-61`）。
+
+**修复方案**：把「挂起」分成有界与无界两种。有截止时间的冷却（cooling）期间模型**继续列出**——
+凭据只是暂时不接活，模型本身是存在的，客户端没必要把选项清空；没有截止时间的挂起
+（手动禁用、401 这类需要人介入的）仍然隐藏。
+
+- `ModelRegistration` 加 `SuspendedUntil map[string]time.Time`；新增
+  `classifySuspension(reason, until, now)` 返回 `suspensionNone / suspensionCooldown / suspensionOther`：
+  截止时间已过即视作已恢复（投影前没人清 map，得就地判），
+  `isQuotaSuspension(reason) || !until.IsZero()` 算有界。
+- `modelRegistrationAvailability`、`GetAvailableModelsByProvider`（`:1690` 起逐字复制了同一套统计）
+  与 `GetModelCount` 三处都改用这个分类；有界时把模型列表缓存的 `expiresAt` 收到 `until` 之前，
+  免得缓存活过冷却。
+- `ClientModelProjection` 加 `SuspendUntil`，`ApplyClientModelProjections` 锁步写/删，
+  reason 或 until 任一变化才算 changed（否则每轮都判脏）。
+- `clientModelProjectionForAuth` 里非永久挂起时取
+  `earliestFutureInstant(now, modelUntil, modelQuotaUntil, auth.NextRetryAfter, credentialUntil)`
+  作为截止时间；`hasUnauthorizedAuthFailure`（401 且没有任何重试时间）与 `StatusDisabled` 仍算永久。
+
+**验证方式**：新增 `model_registry_suspension_deadline_test.go` 五个用例——有界冷却期间
+`/v1/models`、provider 目录、metadata 目录都仍列出而 `GetModelCount()==0`（说明真的没在接活），
+截止时间过后自动恢复成 1；无界挂起仍然隐藏（保持既有契约）；清除/手动挂起/Resume 不留残留
+截止时间；缓存随截止时间过期；`classifySuspension` 表驱动。既有契约测试
+`service_auth_sync_test.go` 的两个用例原断言「401 后模型必须消失」，改成断言
+`GetByID(authID).Unavailable == true`（凭据确实停止服务）且模型仍在列表。
+
+---
+
+## 6. 目录探针没有超时，一个卡住的账号会拖住模型同步
+
+**现象**：不常显；表现为某个账号的模型列表长时间不更新，或整个模型同步比预期慢很多。
+
+**根因**：`sdk/cliproxy/antigravity_models.go:464` 的探针 client 是裸 `&http.Client{}`，
+**没有 Timeout**。探针是并发上限 5 的（`antigravityProbeSlots`，
+`service_plugins.go:21 modelRegistrationMaxWorkersPerCategory`），每条协程就这么无限期挂着，
+槽位不会被释放，后面排队的账号全部堵在门口。
+
+**修复方案**：新增包级 var `antigravityProbeTimeout = 30 * time.Second`（做成 var 而不是 const，
+测试要能置零），client 改成 `&http.Client{Timeout: antigravityProbeTimeout}`；置零时显式保留
+`client.Timeout = 0`，给需要永不超时的测试用。
+
+**验证方式**：`antigravity_models_probe_timeout_test.go` 两个用例——一个断言 200ms 超时下探针返回
+transient 错误、无 hints、耗时落在 [200ms, 5s] 且 transport 被取消；一个断言正常目录照常返回。
+另外三个既有 synctest 用例（`TestAntigravityStalledAccountDoesNotBlockOtherRetries` 等）
+靠新 helper `stalledProbeTimeout(t)` 把超时置零，否则合成时钟会把它们要观察的探针提前取消。
+
+---
+
 ## 补丁清单与验证命令
 
-| 文件 | 改动 | 行数 |
-| :--- | :--- | :--- |
-| `internal/registry/models/models.json` | antigravity 段补 `gemini-3.8-flash-low` / `-medium` | +68 / −0 |
-| `internal/runtime/executor/antigravity_executor_request.go` | 去掉两处 `maxOutputTokens` 删除（`:83`、`:96`） | +8 / −4 |
-| `internal/runtime/executor/antigravity_executor_buildrequest_test.go` | 断言从「必须删除」改为「必须保留且为正」 | +6 / −2 |
+整个补丁 1801 行 / 86 个 hunk / 21 个文件，按改动分组：
+
+| 文件 | 改动 |
+| :--- | :--- |
+| `internal/registry/models/models.json` | antigravity 段补 `gemini-3.8-flash-low` / `-medium` |
+| `internal/runtime/executor/antigravity_executor_request.go` | 去掉 `maxOutputTokens` 删除（上游迁到 `ojson` 后只剩一处 `doc.Delete`） |
+| `internal/runtime/executor/antigravity_executor_buildrequest_test.go` | 断言从「必须删除」改为「必须保留且为正」 |
+| `internal/runtime/executor/antigravity_executor_stream.go` | idle / grace 两个 watchdog、终止帧识别、干净 EOF 补尾帧 |
+| `internal/runtime/executor/antigravity_executor_stream_hold_test.go` | 上游挂住连接时必须结束（`TestAntigravityStreamEndsWhenUpstreamHoldsTheSocket`） |
+| `internal/runtime/executor/antigravity_executor.go` | `ResponseHeaderTimeout` 从 transport key 到 client 全链路透传 |
+| `internal/runtime/executor/antigravity_executor_{auth,credits,execute,tokens}.go` | 跟随新签名传 0（非流式不设限） |
+| `internal/runtime/executor/antigravity_executor_{transport,transport_decorator}_test.go` | 跟随新签名 |
+| `internal/runtime/executor/antigravity_executor_stream_header_test.go` | 首字节超时两个新用例 |
+| `internal/registry/model_registry.go` | `classifySuspension` / `SuspendedUntil` / 三处判定与投影锁步 |
+| `internal/registry/model_registry_suspension_deadline_test.go` | 有界冷却五个新用例 |
+| `sdk/cliproxy/auth/conductor_models.go` | `SuspendUntil` 与 `earliestFutureInstant` |
+| `sdk/cliproxy/auth/conductor_cooldown.go` | `timeout awaiting response headers` 归入 transient transport |
+| `sdk/cliproxy/service_auth_sync_test.go` | 两个端到端用例改为断言「凭据停但有界冷却」 |
+| `sdk/cliproxy/antigravity_models.go` | 探针 30 秒超时 |
+| `sdk/cliproxy/antigravity_models_probe_timeout_test.go` | 探针超时两个新用例 |
+| `sdk/cliproxy/antigravity_models_refresh_test.go` | `stalledProbeTimeout` helper 与三处调用 |
 
 ```bash
 # 1) 应用到上游（幂等；已打则跳过）
@@ -233,5 +378,12 @@ scripts/apply-upstream-patch.sh --refresh
 ```
 
 CI 的 `.github/workflows/auto-sync-upstream.yml` 在 clone 之后立刻做第 1 步的
-`git apply --3way`，并断言「源码里不再有删除 `maxOutputTokens` 的语句」且
-「模型表里有 `gemini-3.8-flash-low`」。任一条不成立就 fail，不会发布丢了修复的内核。
+`git apply --3way`，随后断言 10 条 marker（六个改动各自的关键符号，例如
+`antigravityStreamResponseHeaderTimeout`、`classifySuspension`、`TestBoundedSuspensionKeepsSoleCredentialModelListed`、
+`earliestFutureInstant`、`antigravityProbeTimeout`），外加「源码里不再有任何拼法的
+`maxOutputTokens` 删除」与「模型表里有 `gemini-3.8-flash-low`」。任一条不成立就 fail，
+不会发布丢了修复的内核。
+
+注意 CI 用的是 `git clone --depth 1`，没有历史 blob，`git apply --3way` 会退化成直连应用。
+所以补丁必须与 `.upstream-sha` 指向的那个 commit 精确对齐——上游一前进就得 `--rebase` 重做，
+否则报的是一句很误导人的 `repository lacks the necessary blob to perform 3-way merge`。

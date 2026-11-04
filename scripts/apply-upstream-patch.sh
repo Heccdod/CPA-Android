@@ -27,10 +27,26 @@ UPSTREAM_REPO="https://github.com/router-for-me/CLIProxyAPI.git"
 # patch carried antigravity_executor_stream.go while this list still had only the first three.
 PATCH_FILES=(
   internal/registry/models/models.json
+  internal/registry/model_registry.go
+  internal/registry/model_registry_suspension_deadline_test.go
+  internal/runtime/executor/antigravity_executor.go
+  internal/runtime/executor/antigravity_executor_auth.go
+  internal/runtime/executor/antigravity_executor_credits.go
+  internal/runtime/executor/antigravity_executor_execute.go
   internal/runtime/executor/antigravity_executor_request.go
   internal/runtime/executor/antigravity_executor_buildrequest_test.go
   internal/runtime/executor/antigravity_executor_stream.go
+  internal/runtime/executor/antigravity_executor_stream_header_test.go
   internal/runtime/executor/antigravity_executor_stream_hold_test.go
+  internal/runtime/executor/antigravity_executor_tokens.go
+  internal/runtime/executor/antigravity_executor_transport_test.go
+  internal/runtime/executor/antigravity_transport_decorator_test.go
+  sdk/cliproxy/antigravity_models.go
+  sdk/cliproxy/antigravity_models_probe_timeout_test.go
+  sdk/cliproxy/antigravity_models_refresh_test.go
+  sdk/cliproxy/auth/conductor_cooldown.go
+  sdk/cliproxy/auth/conductor_models.go
+  sdk/cliproxy/service_auth_sync_test.go
 )
 
 # A marker is "file|pattern". Each one names something only the fix can introduce, so a patch
@@ -40,6 +56,12 @@ PATCH_MARKERS=(
   "internal/registry/models/models.json|gemini-3.8-flash-low"
   "internal/runtime/executor/antigravity_executor_stream.go|antigravityStreamGraceTimeout"
   "internal/runtime/executor/antigravity_executor_stream_hold_test.go|TestAntigravityStreamEndsWhenUpstreamHoldsTheSocket"
+  "internal/runtime/executor/antigravity_executor.go|antigravityStreamResponseHeaderTimeout"
+  "internal/runtime/executor/antigravity_executor_stream_header_test.go|TestAntigravityStreamAbandonsSilentUpstream"
+  "internal/registry/model_registry.go|classifySuspension"
+  "internal/registry/model_registry_suspension_deadline_test.go|TestBoundedSuspensionKeepsSoleCredentialModelListed"
+  "sdk/cliproxy/auth/conductor_models.go|earliestFutureInstant"
+  "sdk/cliproxy/antigravity_models.go|antigravityProbeTimeout"
 )
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -48,10 +70,15 @@ die() { echo "error: $*" >&2; exit 1; }
 
 verify_applied() {
   local req="$UPSTREAM_DIR/internal/runtime/executor/antigravity_executor_request.go"
-  # Closed on purpose: the field must be PRESENT, so a grep that finds the old deletion is a
-  # failure, and an empty file is a failure too rather than an accidental pass.
+  # Closed on purpose: the field must be PRESENT, so a grep that finds any deletion is a failure,
+  # and an empty file is a failure too rather than an accidental pass.
+  #
+  # Three spellings, because upstream migrated the deletion from sjson to ojson and a guard that
+  # only knows the old form goes blind exactly when it is needed: a conflict resolved by keeping
+  # upstream's "delete" line would leave the fix gone and this check silent.
   if grep -q 'sjson.Delete(payloadStr, "request.generationConfig.maxOutputTokens")' "$req" \
-      || grep -q 'sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")' "$req"; then
+      || grep -q 'sjson.DeleteBytes(payload, "request.generationConfig.maxOutputTokens")' "$req" \
+      || grep -q 'Delete("request.generationConfig.maxOutputTokens")' "$req"; then
     die "maxOutputTokens is still deleted: the patch did not take"
   fi
   local entry file pattern

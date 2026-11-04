@@ -99,11 +99,14 @@ class UpdateManager(private val context: Context) {
             )
             val release = JSONObject(json)
             val tag = release.optString("tag_name")
-            val current = context.packageManager.getPackageInfo(context.packageName, 0).versionName
+            val current = context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty()
             if (tag.isEmpty()) return@runCatching
-            // Release tags are conventionally "v2.1.0" while versionName is "2.1.0";
-            // comparing them verbatim would report an update on every single check.
-            if (tag.removePrefix("v") == current.removePrefix("v")) return@runCatching
+            // Release tags are conventionally "v2.1.0" while versionName is "2.1.0", so the two
+            // are normalised before they are compared. Equality was the old test, and equality
+            // has no direction: /releases/latest pointed at v2.5.3 while this build was 2.7.1,
+            // every check announced "发现新版本 v2.5.3", and accepting it installed the older app
+            // over the newer one. A signed order is what the channel actually needs.
+            if (compareVersions(tag, current) <= 0) return@runCatching
             val assets = release.optJSONArray("assets") ?: return@runCatching
             for (i in 0 until assets.length()) {
                 val asset = assets.getJSONObject(i)
@@ -143,6 +146,17 @@ class UpdateManager(private val context: Context) {
         runCatching {
             val found = newestKernelRelease(repo) ?: return@runCatching
             val tag = found.first
+            // Kernel tags are fixed width (upstream-20261101-213407), so string order is
+            // publication order. newestKernelRelease() orders by published_at, which only ranks
+            // the twenty releases the API happened to return; a release republished or re-tagged
+            // after the installed one sorts ahead there and would be staged on top of it. Staging
+            // is sticky — HotSoLoader pins the name from pending.txt — so a downgrade does not
+            // correct itself on the next check either.
+            val installed = installedKernelTag()
+            if (installed != null && tag <= installed) {
+                notes.append("内核已是最新（$tag）\n")
+                return@runCatching
+            }
             val target = File(hotLibDir(), "libgojni-$tag.so")
             val bytes = httpGetBytes(found.second, limit = MAX_KERNEL_BYTES)
             val actual = sha256(bytes)
@@ -166,7 +180,16 @@ class UpdateManager(private val context: Context) {
                 return@runCatching
             }
             val manifest = File(hotLibDir(), "sha256.txt")
-            if (manifest.isFile && manifest.readText().trim().equals(actual, ignoreCase = true)) {
+            // The digest alone does not mean the kernel is installed: sha256.txt outlives the .so
+            // it describes, so a staged library deleted by a cleaner (or by clearStaged after the
+            // switch was toggled) left a matching manifest behind and this branch answered
+            // "内核已是最新" for the one release that could put the file back. The tag guard above
+            // already returns null in that case; requiring the file here is what lets the
+            // re-download actually happen.
+            if (manifest.isFile &&
+                target.isFile &&
+                manifest.readText().trim().equals(actual, ignoreCase = true)
+            ) {
                 notes.append("内核已是最新（$tag）\n")
                 return@runCatching
             }
@@ -302,6 +325,29 @@ class UpdateManager(private val context: Context) {
 
     private fun hotLibDir(): File = HotSoLoader.hotLibDir(context)
 
+    /**
+     * The kernel tag staged for the next start, or null when nothing usable is staged.
+     *
+     * pending.txt is the one record of "what this app believes is installed": checkKernelRelease
+     * writes it and HotSoLoader reads it. Two cases deliberately return null instead of a tag,
+     * because the downgrade guard must not fire on either:
+     *  · the entry does not parse — a corrupt or hand-edited file would otherwise pin the
+     *    channel shut forever;
+     *  · the named .so is gone — then nothing is installed, and the tag it used to name must be
+     *    downloadable again. Without this the guard would answer "内核已是最新" for the only
+     *    release that can repair a deleted kernel, which is the exact dead end the UI now
+     *    reports as 已下载但未能加载.
+     */
+    private fun installedKernelTag(): String? {
+        val dir = hotLibDir()
+        val pending = File(dir, "pending.txt")
+        if (!pending.isFile) return null
+        val name = runCatching { pending.readText() }.getOrNull()
+        val tag = trimTagFromPending(name) ?: return null
+        if (!File(dir, "libgojni-$tag.so").isFile) return null
+        return tag
+    }
+
     private fun httpGet(url: String, accept: String): String =
         String(httpGetBytes(url, accept = accept), Charsets.UTF_8)
 
@@ -370,6 +416,70 @@ class UpdateManager(private val context: Context) {
     }
 
     companion object {
+        /**
+         * Orders two dotted version strings. Positive means [remote] is newer.
+         *
+         * Equality is not enough for either channel. "v2.5.3" and "2.7.1" both normalise to a
+         * non-empty string that is not equal to the other, so the old test could not tell
+         * "newer" from "older" and shipped the downgrade. The rules here are the ones the
+         * published tags actually use: an optional leading v, an optional '+build' tail that
+         * never affects order, and a '-suffix' that marks a pre-release (lower than the release
+         * it shares a core with, compared as text against another pre-release). Missing
+         * segments count as zero so "2.7" and "2.7.0" are the same version. A segment that is
+         * not a number is compared as text rather than dropped.
+         *
+         * internal, not private: the JVM unit test is the only thing that can prove the five
+         * cases this function exists for, and the test source set is a friend of this one.
+         */
+        internal fun compareVersions(remote: String, local: String): Int {
+            val left = parseVersion(remote)
+            val right = parseVersion(local)
+            val segments = maxOf(left.core.size, right.core.size)
+            for (i in 0 until segments) {
+                val a = left.core.getOrElse(i) { "0" }
+                val b = right.core.getOrElse(i) { "0" }
+                val na = a.toLongOrNull()
+                val nb = b.toLongOrNull()
+                val order = if (na != null && nb != null) na.compareTo(nb) else a.compareTo(b)
+                if (order != 0) return order
+            }
+            // Same core: a pre-release is older than the release, and two pre-releases sort by
+            // their suffix text.
+            if (left.pre == null && right.pre == null) return 0
+            if (left.pre == null) return 1
+            if (right.pre == null) return -1
+            return left.pre.compareTo(right.pre)
+        }
+
+        private class ParsedVersion(val core: List<String>, val pre: String?)
+
+        private fun parseVersion(raw: String): ParsedVersion {
+            var text = raw.trim()
+            while (text.isNotEmpty() && (text[0] == 'v' || text[0] == 'V')) text = text.substring(1)
+            // Build metadata is compared by nothing and must not look like a core segment.
+            text = text.substringBefore('+')
+            val dash = text.indexOf('-')
+            val suffix = if (dash >= 0) text.substring(dash + 1).trim() else ""
+            val coreText = if (dash >= 0) text.substring(0, dash) else text
+            val core = coreText.split('.')
+                .map { it.trim().ifEmpty { "0" } }
+                .ifEmpty { listOf("0") }
+            return ParsedVersion(core, suffix.ifEmpty { null })
+        }
+
+        /**
+         * The kernel tag inside a pending.txt entry ("libgojni-<tag>.so"), or null.
+         *
+         * Null means "nothing usable is staged", which the caller treats as permission to install
+         * anything — a corrupt or hand-edited pending.txt must not latch the channel shut.
+         */
+        internal fun trimTagFromPending(name: String?): String? {
+            val value = name?.trim().orEmpty()
+            if (!value.startsWith("libgojni-") || !value.endsWith(".so")) return null
+            val tag = value.removePrefix("libgojni-").removeSuffix(".so").trim()
+            return tag.ifEmpty { null }
+        }
+
         private const val MAX_JSON_BYTES = 4L * 1024 * 1024
         private const val MAX_APK_BYTES = 200L * 1024 * 1024
         private const val MAX_KERNEL_BYTES = 200L * 1024 * 1024

@@ -114,4 +114,9 @@
     <string name="rotate_key_body">会生成一个新的随机密钥并写进 config.yaml，引擎随即热重载。已经配置了这个密钥的客户端（SillyTavern、SDK、curl 脚本）需要改成新的；旧密钥立刻失效。</string>
     <string name="rotate_key_done">已更换：%1$s</string>
     <string name="rotate_key_failed">更换失败：%1$s</string>
+    <string name="settings_hot_state_broken">已开启 · 已下载但未能加载，请重新下载</string>
+    <string name="settings_hot_state_hot">已开启 · 当前运行 %1$s</string>
+    <string name="settings_hot_state_packaged">已开启 · 当前用内置内核</string>
+    <string name="engine_packaged">内置内核</string>
+    <string name="engine_hot">热更新 %1$s</string>
 </resources>
